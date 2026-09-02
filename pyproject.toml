@@ -2,6 +2,7 @@
 name = "algolearn-speak"
 version = "0.1.0"
 description = "Local voice MCP server for Claude Code: an ear (Whisper on MLX) and a voice (Kokoro on MLX), no cloud."
+license = "MIT"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "mcp>=2.1,<3",

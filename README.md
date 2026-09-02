@@ -135,3 +135,7 @@ uv run algolearn-speak   # run the server on stdio for manual MCP testing
 
 `speak_server.py` is the whole server. Logs go to stderr. Stdout is the MCP
 transport, so never print to it.
+
+## License
+
+MIT. See `LICENSE`.
