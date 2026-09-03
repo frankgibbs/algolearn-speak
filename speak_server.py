@@ -115,6 +115,24 @@ def _plain(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
+def _audio_stream(kind, **kw):
+    """Open a sounddevice stream. A PortAudioError here means the device is
+    busy or the device list is stale (default output/input changed since this
+    process started — a headset connecting, another session holding the mic).
+    Re-initialize PortAudio so the NEXT call sees the current devices, and
+    raise a readable RuntimeError instead of the SDK's bare "Error executing
+    tool" crash."""
+    try:
+        return kind(**kw)
+    except sd.PortAudioError as e:
+        sd._terminate()
+        sd._initialize()
+        raise RuntimeError(
+            f"audio device error opening {kind.__name__}: {e}. "
+            "PortAudio re-initialized; retry the call."
+        ) from e
+
+
 def _speak_impl(text: str) -> float:
     engines.wait()
     text = _plain(text)
@@ -135,7 +153,7 @@ def _speak_impl(text: str) -> float:
 
     threading.Thread(target=produce, name="kokoro", daemon=True).start()
     samples = 0
-    with sd.OutputStream(samplerate=TTS_RATE, channels=1, dtype="float32") as out:
+    with _audio_stream(sd.OutputStream, samplerate=TTS_RATE, channels=1, dtype="float32") as out:
         while (chunk := chunks.get()) is not None:
             out.write(chunk)
             samples += len(chunk)
@@ -158,7 +176,7 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
 
     # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep
     _cue(880.0, seconds=0.3, volume=0.4, lead_silence=0.2)
-    with sd.InputStream(samplerate=MIC_RATE, channels=1, dtype="float32", blocksize=VAD_FRAME) as mic:
+    with _audio_stream(sd.InputStream, samplerate=MIC_RATE, channels=1, dtype="float32", blocksize=VAD_FRAME) as mic:
         while True:
             frame, _ = mic.read(VAD_FRAME)
             frame = frame[:, 0]
@@ -217,6 +235,12 @@ async def _run(fn, *args):
         return await anyio.to_thread.run_sync(fn, *args)
     except (TimeoutError, RuntimeError, ValueError) as e:
         raise ToolError(str(e)) from e
+    except Exception as e:
+        # Anything else (a PortAudioError mid-stream, a model load failure)
+        # must reach the caller with its type and message, not as a bare
+        # "Error executing tool" with nothing to act on.
+        log.exception("%s failed", getattr(fn, "__name__", fn))
+        raise ToolError(f"{type(e).__name__}: {e}") from e
 
 
 @mcp.tool()
