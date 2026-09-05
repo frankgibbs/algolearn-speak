@@ -124,6 +124,13 @@ def _audio_stream(kind, **kw):
     tool" crash."""
     try:
         return kind(**kw)
+    except sd.PortAudioError as first:
+        # A first open after the process has sat idle often fails once
+        # (-9986) and succeeds on an immediate retry; try once before giving up.
+        log.warning("audio device error opening %s (%s); retrying once", kind.__name__, first)
+        time.sleep(1.0)
+    try:
+        return kind(**kw)
     except sd.PortAudioError as e:
         # Re-initializing PortAudio in-process (sd._terminate/_initialize) was
         # tried on 2026-09-04 and crashed the process on the next InputStream
