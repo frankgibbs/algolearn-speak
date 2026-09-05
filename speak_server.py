@@ -125,11 +125,17 @@ def _audio_stream(kind, **kw):
     try:
         return kind(**kw)
     except sd.PortAudioError as e:
-        sd._terminate()
-        sd._initialize()
+        # Re-initializing PortAudio in-process (sd._terminate/_initialize) was
+        # tried on 2026-09-04 and crashed the process on the next InputStream
+        # open (client saw "Connection closed" mid-listen). A stale device list
+        # is only reliably cleared by a fresh process, and Claude Code respawns
+        # a stdio MCP server that exits — so report, then exit after the error
+        # has been sent; the next call lands on a fresh server.
+        log.error("audio device error opening %s: %s — exiting so the client respawns a fresh server", kind.__name__, e)
+        threading.Timer(1.5, lambda: os._exit(3)).start()
         raise RuntimeError(
             f"audio device error opening {kind.__name__}: {e}. "
-            "PortAudio re-initialized; retry the call."
+            "Server restarting; retry the call in a few seconds."
         ) from e
 
 
