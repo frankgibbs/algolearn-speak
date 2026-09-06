@@ -16,15 +16,18 @@ import logging
 import os
 import queue
 import re
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 
 import anyio
 import numpy as np
-import sounddevice as sd
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+
+import speak_audio_worker
 
 log = logging.getLogger("speak")
 
@@ -51,17 +54,17 @@ class Engines:
         self.ready = threading.Event()
         self.error: BaseException | None = None
         self.kokoro = None
-        self.vad = None
 
     def load(self) -> None:
         try:
             t0 = time.time()
             import mlx_whisper  # noqa: F401  (import cost is the bulk of the work)
             from mlx_audio.tts.utils import load_model
-            from silero_vad import load_silero_vad
 
             self.kokoro = load_model(KOKORO_MODEL)
-            self.vad = load_silero_vad()
+            # VAD is loaded fresh inside speak_audio_worker per listen() call —
+            # it's cheap (~1s) and the worker is a separate process that never
+            # shares state with this one. Nothing to warm here for it.
             # Warm the Kokoro pipeline (voice file, G2P, spaCy) so the first speak() is fast.
             for _ in self.kokoro.generate(text="Ready.", voice=VOICE, speed=SPEED, lang_code="a"):
                 pass
@@ -95,15 +98,13 @@ def _cue(freq_hz: float, seconds: float = 0.12, volume: float = 0.2, lead_silenc
     tone = _tone(freq_hz, seconds, volume)
     if lead_silence:
         tone = np.concatenate([np.zeros(int(TTS_RATE * lead_silence), dtype=np.float32), tone])
-    sd.play(tone, samplerate=TTS_RATE)
-    sd.wait()
+    _play_pcm(tone, TTS_RATE)
 
 
 def _ack() -> None:
     """Rising two-note chime then a spoken word: the transcript is in hand and
     is being sent to the model. Distinct from the single ear-open/ear-closed cues."""
-    sd.play(np.concatenate([_tone(660.0, 0.10), _tone(990.0, 0.14)]), samplerate=TTS_RATE)
-    sd.wait()
+    _play_pcm(np.concatenate([_tone(660.0, 0.10), _tone(990.0, 0.14)]), TTS_RATE)
     _speak_impl(ACK_TEXT)
 
 
@@ -115,45 +116,112 @@ def _plain(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
-def _audio_stream(kind, **kw):
-    """Open a sounddevice stream. A PortAudioError here means the device is
-    busy or the device list is stale (default output/input changed since this
-    process started — a headset connecting, another session holding the mic).
-    Re-initialize PortAudio so the NEXT call sees the current devices, and
-    raise a readable RuntimeError instead of the SDK's bare "Error executing
-    tool" crash."""
+def _worker_command(*args: str) -> list[str]:
+    return [sys.executable, "-m", "speak_audio_worker", *(str(a) for a in args)]
+
+
+def _run_worker_once(*args: str, timeout: float) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        _worker_command(*args),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _stderr_tail(proc: subprocess.CompletedProcess, lines: int = 20) -> str:
+    tail = "\n".join(proc.stderr.strip().splitlines()[-lines:])
+    return tail or "(worker produced no stderr)"
+
+
+def _run_worker(*args: str, timeout: float) -> subprocess.CompletedProcess:
+    """Run the audio helper subprocess and return on success. Every actual
+    PortAudio open happens in that short-lived process (see
+    speak_audio_worker.py / docs/AUDIO_LIFECYCLE_AUDIT.md) — a fresh process
+    never inherits a stale device snapshot, so retrying here just means
+    launching a second fresh process, not re-touching bad state in this one.
+    One immediate retry on a non-timeout-exit-code failure; a readable
+    ToolError-friendly RuntimeError on the second failure."""
+    proc = _run_worker_once(*args, timeout=timeout)
+    if proc.returncode == 0 or proc.returncode == speak_audio_worker.TIMEOUT_EXIT_CODE:
+        return proc
+    log.warning("audio worker %r failed (exit %d); retrying once:\n%s", args[0], proc.returncode, _stderr_tail(proc))
+    proc = _run_worker_once(*args, timeout=timeout)
+    if proc.returncode == 0 or proc.returncode == speak_audio_worker.TIMEOUT_EXIT_CODE:
+        return proc
+    raise RuntimeError(
+        f"audio worker {args[0]!r} failed twice (exit {proc.returncode}):\n{_stderr_tail(proc)}"
+    )
+
+
+def _play_pcm(audio: np.ndarray, samplerate: int) -> None:
+    with tempfile.NamedTemporaryFile(prefix="speak-play-", suffix=".pcm", delete=False) as f:
+        path = f.name
     try:
-        return kind(**kw)
-    except sd.PortAudioError as first:
-        # A first open after the process has sat idle often fails once
-        # (-9986) and succeeds on an immediate retry; try once before giving up.
-        log.warning("audio device error opening %s (%s); retrying once", kind.__name__, first)
-        time.sleep(1.0)
+        audio.astype(np.float32).tofile(path)
+        # generous fixed budget: playback itself has no fixed duration bound
+        # here since callers pass short cues and full TTS chunks alike.
+        duration = len(audio) / samplerate
+        _run_worker("play", path, str(samplerate), timeout=duration + 30.0)
+    finally:
+        os.unlink(path)
+
+
+def _play_pcm_stream(chunks: list[np.ndarray], samplerate: int, timeout: float) -> None:
+    """Play chunks (already produced, kept in memory) through a play-stream
+    worker fed over stdin, so the worker starts playing the first chunk
+    without waiting for a temp file of the whole utterance. On failure,
+    retry the whole utterance against a fresh worker (a fresh process is the
+    fix for a stale PortAudio snapshot; replaying the same bytes is cheap).
+
+    Uses Popen.communicate(input=...) rather than writing to proc.stdin
+    directly: writing our own stdin while the worker's stdout/stderr pipes
+    can fill is a classic subprocess deadlock (each side blocked on the
+    other's pipe); communicate() feeds stdin and drains stdout/stderr
+    concurrently on our behalf.
+    """
+    payload = b"".join(chunk.astype(np.float32).tobytes() for chunk in chunks)
+    for attempt in (1, 2):
+        proc = subprocess.Popen(
+            _worker_command("play-stream", str(samplerate)),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            _, stderr = proc.communicate(input=payload, timeout=timeout)
+            returncode = proc.returncode
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, stderr = proc.communicate()
+            returncode = -1
+        if returncode == 0:
+            return
+        stderr_text = stderr.decode("utf-8", "replace") if stderr else ""
+        tail = "\n".join(stderr_text.strip().splitlines()[-20:]) or "(worker produced no stderr)"
+        if attempt == 1:
+            log.warning("audio worker 'play-stream' failed (exit %s); retrying once:\n%s", returncode, tail)
+            continue
+        raise RuntimeError(f"audio worker 'play-stream' failed twice (exit {returncode}):\n{tail}")
+
+
+def _record_pcm(samplerate: int, blocksize: int, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> np.ndarray:
+    with tempfile.NamedTemporaryFile(prefix="speak-record-", suffix=".pcm", delete=False) as f:
+        path = f.name
+    os.unlink(path)  # the worker creates it; we just need a unique name
     try:
-        return kind(**kw)
-    except sd.PortAudioError as e:
-        # Re-initializing PortAudio in-process (sd._terminate/_initialize) was
-        # tried on 2026-09-04 and crashed the process on the next InputStream
-        # open (client saw "Connection closed" mid-listen). A stale device list
-        # is only reliably cleared by a fresh process, and Claude Code respawns
-        # a stdio MCP server that exits — so report, then exit after the error
-        # has been sent; the next call lands on a fresh server.
-        # Claude Code does not respawn a stdio server that exits (observed
-        # 2026-09-05: the user had to run /mcp each time). Re-exec THIS process
-        # in place instead: same PID, same stdio pipes, fresh PortAudio device
-        # list. The in-flight call fails once with a readable message; the next
-        # call lands on the re-executed server.
-        log.error("audio device error opening %s: %s — re-executing the server in place", kind.__name__, e)
-        def _reexec():
-            try:
-                sys.stdout.flush(); sys.stderr.flush()
-            finally:
-                os.execv(sys.executable, [sys.executable] + sys.argv)  # the console-script wrapper is a Python file
-        threading.Timer(1.5, _reexec).start()
-        raise RuntimeError(
-            f"audio device error opening {kind.__name__}: {e}. "
-            "Server re-initializing audio; retry the call in a few seconds."
-        ) from e
+        timeout = start_timeout_seconds + max_seconds + 30.0
+        proc = _run_worker(
+            "record", path, str(samplerate), str(blocksize),
+            str(max_seconds), str(silence_seconds), str(start_timeout_seconds),
+            timeout=timeout,
+        )
+        if proc.returncode == speak_audio_worker.TIMEOUT_EXIT_CODE:
+            raise TimeoutError(f"no speech detected within {start_timeout_seconds:.0f}s")
+        return np.fromfile(path, dtype=np.float32)
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
 
 
 def _speak_impl(text: str) -> float:
@@ -176,52 +244,33 @@ def _speak_impl(text: str) -> float:
 
     threading.Thread(target=produce, name="kokoro", daemon=True).start()
     samples = 0
-    with _audio_stream(sd.OutputStream, samplerate=TTS_RATE, channels=1, dtype="float32") as out:
-        while (chunk := chunks.get()) is not None:
-            out.write(chunk)
-            samples += len(chunk)
+    played: list[np.ndarray] = []
+    while (chunk := chunks.get()) is not None:
+        played.append(chunk)
+        samples += len(chunk)
     if failure:
         raise RuntimeError(f"Kokoro synthesis failed: {failure[0]!r}") from failure[0]
+    if played:
+        # A generous fixed budget for the worker's whole life: startup + the
+        # audio's own duration + margin for the retry path.
+        duration = samples / TTS_RATE
+        _play_pcm_stream(played, TTS_RATE, timeout=duration + 30.0)
     return samples / TTS_RATE
 
 
 def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
     engines.wait()
-    import torch
     import mlx_whisper
-    from silero_vad import VADIterator
-
-    vad = VADIterator(engines.vad, threshold=0.5, sampling_rate=MIC_RATE, min_silence_duration_ms=int(silence_seconds * 1000), speech_pad_ms=300)
-    frames: list[np.ndarray] = []
-    speaking = False
-    t_open = time.time()
-    t_speech = None
 
     # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep
     _cue(880.0, seconds=0.3, volume=0.4, lead_silence=0.2)
-    with _audio_stream(sd.InputStream, samplerate=MIC_RATE, channels=1, dtype="float32", blocksize=VAD_FRAME) as mic:
-        while True:
-            frame, _ = mic.read(VAD_FRAME)
-            frame = frame[:, 0]
-            frames.append(frame)
-            event = vad(torch.from_numpy(frame.copy()), return_seconds=False)
-            now = time.time()
-            if event and "start" in event:
-                speaking = True
-                t_speech = now
-                # keep ~0.5 s of pre-roll before the detected start
-                frames = frames[-int(0.5 * MIC_RATE / VAD_FRAME):]
-            if event and "end" in event and speaking:
-                break
-            if not speaking and now - t_open > start_timeout_seconds:
-                _cue(330.0)
-                raise TimeoutError(f"no speech detected within {start_timeout_seconds:.0f}s")
-            if speaking and now - t_speech > max_seconds:
-                log.info("listen: hit max_seconds=%.0f, transcribing what we have", max_seconds)
-                break
+    try:
+        audio = _record_pcm(MIC_RATE, VAD_FRAME, max_seconds, silence_seconds, start_timeout_seconds)
+    except TimeoutError:
+        _cue(330.0)
+        raise
     _cue(440.0)  # ear closed
 
-    audio = np.concatenate(frames)
     t0 = time.time()
     text = mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER_MODEL, language=LANGUAGE)["text"].strip()
     log.info("listen: %.1fs of audio transcribed in %.1fs: %r", len(audio) / MIC_RATE, time.time() - t0, text)

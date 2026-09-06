@@ -20,12 +20,54 @@ responsive during a long `listen`.
 
 ## Files
 
-- `speak_server.py` — the whole server. `main()` starts a background thread that
-  loads Kokoro, Silero VAD, and Whisper (about 9 s on the M1 Pro), then runs the
-  MCP stdio loop. Tool calls block on the loading event; a load failure is raised
-  into every tool call rather than hidden.
+- `speak_server.py` — the MCP server. `main()` starts a background thread that
+  loads Kokoro and Whisper (about 9 s on the M1 Pro), then runs the MCP stdio
+  loop. Tool calls block on the loading event; a load failure is raised into
+  every tool call rather than hidden. This process never imports `sounddevice`
+  — see below.
+- `speak_audio_worker.py` — the only code in this repo that touches
+  `sounddevice`/PortAudio. Launched fresh (`sys.executable -m
+  speak_audio_worker <play|play-stream|record> ...`) for every single audio
+  operation and exits when that operation finishes. See "Audio process
+  isolation" below for why.
 - `pyproject.toml` — uv project, Python 3.12 (mlx-whisper pulls torch; Kokoro
   needs `misaki[en]`; Silero adds only torchaudio on top of that).
+
+## Audio process isolation
+
+`docs/AUDIO_LIFECYCLE_AUDIT.md` has the full investigation. Short version:
+PortAudio's cached device snapshot (default device = Frank's AirPods Pro, a
+Bluetooth device that macOS suspends after idle) goes stale after the machine
+sits for roughly 2+ hours, and the first stream opened against a stale
+snapshot fails with `PortAudioError -9986`. This is not a leak in this
+codebase — every stream was already opened via `with` and closed
+deterministically — it's process-wide PortAudio state that only a fresh
+process reliably clears. Re-exec-in-place was tried and rejected: it breaks
+the MCP stdio pipe Claude Code holds open.
+
+The fix: `speak_server.py` never calls into `sounddevice` at all. Every
+`sd.OutputStream` / `sd.InputStream` / `sd.play` open happens inside
+`speak_audio_worker.py`, run as a subprocess launched fresh per `speak`/
+`listen`/`converse` call:
+
+- **Playback** (`speak`, and the tone cues in `_cue`/`_ack`): the server
+  writes PCM to a temp file (short cues, `play`) or pipes PCM chunks over
+  stdin (TTS output, `play-stream`) to a worker process; the worker opens the
+  output stream, plays, and exits.
+- **Recording** (`listen`): the server launches a `record` worker with the
+  VAD/timing parameters; the worker owns the whole capture loop — including
+  the Silero VAD start/stop gating (it loads its own VAD model, ~1s, fresh
+  every call) — and writes the captured PCM to a temp file on success, or
+  exits with `speak_audio_worker.TIMEOUT_EXIT_CODE` if nobody spoke in time.
+  The server then transcribes with the parent's already-warm Whisper model.
+- If a worker exits non-zero (not the timeout code), the server retries once
+  with a brand-new worker process (cheap; a fresh process never inherits the
+  bad snapshot) before raising a `RuntimeError` with the worker's stderr tail.
+- `SPEAK_AUDIO_DRY_RUN=1` makes the worker synthesize silence/noise instead of
+  touching a real device — used by tests, never in normal operation.
+
+There is no long-lived PortAudio state anywhere in this repo anymore, so
+there is nothing left to go stale between calls.
 
 ## Configuration (environment variables, read at startup)
 
