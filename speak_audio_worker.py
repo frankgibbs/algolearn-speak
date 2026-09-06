@@ -31,8 +31,26 @@ Commands:
       after `silence_seconds` of quiet following detected speech, or after
       `max_seconds` of speech, whichever comes first. If nobody speaks
       within `start_timeout_seconds`, exit with code TIMEOUT_EXIT_CODE and
-      write nothing. Recorded audio (mono float32 PCM) is written to
-      `out_pcm_path` on success.
+      write nothing.
+
+      Hard wall-clock cap: `start_timeout_seconds + max_seconds`, measured
+      from stream open (not from speech start). This is the absolute upper
+      bound on how long `record` can run, checked on every loop iteration
+      regardless of VAD state. It exists because a VAD can be fooled by
+      continuous non-speech sound (e.g. a TV in the room) into believing
+      speech never stops, so "silence_seconds after speech" may never
+      arrive — no heuristic is applied to detect that case; the wall-clock
+      cap is the only guard. When the cap is hit, whatever audio has been
+      captured so far is written to `out_pcm_path` and the process exits 0
+      (even if no VAD "end" event ever fired) — the caller always gets
+      something rather than nothing.
+
+      On success (including a cap-triggered stop), recorded audio (mono
+      float32 PCM) is written to `out_pcm_path`. The process prints a
+      single status line to stderr on each phase change
+      (`phase=waiting-for-speech` at stream open, `phase=recording` on the
+      first detected speech) so a caller that still sees the subprocess
+      overrun its own timeout can report which phase it was in.
 
 Env:
   SPEAK_AUDIO_DRY_RUN=1
@@ -45,6 +63,14 @@ Env:
       With dry-run also set: `record` returns TIMEOUT_EXIT_CODE immediately
       instead of synthesizing speech, so the caller's timeout path can be
       exercised deterministically. Used by tests only.
+  SPEAK_AUDIO_DRY_RUN_ENDLESS_SPEECH=1
+      With dry-run also set: `record` behaves as if speech starts
+      immediately and never stops (as continuous non-speech noise, e.g. a
+      TV, can fool the real VAD into doing) instead of synthesizing a fixed
+      `SPEAK_AUDIO_DRY_RUN_SECONDS` clip. Used to exercise the wall-clock
+      cap path deterministically: `record` must still stop at
+      `start_timeout_seconds + max_seconds` and write whatever it
+      captured, exiting 0. Used by tests only.
   SPEAK_AUDIO_DRY_RUN_FAIL=1
       With dry-run also set: every command exits 1 with a fixed message on
       stderr, so the caller's retry-then-raise path can be exercised
@@ -75,6 +101,14 @@ def _dry_run_force_fail() -> bool:
 
 def _dry_run_force_timeout() -> bool:
     return _dry_run() and os.environ.get("SPEAK_AUDIO_DRY_RUN_TIMEOUT") == "1"
+
+
+def _dry_run_endless_speech() -> bool:
+    return _dry_run() and os.environ.get("SPEAK_AUDIO_DRY_RUN_ENDLESS_SPEECH") == "1"
+
+
+def _log_phase(phase: str) -> None:
+    print(f"phase={phase}", file=sys.stderr, flush=True)
 
 
 def _load_pcm(path: str) -> np.ndarray:
@@ -132,11 +166,32 @@ def cmd_record(
     silence_seconds: float,
     start_timeout_seconds: float,
 ) -> int:
-    """Returns an exit code: 0 on success, TIMEOUT_EXIT_CODE if nobody spoke."""
+    """Returns an exit code: 0 on success, TIMEOUT_EXIT_CODE if nobody spoke.
+
+    Hard wall-clock cap = start_timeout_seconds + max_seconds, measured from
+    stream open. Checked every loop iteration regardless of VAD state, so a
+    VAD that never emits "end" (e.g. fooled by continuous non-speech sound
+    like a TV) cannot make this loop run longer than the cap. On a
+    cap-triggered stop, whatever has been captured is written and the
+    process exits 0 — never a bare timeout with nothing written.
+    """
+    cap_seconds = start_timeout_seconds + max_seconds
+
     if _dry_run():
         if _dry_run_force_timeout():
             return TIMEOUT_EXIT_CODE
+        _log_phase("waiting-for-speech")
+        if _dry_run_endless_speech():
+            # Simulate a VAD permanently fooled by continuous non-speech
+            # noise: speech "starts" immediately and never ends. The only
+            # thing that can stop this is the wall-clock cap.
+            _log_phase("recording")
+            rng = np.random.default_rng(0)
+            audio = (0.01 * rng.standard_normal(int(samplerate * cap_seconds))).astype(np.float32)
+            _save_pcm(out_pcm_path, audio)
+            return 0
         seconds = float(os.environ.get("SPEAK_AUDIO_DRY_RUN_SECONDS", "1.0"))
+        _log_phase("recording")
         rng = np.random.default_rng(0)
         audio = (0.01 * rng.standard_normal(int(samplerate * seconds))).astype(np.float32)
         _save_pcm(out_pcm_path, audio)
@@ -158,8 +213,8 @@ def cmd_record(
     frames: list[np.ndarray] = []
     speaking = False
     t_open = time.time()
-    t_speech = None
 
+    _log_phase("waiting-for-speech")
     with sd.InputStream(samplerate=samplerate, channels=1, dtype="float32", blocksize=blocksize) as mic:
         while True:
             frame, _ = mic.read(blocksize)
@@ -167,16 +222,21 @@ def cmd_record(
             frames.append(frame)
             event = vad(torch.from_numpy(frame.copy()), return_seconds=False)
             now = time.time()
-            if event and "start" in event:
+            elapsed = now - t_open
+            if event and "start" in event and not speaking:
                 speaking = True
-                t_speech = now
+                _log_phase("recording")
                 # keep ~0.5 s of pre-roll before the detected start
                 frames = frames[-int(0.5 * samplerate / blocksize):]
             if event and "end" in event and speaking:
                 break
-            if not speaking and now - t_open > start_timeout_seconds:
+            if not speaking and elapsed > start_timeout_seconds:
                 return TIMEOUT_EXIT_CODE
-            if speaking and now - t_speech > max_seconds:
+            # Hard wall-clock cap, checked unconditionally every iteration
+            # (not gated on VAD state) so continuous non-speech noise that
+            # the VAD miscounts as speech cannot extend the recording past
+            # this bound. Write whatever was captured and succeed.
+            if elapsed > cap_seconds:
                 break
 
     _save_pcm(out_pcm_path, np.concatenate(frames))

@@ -121,12 +121,35 @@ def _worker_command(*args: str) -> list[str]:
 
 
 def _run_worker_once(*args: str, timeout: float) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        _worker_command(*args),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+    try:
+        return subprocess.run(
+            _worker_command(*args),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        # The worker itself enforces a wall-clock cap on every command that
+        # can run long (see speak_audio_worker.py) and is expected to exit
+        # on its own well inside `timeout`. Getting here means the worker
+        # overran its own cap -- a bug in the worker, not an expected path
+        # -- so name the phase it was stuck in (from its last stderr status
+        # line) to make that bug diagnosable instead of a bare "timed out".
+        phase = _last_phase(e.stderr)
+        raise RuntimeError(
+            f"audio worker {args[0]!r} exceeded its own budget and was killed "
+            f"after {timeout:.0f}s (last phase: {phase}); this means the "
+            f"worker's internal wall-clock cap did not fire -- see "
+            f"speak_audio_worker.py's cmd_record cap logic"
+        ) from e
+
+
+def _last_phase(stderr: bytes | str | None) -> str:
+    if not stderr:
+        return "unknown (worker produced no stderr before being killed)"
+    text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else stderr
+    phases = [line.split("=", 1)[1] for line in text.splitlines() if line.startswith("phase=")]
+    return phases[-1] if phases else "unknown (no phase status line seen)"
 
 
 def _stderr_tail(proc: subprocess.CompletedProcess, lines: int = 20) -> str:
@@ -210,7 +233,16 @@ def _record_pcm(samplerate: int, blocksize: int, max_seconds: float, silence_sec
         path = f.name
     os.unlink(path)  # the worker creates it; we just need a unique name
     try:
-        timeout = start_timeout_seconds + max_seconds + 30.0
+        # The worker's own wall-clock cap is start_timeout_seconds +
+        # max_seconds, measured from stream open (see cmd_record in
+        # speak_audio_worker.py) -- it always stops and writes whatever it
+        # captured by then, even if a VAD is fooled into never reporting
+        # silence (e.g. a TV in the room). This subprocess timeout is that
+        # same budget plus a small fixed margin for process start/exit
+        # overhead; a fixed margin, not a multiple, so a slow VAD model
+        # load can't silently double the wait.
+        cap_seconds = start_timeout_seconds + max_seconds
+        timeout = cap_seconds + 15.0
         proc = _run_worker(
             "record", path, str(samplerate), str(blocksize),
             str(max_seconds), str(silence_seconds), str(start_timeout_seconds),

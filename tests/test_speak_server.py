@@ -87,6 +87,55 @@ class TestRecordPcm(unittest.TestCase):
         after = {p for p in os.listdir(tmp_dir) if p.startswith("speak-record-")}
         self.assertEqual(after - before, set())
 
+    def test_record_pcm_returns_captured_audio_when_worker_hits_wall_clock_cap(self):
+        # Regression test for the TimeoutExpired bug: continuous non-speech
+        # sound (e.g. a TV) can make a real VAD believe speech never stops,
+        # so silence_seconds never arrives. The worker's own wall-clock cap
+        # (start_timeout_seconds + max_seconds from stream open) must still
+        # fire, and _record_pcm must return the captured audio rather than
+        # raising -- the subprocess timeout given to the worker must be
+        # generous enough for the worker's own cap to win the race.
+        max_seconds = 0.2
+        start_timeout_seconds = 0.1
+        cap_seconds = max_seconds + start_timeout_seconds
+        with mock.patch.dict(os.environ, {"SPEAK_AUDIO_DRY_RUN_ENDLESS_SPEECH": "1"}):
+            audio = s._record_pcm(
+                s.MIC_RATE, s.VAD_FRAME, max_seconds=max_seconds,
+                silence_seconds=1.2, start_timeout_seconds=start_timeout_seconds,
+            )
+        self.assertEqual(len(audio), int(s.MIC_RATE * cap_seconds))
+        self.assertEqual(audio.dtype, np.float32)
+
+    def test_record_pcm_subprocess_timeout_is_cap_plus_fixed_margin(self):
+        # The parent's subprocess timeout must be the worker's own budget
+        # (start_timeout_seconds + max_seconds) plus a small FIXED margin,
+        # not a multiple of it and not the old (wrong) 3x-ish arithmetic
+        # that let the worker's actual overrun run past the parent's kill.
+        captured = {}
+
+        def fake_run_worker(*args, timeout):
+            captured["timeout"] = timeout
+            raise RuntimeError("stop before actually launching anything")
+
+        with mock.patch.object(s, "_run_worker", side_effect=fake_run_worker):
+            with self.assertRaises(RuntimeError):
+                s._record_pcm(s.MIC_RATE, s.VAD_FRAME, max_seconds=300.0, silence_seconds=3.0, start_timeout_seconds=45.0)
+        self.assertEqual(captured["timeout"], 45.0 + 300.0 + 15.0)
+
+    def test_record_pcm_names_the_phase_when_worker_overruns_its_own_cap(self):
+        # If the worker somehow still overran (the bug this fix targets),
+        # the resulting error must name which phase it was stuck in, not
+        # just report a bare subprocess timeout.
+        import subprocess
+
+        def fake_run(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs.get("timeout", 0), output=b"", stderr=b"phase=recording\n")
+
+        with mock.patch.object(subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError) as ctx:
+                s._record_pcm(s.MIC_RATE, s.VAD_FRAME, max_seconds=5, silence_seconds=1.2, start_timeout_seconds=3)
+        self.assertIn("recording", str(ctx.exception))
+
 
 class TestRetryOnWorkerFailure(unittest.TestCase):
     """SPEAK_AUDIO_DRY_RUN_FAIL forces the worker to exit 1 every time, so
