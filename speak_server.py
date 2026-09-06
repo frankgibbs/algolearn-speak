@@ -138,11 +138,21 @@ def _audio_stream(kind, **kw):
         # is only reliably cleared by a fresh process, and Claude Code respawns
         # a stdio MCP server that exits — so report, then exit after the error
         # has been sent; the next call lands on a fresh server.
-        log.error("audio device error opening %s: %s — exiting so the client respawns a fresh server", kind.__name__, e)
-        threading.Timer(1.5, lambda: os._exit(3)).start()
+        # Claude Code does not respawn a stdio server that exits (observed
+        # 2026-09-05: the user had to run /mcp each time). Re-exec THIS process
+        # in place instead: same PID, same stdio pipes, fresh PortAudio device
+        # list. The in-flight call fails once with a readable message; the next
+        # call lands on the re-executed server.
+        log.error("audio device error opening %s: %s — re-executing the server in place", kind.__name__, e)
+        def _reexec():
+            try:
+                sys.stdout.flush(); sys.stderr.flush()
+            finally:
+                os.execv(sys.executable, [sys.executable] + sys.argv)  # the console-script wrapper is a Python file
+        threading.Timer(1.5, _reexec).start()
         raise RuntimeError(
             f"audio device error opening {kind.__name__}: {e}. "
-            "Server restarting; retry the call in a few seconds."
+            "Server re-initializing audio; retry the call in a few seconds."
         ) from e
 
 
