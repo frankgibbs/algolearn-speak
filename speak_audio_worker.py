@@ -26,31 +26,63 @@ Commands:
       plays out whatever is buffered and exits.
 
   record <out_pcm_path> <samplerate> <blocksize> <max_seconds>
-         <silence_seconds> <start_timeout_seconds>
+         <silence_seconds> <start_timeout_seconds> <cue_freq_hz>
+         <cue_seconds> <cue_volume> <cue_lead_silence>
       Record from the default input device, gated by Silero VAD: stop
       after `silence_seconds` of quiet following detected speech, or after
       `max_seconds` of speech, whichever comes first. If nobody speaks
-      within `start_timeout_seconds`, exit with code TIMEOUT_EXIT_CODE and
-      write nothing.
+      within `start_timeout_seconds` (measured from stream open, i.e. from
+      the `phase=stream-open` line below), exit with code TIMEOUT_EXIT_CODE
+      and write nothing.
+
+      The "ear open" cue is played from INSIDE this process, right after
+      the input stream opens and before the frame-read loop starts -- NOT
+      by a separate `play` worker. Two processes each opening one
+      direction-split half (input vs output) of the same Bluetooth device
+      (e.g. AirPods) at the same time can lose the cue during HFP profile
+      renegotiation, silently (see docs -- this is the fix for that). Pass
+      `cue_freq_hz <= 0` to skip the cue entirely (used by tests and by any
+      future caller that wants a silent start).
+
+      Readiness ordering: torch/sounddevice/silero_vad are imported,
+      `load_silero_vad()` runs, and `sd.InputStream` is opened BEFORE
+      anything is signalled to the caller. Once the stream is open, the
+      process prints `phase=stream-open` to stderr and flushes, then
+      starts a background thread that reads and buffers frames from the
+      stream immediately -- even while the cue plays -- so frames PortAudio
+      delivers during the ~0.5s cue are never dropped to a full internal
+      buffer. The cue itself plays synchronously in the main thread
+      (`sd.play` + `sd.wait`, a separate short-lived OutputStream from the
+      mic's InputStream, both owned by this one process). Once the cue
+      finishes, the process prints `phase=cue-played` -- this, not
+      `phase=stream-open`, is the readiness signal a caller should wait on
+      before treating the user as "being listened to" and starting its own
+      `start_timeout_seconds` countdown, so a user speaking during/right
+      after the beep is still captured (their frames were already
+      buffered by the reader thread) and the timeout clock does not start
+      ticking until the beep -- the thing that tells the user to talk --
+      has actually finished.
 
       Hard wall-clock cap: `start_timeout_seconds + max_seconds`, measured
-      from stream open (not from speech start). This is the absolute upper
-      bound on how long `record` can run, checked on every loop iteration
-      regardless of VAD state. It exists because a VAD can be fooled by
-      continuous non-speech sound (e.g. a TV in the room) into believing
-      speech never stops, so "silence_seconds after speech" may never
-      arrive — no heuristic is applied to detect that case; the wall-clock
-      cap is the only guard. When the cap is hit, whatever audio has been
-      captured so far is written to `out_pcm_path` and the process exits 0
-      (even if no VAD "end" event ever fired) — the caller always gets
-      something rather than nothing.
+      from stream open. This is the absolute upper bound on how long
+      `record` can run, checked on every loop iteration regardless of VAD
+      state. It exists because a VAD can be fooled by continuous non-speech
+      sound (e.g. a TV in the room) into believing speech never stops, so
+      "silence_seconds after speech" may never arrive — no heuristic is
+      applied to detect that case; the wall-clock cap is the only guard.
+      When the cap is hit, whatever audio has been captured so far is
+      written to `out_pcm_path` and the process exits 0 (even if no VAD
+      "end" event ever fired) — the caller always gets something rather
+      than nothing.
 
       On success (including a cap-triggered stop), recorded audio (mono
       float32 PCM) is written to `out_pcm_path`. The process prints a
       single status line to stderr on each phase change
-      (`phase=waiting-for-speech` at stream open, `phase=recording` on the
-      first detected speech) so a caller that still sees the subprocess
-      overrun its own timeout can report which phase it was in.
+      (`phase=stream-open` once the mic is open and the reader thread has
+      started, `phase=cue-played` once the ear-open cue has finished
+      playing (or immediately, if no cue was requested), `phase=recording`
+      on the first detected speech) so a caller that still sees the
+      subprocess overrun its own timeout can report which phase it was in.
 
 Env:
   SPEAK_AUDIO_DRY_RUN=1
@@ -80,10 +112,14 @@ Env:
 from __future__ import annotations
 
 import os
+import queue
 import sys
+import threading
 import time
 
 import numpy as np
+
+from speak_tone import TONE_RATE, cue_pcm
 
 TIMEOUT_EXIT_CODE = 2
 
@@ -165,8 +201,19 @@ def cmd_record(
     max_seconds: float,
     silence_seconds: float,
     start_timeout_seconds: float,
+    cue_freq_hz: float = 0.0,
+    cue_seconds: float = 0.3,
+    cue_volume: float = 0.4,
+    cue_lead_silence: float = 0.2,
 ) -> int:
     """Returns an exit code: 0 on success, TIMEOUT_EXIT_CODE if nobody spoke.
+
+    `cue_freq_hz <= 0` means "play no cue" (used by callers that don't want
+    one, and by tests). Otherwise the "ear open" cue is synthesized and
+    played by THIS process, in-process, right after the input stream opens
+    -- see the module docstring's `record` entry for why (two processes
+    each opening one direction-split half of a Bluetooth device
+    concurrently can silently lose the cue during HFP renegotiation).
 
     Hard wall-clock cap = start_timeout_seconds + max_seconds, measured from
     stream open. Checked every loop iteration regardless of VAD state, so a
@@ -179,8 +226,16 @@ def cmd_record(
 
     if _dry_run():
         if _dry_run_force_timeout():
+            # Real timeouts always happen AFTER readiness (stream open, then
+            # nobody speaks within start_timeout_seconds) -- readiness has
+            # already been signalled and a caller may already be relying on
+            # it (e.g. having played the "ear open" cue), so this dry-run
+            # path must log it too rather than exiting silently before it.
+            _log_phase("stream-open")
+            _log_phase("cue-played")
             return TIMEOUT_EXIT_CODE
-        _log_phase("waiting-for-speech")
+        _log_phase("stream-open")
+        _log_phase("cue-played")
         if _dry_run_endless_speech():
             # Simulate a VAD permanently fooled by continuous non-speech
             # noise: speech "starts" immediately and never ends. The only
@@ -212,13 +267,49 @@ def cmd_record(
 
     frames: list[np.ndarray] = []
     speaking = False
-    t_open = time.time()
 
-    _log_phase("waiting-for-speech")
+    # frame_q carries frames from the reader thread to this (main) thread.
+    # reader_error carries an exception raised inside the reader thread, if
+    # any, so a mid-recording device failure surfaces here instead of the
+    # reader thread just going silent forever.
+    frame_q: queue.Queue = queue.Queue()
+    reader_error: list[BaseException] = []
+    reader_stop = threading.Event()
+
+    def read_frames(mic) -> None:
+        try:
+            while not reader_stop.is_set():
+                frame, _ = mic.read(blocksize)
+                frame_q.put(frame[:, 0])
+        except BaseException as e:  # surfaced in the main thread, never swallowed
+            reader_error.append(e)
+            frame_q.put(None)  # unblock a main-thread get() waiting on this queue
+
     with sd.InputStream(samplerate=samplerate, channels=1, dtype="float32", blocksize=blocksize) as mic:
+        # Readiness signal #1: the stream is open. Start the reader thread
+        # immediately, BEFORE playing the cue, so frames PortAudio delivers
+        # during the ~0.5s cue are pulled off the stream and queued rather
+        # than left to a fixed-size internal buffer that could overflow.
+        t_open = time.time()
+        _log_phase("stream-open")
+        reader_thread = threading.Thread(target=read_frames, args=(mic,), daemon=True)
+        reader_thread.start()
+
+        if cue_freq_hz > 0:
+            sd.play(cue_pcm(cue_freq_hz, cue_seconds, cue_volume, cue_lead_silence), samplerate=TONE_RATE)
+            sd.wait()
+        # Readiness signal #2: the cue (if any) has finished playing. This,
+        # not `stream-open`, is what a caller should measure
+        # start_timeout_seconds from -- frames spoken during/right after the
+        # cue are already sitting in frame_q from the reader thread, so
+        # nothing is lost even though the timeout clock starts only now.
+        _log_phase("cue-played")
+
         while True:
-            frame, _ = mic.read(blocksize)
-            frame = frame[:, 0]
+            frame = frame_q.get()
+            if frame is None:
+                reader_stop.set()
+                raise reader_error[0]
             frames.append(frame)
             event = vad(torch.from_numpy(frame.copy()), return_seconds=False)
             now = time.time()
@@ -231,6 +322,7 @@ def cmd_record(
             if event and "end" in event and speaking:
                 break
             if not speaking and elapsed > start_timeout_seconds:
+                reader_stop.set()
                 return TIMEOUT_EXIT_CODE
             # Hard wall-clock cap, checked unconditionally every iteration
             # (not gated on VAD state) so continuous non-speech noise that
@@ -238,6 +330,7 @@ def cmd_record(
             # this bound. Write whatever was captured and succeed.
             if elapsed > cap_seconds:
                 break
+        reader_stop.set()
 
     _save_pcm(out_pcm_path, np.concatenate(frames))
     return 0
@@ -265,7 +358,10 @@ def main(argv: list[str]) -> int:
         cmd_play_stream(int(samplerate))
         return 0
     if command == "record":
-        out_pcm_path, samplerate, blocksize, max_seconds, silence_seconds, start_timeout_seconds = args
+        (
+            out_pcm_path, samplerate, blocksize, max_seconds, silence_seconds,
+            start_timeout_seconds, cue_freq_hz, cue_seconds, cue_volume, cue_lead_silence,
+        ) = args
         return cmd_record(
             out_pcm_path,
             int(samplerate),
@@ -273,6 +369,10 @@ def main(argv: list[str]) -> int:
             float(max_seconds),
             float(silence_seconds),
             float(start_timeout_seconds),
+            float(cue_freq_hz),
+            float(cue_seconds),
+            float(cue_volume),
+            float(cue_lead_silence),
         )
     print(f"unknown command: {command!r}", file=sys.stderr)
     return 1

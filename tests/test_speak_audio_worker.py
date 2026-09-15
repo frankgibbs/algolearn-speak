@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -49,13 +50,21 @@ class TestPlayStream(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
+# record's CLI now takes 4 trailing cue args: cue_freq_hz, cue_seconds,
+# cue_volume, cue_lead_silence. "0" for cue_freq_hz means "no cue" -- used
+# by every test below that isn't specifically about the cue, since dry-run
+# never touches a real device either way and these tests only care about
+# the recording behaviour.
+NO_CUE_ARGS = ["0", "0", "0", "0"]
+
+
 class TestRecord(unittest.TestCase):
     def test_record_dry_run_writes_synthesized_audio(self):
         with tempfile.NamedTemporaryFile(suffix=".pcm") as f:
             out_path = f.name
         try:
             proc = run_worker(
-                ["record", out_path, "16000", "512", "5", "1.2", "3"],
+                ["record", out_path, "16000", "512", "5", "1.2", "3", *NO_CUE_ARGS],
                 env_extra={"SPEAK_AUDIO_DRY_RUN_SECONDS": "0.25"},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -78,7 +87,7 @@ class TestRecord(unittest.TestCase):
             out_path = f.name
         try:
             proc = run_worker(
-                ["record", out_path, "16000", "512", str(max_seconds), "1.2", str(start_timeout_seconds)],
+                ["record", out_path, "16000", "512", str(max_seconds), "1.2", str(start_timeout_seconds), *NO_CUE_ARGS],
                 env_extra={"SPEAK_AUDIO_DRY_RUN_ENDLESS_SPEECH": "1"},
                 timeout=10.0,
             )
@@ -94,12 +103,13 @@ class TestRecord(unittest.TestCase):
             out_path = f.name
         try:
             proc = run_worker(
-                ["record", out_path, "16000", "512", "0.2", "1.2", "0.1"],
+                ["record", out_path, "16000", "512", "0.2", "1.2", "0.1", *NO_CUE_ARGS],
                 env_extra={"SPEAK_AUDIO_DRY_RUN_ENDLESS_SPEECH": "1"},
                 timeout=10.0,
             )
             stderr = proc.stderr.decode("utf-8", "replace") if isinstance(proc.stderr, bytes) else proc.stderr
-            self.assertIn("phase=waiting-for-speech", stderr)
+            self.assertIn("phase=stream-open", stderr)
+            self.assertIn("phase=cue-played", stderr)
             self.assertIn("phase=recording", stderr)
         finally:
             if os.path.exists(out_path):
@@ -112,7 +122,7 @@ class TestRecord(unittest.TestCase):
         # write it either when it exits with the timeout code.
         try:
             proc = run_worker(
-                ["record", out_path, "16000", "512", "5", "1.2", "3"],
+                ["record", out_path, "16000", "512", "5", "1.2", "3", *NO_CUE_ARGS],
                 env_extra={"SPEAK_AUDIO_DRY_RUN_TIMEOUT": "1"},
             )
             import speak_audio_worker
@@ -121,6 +131,51 @@ class TestRecord(unittest.TestCase):
         finally:
             if os.path.exists(out_path):
                 os.unlink(out_path)
+
+
+class TestRecordCueArgs(unittest.TestCase):
+    """Worker-side test for the cue: cmd_record must accept the cue CLI args
+    and, in dry-run mode, log `phase=cue-played` without touching any real
+    hardware (sounddevice is never imported in dry-run at all)."""
+
+    def test_dry_run_logs_cue_played_regardless_of_cue_args(self):
+        # Dry-run never opens a real device (see cmd_record: the dry-run
+        # branch returns before `import sounddevice`), so it logs
+        # phase=cue-played unconditionally -- this just proves the CLI
+        # parses cue args without error and the phase line still appears.
+        with tempfile.NamedTemporaryFile(suffix=".pcm") as f:
+            out_path = f.name
+        try:
+            proc = run_worker(
+                ["record", out_path, "16000", "512", "5", "1.2", "3", "880.0", "0.3", "0.4", "0.2"],
+                env_extra={"SPEAK_AUDIO_DRY_RUN_SECONDS": "0.05"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            stderr = proc.stderr.decode("utf-8", "replace") if isinstance(proc.stderr, bytes) else proc.stderr
+            phases = [line.split("=", 1)[1] for line in stderr.splitlines() if line.startswith("phase=")]
+            self.assertEqual(phases, ["stream-open", "cue-played", "recording"])
+        finally:
+            if os.path.exists(out_path):
+                os.unlink(out_path)
+
+    def test_cmd_record_accepts_cue_kwargs_directly(self):
+        # Call cmd_record() directly (still dry-run, so no device is
+        # touched) to pin the parameter names/order cmd_record's CLI parsing
+        # in main() relies on.
+        import speak_audio_worker as w
+
+        with mock.patch.dict(os.environ, {"SPEAK_AUDIO_DRY_RUN": "1", "SPEAK_AUDIO_DRY_RUN_SECONDS": "0.05"}):
+            with tempfile.NamedTemporaryFile(suffix=".pcm") as f:
+                out_path = f.name
+            try:
+                rc = w.cmd_record(
+                    out_path, 16000, 512, max_seconds=5, silence_seconds=1.2, start_timeout_seconds=3,
+                    cue_freq_hz=880.0, cue_seconds=0.3, cue_volume=0.4, cue_lead_silence=0.2,
+                )
+                self.assertEqual(rc, 0)
+            finally:
+                if os.path.exists(out_path):
+                    os.unlink(out_path)
 
 
 class TestForcedFailure(unittest.TestCase):

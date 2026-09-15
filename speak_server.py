@@ -28,6 +28,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 import speak_audio_worker
+from speak_tone import cue_pcm, tone
 
 log = logging.getLogger("speak")
 
@@ -63,8 +64,15 @@ class Engines:
 
             self.kokoro = load_model(KOKORO_MODEL)
             # VAD is loaded fresh inside speak_audio_worker per listen() call —
-            # it's cheap (~1s) and the worker is a separate process that never
-            # shares state with this one. Nothing to warm here for it.
+            # the worker is a separate process that never shares state with
+            # this one, so there's nothing to warm here for it. That load
+            # (~1s) is not free, but it happens entirely before the "ear
+            # open" beep: _record_pcm launches the worker and blocks until it
+            # signals readiness (VAD loaded, mic stream open and buffering),
+            # and only then does _listen_impl play the beep -- so the ~1s
+            # cost is hidden behind the beep's own lead-in silence rather
+            # than opening the mic after the user has already started
+            # answering.
             # Warm the Kokoro pipeline (voice file, G2P, spaCy) so the first speak() is fast.
             for _ in self.kokoro.generate(text="Ready.", voice=VOICE, speed=SPEED, lang_code="a"):
                 pass
@@ -89,16 +97,15 @@ audio_lock = threading.Lock()   # speak and listen never overlap
 # ---------------------------------------------------------------- helpers
 
 def _tone(freq_hz: float, seconds: float, volume: float = 0.2) -> np.ndarray:
-    t = np.arange(int(TTS_RATE * seconds)) / TTS_RATE
-    env = np.minimum(1.0, np.minimum(t, seconds - t) / 0.01)  # 10 ms fade in/out
-    return (volume * env * np.sin(2 * np.pi * freq_hz * t)).astype(np.float32)
+    # Thin wrapper kept for existing call sites and tests -- the actual
+    # generator lives in speak_tone.py so speak_audio_worker.py's record
+    # worker can synthesize the "ear open" cue in-process without importing
+    # this module (see speak_tone.py's module docstring).
+    return tone(freq_hz, seconds, volume)
 
 
 def _cue(freq_hz: float, seconds: float = 0.12, volume: float = 0.2, lead_silence: float = 0.0) -> None:
-    tone = _tone(freq_hz, seconds, volume)
-    if lead_silence:
-        tone = np.concatenate([np.zeros(int(TTS_RATE * lead_silence), dtype=np.float32), tone])
-    _play_pcm(tone, TTS_RATE)
+    _play_pcm(cue_pcm(freq_hz, seconds, volume, lead_silence), TTS_RATE)
 
 
 def _ack() -> None:
@@ -228,29 +235,184 @@ def _play_pcm_stream(chunks: list[np.ndarray], samplerate: int, timeout: float) 
         raise RuntimeError(f"audio worker 'play-stream' failed twice (exit {returncode}):\n{tail}")
 
 
-def _record_pcm(samplerate: int, blocksize: int, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> np.ndarray:
+READY_PHASE = "cue-played"  # mic open AND the ear-open cue (if any) has finished playing
+READY_WAIT_SECONDS = 10.0  # bounded wait for the record worker's readiness line
+
+
+class _RecordHandle:
+    """A launched-but-not-yet-awaited record worker: the mic is already open
+    and buffering by the time this is returned to the caller (readiness was
+    already confirmed). Call `_finish_record_worker` to play out the rest of
+    the recording and collect its result."""
+
+    def __init__(self, proc: subprocess.Popen, path: str, stderr_lines: list[str], stderr_thread: threading.Thread) -> None:
+        self.proc = proc
+        self.path = path
+        self.stderr_lines = stderr_lines
+        self.stderr_thread = stderr_thread
+
+
+def _drain_stderr(pipe, lines: list[str], ready_event: threading.Event) -> None:
+    """Runs in a background thread for the lifetime of the record worker.
+    Reads stderr line by line (never blocking the main thread on it, so a
+    worker that writes a lot to stderr can't deadlock us on a full pipe),
+    appending each line and setting `ready_event` the moment the readiness
+    phase line appears. Keeps draining after readiness so `_last_phase` can
+    still see later phase transitions (e.g. `phase=recording`) if the
+    worker later overruns its own wall-clock cap."""
+    try:
+        for line in iter(pipe.readline, ""):
+            lines.append(line)
+            if line.strip() == f"phase={READY_PHASE}":
+                ready_event.set()
+    finally:
+        pipe.close()
+
+
+def _start_record_worker(
+    path: str, samplerate: int, blocksize: int, max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
+    cue_freq_hz: float = 0.0, cue_seconds: float = 0.3, cue_volume: float = 0.4, cue_lead_silence: float = 0.2,
+) -> _RecordHandle:
+    """Launch the record worker and block only until it signals readiness
+    (mic open, and the ear-open cue -- if `cue_freq_hz > 0` -- already
+    played) -- NOT until it finishes recording. See speak_audio_worker.py's
+    cmd_record docstring for the readiness contract.
+
+    The cue is played by the worker itself, in the same process that owns
+    the input stream, so passing `cue_freq_hz > 0` here is what makes the
+    "ear open" cue play at all; a caller that wants no cue passes
+    `cue_freq_hz <= 0` (the default) and readiness fires as soon as the
+    stream opens (the worker logs `phase=cue-played` immediately in that
+    case -- see cmd_record).
+
+    No silent fallback: if readiness never arrives within
+    READY_WAIT_SECONDS, the worker is killed and a clear RuntimeError is
+    raised. One retry (a fresh process) is allowed if the worker exits
+    before ever reaching readiness -- a fresh process is the documented fix
+    for a stale PortAudio device snapshot (see
+    docs/AUDIO_LIFECYCLE_AUDIT.md), so this mirrors `_run_worker`'s
+    retry-once policy rather than adding new fallback behaviour.
+    """
+    for attempt in (1, 2):
+        proc = subprocess.Popen(
+            _worker_command(
+                "record", path, str(samplerate), str(blocksize),
+                str(max_seconds), str(silence_seconds), str(start_timeout_seconds),
+                str(cue_freq_hz), str(cue_seconds), str(cue_volume), str(cue_lead_silence),
+            ),
+            # No stdout pipe: `record` never writes to stdout (see
+            # speak_audio_worker.py), so there's nothing to drain and no
+            # deadlock risk in leaving it inherited. stderr is piped and
+            # owned exclusively by the drain thread below -- never touched
+            # via Popen.communicate(), which would race the thread's reads
+            # against its own and raise "Bad file descriptor" on double-close.
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stderr_lines: list[str] = []
+        ready_event = threading.Event()
+        stderr_thread = threading.Thread(
+            target=_drain_stderr, args=(proc.stderr, stderr_lines, ready_event), daemon=True,
+        )
+        stderr_thread.start()
+
+        # Poll in small increments rather than one blocking wait(timeout=...)
+        # so a worker that exits early (fast failure) is noticed and retried
+        # right away instead of waiting out the full READY_WAIT_SECONDS.
+        deadline = time.time() + READY_WAIT_SECONDS
+        while not ready_event.is_set() and proc.poll() is None and time.time() < deadline:
+            ready_event.wait(timeout=0.05)
+        if ready_event.is_set():
+            return _RecordHandle(proc, path, stderr_lines, stderr_thread)
+
+        # Not ready in time: either the worker exited early (fast failure,
+        # worth one retry with a fresh process) or it is hung past
+        # READY_WAIT_SECONDS (not worth retrying -- retrying a hang just
+        # doubles the wait for the same outcome).
+        exited_early = proc.poll() is not None
+        if exited_early and attempt == 1:
+            log.warning(
+                "record worker exited before signalling readiness (exit %s); retrying once:\n%s",
+                proc.returncode, "".join(stderr_lines[-20:]) or "(worker produced no stderr)",
+            )
+            stderr_thread.join(timeout=5.0)
+            continue
+
+        proc.kill()
+        proc.wait()
+        stderr_thread.join(timeout=5.0)
+        tail = "".join(stderr_lines[-20:]) or "(worker produced no stderr)"
+        if exited_early:
+            raise RuntimeError(f"record worker failed twice before signalling readiness (exit {proc.returncode}):\n{tail}")
+        raise RuntimeError(
+            f"record worker did not signal readiness (phase={READY_PHASE}) within "
+            f"{READY_WAIT_SECONDS:.0f}s; killed it rather than treat a mic that might "
+            f"not be listening as ready. Last stderr:\n{tail}"
+        )
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def _finish_record_worker(handle: _RecordHandle, cap_seconds: float, start_timeout_seconds: float) -> np.ndarray:
+    """Wait for a record worker (already confirmed ready by
+    `_start_record_worker`) to finish, and return its captured audio.
+
+    Timeout budget: the worker's own wall-clock cap is
+    start_timeout_seconds + max_seconds measured from stream open (already
+    passed by the time this is called), plus a small fixed margin for
+    process start/exit overhead -- a fixed margin, not a multiple, so a
+    slow VAD model load can't silently double the wait. Readiness has
+    already been confirmed, so this wait is just "cap_seconds forward from
+    here, plus margin", not cap_seconds plus the readiness wait again.
+    """
+    timeout = cap_seconds + 15.0
+    try:
+        handle.proc.wait(timeout=timeout)
+        returncode = handle.proc.returncode
+    except subprocess.TimeoutExpired:
+        handle.proc.kill()
+        handle.proc.wait()
+        returncode = None
+    # The drain thread's own `for line in iter(pipe.readline, "")` returns
+    # (closing the pipe) once the process exits and stderr hits EOF, so this
+    # join is bounded by the wait/kill above, not an independent hang risk.
+    handle.stderr_thread.join(timeout=5.0)
+
+    if returncode is None:
+        phase = _last_phase("".join(handle.stderr_lines))
+        raise RuntimeError(
+            f"audio worker 'record' exceeded its own budget and was killed after "
+            f"{timeout:.0f}s (last phase: {phase}); this means the worker's internal "
+            f"wall-clock cap did not fire -- see speak_audio_worker.py's cmd_record cap logic"
+        )
+    if returncode == speak_audio_worker.TIMEOUT_EXIT_CODE:
+        raise TimeoutError(f"no speech detected within {start_timeout_seconds:.0f}s")
+    if returncode != 0:
+        tail = "".join(handle.stderr_lines[-20:]) or "(worker produced no stderr)"
+        raise RuntimeError(f"audio worker 'record' failed (exit {returncode}) after signalling readiness:\n{tail}")
+    return np.fromfile(handle.path, dtype=np.float32)
+
+
+def _record_pcm(
+    samplerate: int, blocksize: int, max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
+    cue_freq_hz: float = 0.0, cue_seconds: float = 0.3, cue_volume: float = 0.4, cue_lead_silence: float = 0.2,
+) -> np.ndarray:
+    """Record via the worker subprocess. If `cue_freq_hz > 0`, the worker
+    plays the "ear open" cue itself, in-process, right after the mic opens
+    and before it starts reading frames for real -- see
+    speak_audio_worker.py's cmd_record docstring for why the cue must be
+    played by the same process that owns the input stream (playing it via a
+    separate `play` subprocess can silently lose the cue on a Bluetooth
+    device mid-HFP-renegotiation)."""
     with tempfile.NamedTemporaryFile(prefix="speak-record-", suffix=".pcm", delete=False) as f:
         path = f.name
     os.unlink(path)  # the worker creates it; we just need a unique name
     try:
-        # The worker's own wall-clock cap is start_timeout_seconds +
-        # max_seconds, measured from stream open (see cmd_record in
-        # speak_audio_worker.py) -- it always stops and writes whatever it
-        # captured by then, even if a VAD is fooled into never reporting
-        # silence (e.g. a TV in the room). This subprocess timeout is that
-        # same budget plus a small fixed margin for process start/exit
-        # overhead; a fixed margin, not a multiple, so a slow VAD model
-        # load can't silently double the wait.
-        cap_seconds = start_timeout_seconds + max_seconds
-        timeout = cap_seconds + 15.0
-        proc = _run_worker(
-            "record", path, str(samplerate), str(blocksize),
-            str(max_seconds), str(silence_seconds), str(start_timeout_seconds),
-            timeout=timeout,
+        handle = _start_record_worker(
+            path, samplerate, blocksize, max_seconds, silence_seconds, start_timeout_seconds,
+            cue_freq_hz, cue_seconds, cue_volume, cue_lead_silence,
         )
-        if proc.returncode == speak_audio_worker.TIMEOUT_EXIT_CODE:
-            raise TimeoutError(f"no speech detected within {start_timeout_seconds:.0f}s")
-        return np.fromfile(path, dtype=np.float32)
+        cap_seconds = start_timeout_seconds + max_seconds
+        return _finish_record_worker(handle, cap_seconds, start_timeout_seconds)
     finally:
         if os.path.exists(path):
             os.unlink(path)
@@ -294,10 +456,24 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
     engines.wait()
     import mlx_whisper
 
-    # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep
-    _cue(880.0, seconds=0.3, volume=0.4, lead_silence=0.2)
+    # The "ear open" cue is played by the record worker itself, from inside
+    # the same process that holds the input stream open (see
+    # speak_audio_worker.py's cmd_record and _record_pcm's docstring) --
+    # NOT by a separate `play` subprocess. On a Bluetooth device (e.g.
+    # AirPods) that splits into direction-specific CoreAudio entries, two
+    # processes each opening one half of the device at the same time can
+    # silently lose the cue during HFP profile renegotiation. Playing it
+    # in-process also means the mic is already buffering (via a background
+    # reader thread, started before the cue plays) for the cue's own
+    # duration, so speech spoken during/right after the beep is never lost.
+    # start_timeout_seconds is enforced by the worker from the moment the
+    # cue finishes playing (`phase=cue-played`), not from stream-open.
     try:
-        audio = _record_pcm(MIC_RATE, VAD_FRAME, max_seconds, silence_seconds, start_timeout_seconds)
+        # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep
+        audio = _record_pcm(
+            MIC_RATE, VAD_FRAME, max_seconds, silence_seconds, start_timeout_seconds,
+            cue_freq_hz=880.0, cue_seconds=0.3, cue_volume=0.4, cue_lead_silence=0.2,
+        )
     except TimeoutError:
         _cue(330.0)
         raise
