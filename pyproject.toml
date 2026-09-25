@@ -12,6 +12,7 @@ dependencies = [
     "silero-vad>=5.1",
     "sounddevice>=0.5.6",
     "numpy>=1.26",
+    "scipy>=1.11",  # resample_poly, used only for optional native-rate input-device capture
     # spaCy model misaki (Kokoro G2P) needs; pinned here so `uv sync` never removes it
     "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
 ]

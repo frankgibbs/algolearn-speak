@@ -67,6 +67,114 @@ class TestPlayPcmStream(unittest.TestCase):
         s._play_pcm_stream([], s.TTS_RATE, timeout=10.0)  # must not raise
 
 
+class TestOutputDeviceReachesWorker(unittest.TestCase):
+    """SPEAK_OUTPUT_DEVICE (module-level s.OUTPUT_DEVICE) must reach every
+    playback path's worker command: play (_play_pcm), play-stream
+    (_play_pcm_stream), and the in-worker ear-open cue (record, via
+    _start_record_worker). Captures the actual argv built for each, with
+    the underlying subprocess call left real (dry-run env already set at
+    module import) so this also proves the command is well-formed."""
+
+    def test_play_pcm_passes_output_device_to_the_play_worker(self):
+        captured = {}
+        real_run = subprocess.run
+
+        def capturing_run(cmd, *args, **kwargs):
+            captured["cmd"] = cmd
+            return real_run(cmd, *args, **kwargs)
+
+        with mock.patch.object(s, "OUTPUT_DEVICE", "Logi USB Headset"):
+            with mock.patch.object(subprocess, "run", side_effect=capturing_run):
+                s._play_pcm(s._tone(440.0, 0.01), s.TTS_RATE)
+
+        self.assertEqual(captured["cmd"][3], "play")
+        self.assertEqual(captured["cmd"][-1], "Logi USB Headset")
+
+    def test_play_pcm_passes_empty_string_when_output_device_unset(self):
+        captured = {}
+        real_run = subprocess.run
+
+        def capturing_run(cmd, *args, **kwargs):
+            captured["cmd"] = cmd
+            return real_run(cmd, *args, **kwargs)
+
+        with mock.patch.object(s, "OUTPUT_DEVICE", ""):
+            with mock.patch.object(subprocess, "run", side_effect=capturing_run):
+                s._play_pcm(s._tone(440.0, 0.01), s.TTS_RATE)
+
+        self.assertEqual(captured["cmd"][-1], "")
+
+    def test_play_pcm_stream_passes_output_device_to_the_play_stream_worker(self):
+        captured = {}
+        real_popen = subprocess.Popen
+
+        def capturing_popen(cmd, *args, **kwargs):
+            captured["cmd"] = cmd
+            return real_popen(cmd, *args, **kwargs)
+
+        chunks = [s._tone(440.0, 0.01).reshape(-1, 1)]
+        with mock.patch.object(s, "OUTPUT_DEVICE", "Logi USB Headset"):
+            with mock.patch.object(subprocess, "Popen", side_effect=capturing_popen):
+                s._play_pcm_stream(chunks, s.TTS_RATE, timeout=10.0)
+
+        self.assertEqual(captured["cmd"][3], "play-stream")
+        self.assertEqual(captured["cmd"][-1], "Logi USB Headset")
+
+    def test_start_record_worker_passes_output_device_name_on_the_command_line(self):
+        fake_proc = _FakePopen([f"phase={s.READY_PHASE}\n"], exit_after_lines=False)
+        captured_cmd = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmd["cmd"] = cmd
+            return fake_proc
+
+        with mock.patch.object(subprocess, "Popen", side_effect=fake_popen):
+            handle = s._start_record_worker(
+                "/tmp/x.pcm", s.MIC_RATE, s.VAD_FRAME, 5.0, 1.2, 3.0,
+                cue_freq_hz=880.0, output_device_name="Logi USB Headset",
+            )
+
+        self.assertEqual(captured_cmd["cmd"][-1], "Logi USB Headset")
+        fake_proc.kill()
+        handle.stderr_thread.join(timeout=5.0)
+
+    def test_listen_impl_passes_output_device_to_the_record_worker(self):
+        # End-to-end: SPEAK_OUTPUT_DEVICE (s.OUTPUT_DEVICE) reaches
+        # _start_record_worker's output_device_name via _listen_impl, the
+        # same way INPUT_DEVICE does for device_name.
+        orig_ready = s.engines.ready.is_set()
+        orig_error = s.engines.error
+        s.engines.ready.set()
+        s.engines.error = None
+        self.addCleanup(lambda: (s.engines.ready.clear() if not orig_ready else None))
+        self.addCleanup(setattr, s.engines, "error", orig_error)
+
+        captured = {}
+
+        def fake_start(path, samplerate, blocksize, max_seconds, silence_seconds, start_timeout_seconds,
+                        cue_freq_hz=0.0, cue_seconds=0.3, cue_volume=0.4, cue_lead_silence=0.2,
+                        device_name="", archive_path="", output_device_name=""):
+            captured["output_device_name"] = output_device_name
+            fake_proc = mock.Mock()
+            return s._RecordHandle(fake_proc, path, [f"phase={s.READY_PHASE}\n"], threading.Thread(target=lambda: None))
+
+        def fake_finish(handle, cap_seconds, start_timeout_seconds):
+            return np.zeros(int(s.MIC_RATE * 0.1), dtype=np.float32)
+
+        fake_mlx_whisper = mock.Mock()
+        fake_mlx_whisper.transcribe.return_value = {"text": "hi"}
+
+        with mock.patch.object(s, "OUTPUT_DEVICE", "Logi USB Headset"):
+            with mock.patch.object(s, "_start_record_worker", side_effect=fake_start):
+                with mock.patch.object(s, "_finish_record_worker", side_effect=fake_finish):
+                    with mock.patch.object(s, "_cue"):
+                        with mock.patch.object(s, "_ack"):
+                            with mock.patch.dict(sys.modules, {"mlx_whisper": fake_mlx_whisper}):
+                                s._listen_impl(max_seconds=5, silence_seconds=1.2, start_timeout_seconds=3)
+
+        self.assertEqual(captured["output_device_name"], "Logi USB Headset")
+
+
 class TestRecordPcm(unittest.TestCase):
     def test_record_pcm_returns_synthesized_audio(self):
         with mock.patch.dict(os.environ, {"SPEAK_AUDIO_DRY_RUN_SECONDS": "0.2"}):
@@ -298,6 +406,183 @@ class TestListenImpl(unittest.TestCase):
         self.assertIn("no text", str(ctx.exception))
 
 
+class TestCheckSaveDir(unittest.TestCase):
+    """SPEAK_SAVE_DIR must already exist and be writable -- no fallback, and
+    never created by this codebase (per the opt-in save-dir spec)."""
+
+    def test_missing_directory_raises_without_creating_it(self):
+        import tempfile
+        parent = tempfile.mkdtemp()
+        missing = os.path.join(parent, "does-not-exist")
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                s._check_save_dir(missing)
+            self.assertIn("does not exist", str(ctx.exception))
+            self.assertFalse(os.path.exists(missing), "_check_save_dir must never create the directory")
+        finally:
+            os.rmdir(parent)
+
+    def test_existing_writable_directory_passes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            s._check_save_dir(d)  # must not raise
+
+    def test_non_writable_directory_raises(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            os.chmod(d, 0o500)  # read+execute only, no write
+            try:
+                with self.assertRaises(RuntimeError) as ctx:
+                    s._check_save_dir(d)
+                self.assertIn("not writable", str(ctx.exception))
+            finally:
+                os.chmod(d, 0o700)  # restore so TemporaryDirectory can clean up
+
+    def test_a_file_instead_of_a_directory_raises(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile() as f:
+            with self.assertRaises(RuntimeError) as ctx:
+                s._check_save_dir(f.name)
+            self.assertIn("does not exist", str(ctx.exception))
+
+
+class TestSaveCapture(unittest.TestCase):
+    """_save_capture writes <SAVE_DIR>/<timestamp>_<n>.wav + matching .txt.
+    Exercised directly (not through _listen_impl) so it doesn't depend on
+    dry-run recording at all -- just synthesized PCM."""
+
+    def test_writes_wav_and_txt_with_matching_basenames(self):
+        import tempfile
+        import wave
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(s, "SAVE_DIR", d):
+                audio = np.linspace(-0.5, 0.5, 1600, dtype=np.float32)
+                s._save_capture(audio, 16000, "hello world")
+            wavs = sorted(p for p in os.listdir(d) if p.endswith(".wav"))
+            txts = sorted(p for p in os.listdir(d) if p.endswith(".txt"))
+            self.assertEqual(len(wavs), 1)
+            self.assertEqual(len(txts), 1)
+            self.assertEqual(wavs[0][:-4], txts[0][:-4])
+            with open(os.path.join(d, txts[0]), encoding="utf-8") as f:
+                self.assertEqual(f.read(), "hello world")
+            with wave.open(os.path.join(d, wavs[0]), "rb") as wf:
+                self.assertEqual(wf.getnchannels(), 1)
+                self.assertEqual(wf.getsampwidth(), 2)  # int16
+                self.assertEqual(wf.getframerate(), 16000)
+                self.assertEqual(wf.getnframes(), 1600)
+
+    def test_writes_wav_at_the_given_samplerate(self):
+        import tempfile
+        import wave
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(s, "SAVE_DIR", d):
+                audio = np.zeros(4800, dtype=np.float32)
+                s._save_capture(audio, 48000, "native rate capture")
+            wavs = [p for p in os.listdir(d) if p.endswith(".wav")]
+            with wave.open(os.path.join(d, wavs[0]), "rb") as wf:
+                self.assertEqual(wf.getframerate(), 48000)
+
+    def test_successive_captures_get_distinct_filenames(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(s, "SAVE_DIR", d):
+                s._save_capture(np.zeros(160, dtype=np.float32), 16000, "one")
+                s._save_capture(np.zeros(160, dtype=np.float32), 16000, "two")
+            wavs = sorted(p for p in os.listdir(d) if p.endswith(".wav"))
+            self.assertEqual(len(wavs), 2)
+            self.assertNotEqual(wavs[0], wavs[1])
+
+
+class TestListenImplSaveDir(unittest.TestCase):
+    """SPEAK_SAVE_DIR archiving wired through _listen_impl end to end, using
+    the same SPEAK_AUDIO_DRY_RUN_SECONDS the rest of this file uses so no
+    real device is touched."""
+
+    def setUp(self):
+        self._orig_ready = s.engines.ready.is_set()
+        self._orig_error = s.engines.error
+        s.engines.ready.set()
+        s.engines.error = None
+
+    def tearDown(self):
+        s.engines.error = self._orig_error
+        if not self._orig_ready:
+            s.engines.ready.clear()
+
+    def test_listen_impl_saves_capture_when_save_dir_is_set(self):
+        import tempfile
+        fake_mlx_whisper = mock.Mock()
+        fake_mlx_whisper.transcribe.return_value = {"text": "archived speech"}
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(s, "SAVE_DIR", d):
+                with mock.patch.dict(sys.modules, {"mlx_whisper": fake_mlx_whisper}):
+                    with mock.patch.object(s, "_ack"):
+                        with mock.patch.dict(os.environ, {"SPEAK_AUDIO_DRY_RUN_SECONDS": "0.2"}):
+                            text = s._listen_impl(max_seconds=5, silence_seconds=1.2, start_timeout_seconds=3)
+            self.assertEqual(text, "archived speech")
+            wavs = [p for p in os.listdir(d) if p.endswith(".wav")]
+            txts = [p for p in os.listdir(d) if p.endswith(".txt")]
+            self.assertEqual(len(wavs), 1)
+            self.assertEqual(len(txts), 1)
+            with open(os.path.join(d, txts[0]), encoding="utf-8") as f:
+                self.assertEqual(f.read(), "archived speech")
+
+    def test_listen_impl_does_not_save_when_save_dir_is_unset(self):
+        fake_mlx_whisper = mock.Mock()
+        fake_mlx_whisper.transcribe.return_value = {"text": "not archived"}
+        with mock.patch.object(s, "SAVE_DIR", ""):
+            with mock.patch.object(s, "_save_capture") as fake_save:
+                with mock.patch.dict(sys.modules, {"mlx_whisper": fake_mlx_whisper}):
+                    with mock.patch.object(s, "_ack"):
+                        with mock.patch.dict(os.environ, {"SPEAK_AUDIO_DRY_RUN_SECONDS": "0.2"}):
+                            s._listen_impl(max_seconds=5, silence_seconds=1.2, start_timeout_seconds=3)
+        fake_save.assert_not_called()
+
+    def test_listen_impl_does_not_save_when_transcript_is_empty(self):
+        # _listen_impl already raises before the save-dir check for an empty
+        # transcript (see the "no text" RuntimeError) -- only a
+        # non-empty-transcript capture is ever written to SPEAK_SAVE_DIR.
+        import tempfile
+        fake_mlx_whisper = mock.Mock()
+        fake_mlx_whisper.transcribe.return_value = {"text": "   "}
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(s, "SAVE_DIR", d):
+                with mock.patch.dict(sys.modules, {"mlx_whisper": fake_mlx_whisper}):
+                    with mock.patch.dict(os.environ, {"SPEAK_AUDIO_DRY_RUN_SECONDS": "0.2"}):
+                        with self.assertRaises(RuntimeError):
+                            s._listen_impl(max_seconds=5, silence_seconds=1.2, start_timeout_seconds=3)
+            self.assertEqual(os.listdir(d), [])
+
+    def test_listen_impl_passes_input_device_to_the_record_worker(self):
+        # SPEAK_INPUT_DEVICE, when set, must reach the record worker's CLI
+        # args via device_name -- verified here by capturing the command
+        # _start_record_worker builds, with the worker itself faked out.
+        captured = {}
+
+        def fake_start(path, samplerate, blocksize, max_seconds, silence_seconds, start_timeout_seconds,
+                        cue_freq_hz=0.0, cue_seconds=0.3, cue_volume=0.4, cue_lead_silence=0.2,
+                        device_name="", archive_path="", output_device_name=""):
+            captured["device_name"] = device_name
+            fake_proc = mock.Mock()
+            return s._RecordHandle(fake_proc, path, [f"phase={s.READY_PHASE}\n"], threading.Thread(target=lambda: None))
+
+        def fake_finish(handle, cap_seconds, start_timeout_seconds):
+            return np.zeros(int(s.MIC_RATE * 0.1), dtype=np.float32)
+
+        fake_mlx_whisper = mock.Mock()
+        fake_mlx_whisper.transcribe.return_value = {"text": "hi"}
+
+        with mock.patch.object(s, "INPUT_DEVICE", "Logi USB Headset"):
+            with mock.patch.object(s, "_start_record_worker", side_effect=fake_start):
+                with mock.patch.object(s, "_finish_record_worker", side_effect=fake_finish):
+                    with mock.patch.object(s, "_cue"):
+                        with mock.patch.object(s, "_ack"):
+                            with mock.patch.dict(sys.modules, {"mlx_whisper": fake_mlx_whisper}):
+                                s._listen_impl(max_seconds=5, silence_seconds=1.2, start_timeout_seconds=3)
+
+        self.assertEqual(captured["device_name"], "Logi USB Headset")
+
+
 class _FakeStderr:
     """A minimal file-like object standing in for a real Popen's `.stderr`
     pipe: `readline()` returns queued lines one at a time (each ending in
@@ -402,8 +687,9 @@ class TestReadinessHandshake(unittest.TestCase):
         self.assertEqual(cmd[0:3], [sys.executable, "-m", "speak_audio_worker"])
         self.assertEqual(cmd[3], "record")
         # record <path> <samplerate> <blocksize> <max_seconds> <silence_seconds>
-        #        <start_timeout_seconds> <cue_freq_hz> <cue_seconds> <cue_volume> <cue_lead_silence>
-        self.assertEqual(cmd[-4:], ["880.0", "0.3", "0.4", "0.2"])
+        #        <start_timeout_seconds> <cue_freq_hz> <cue_seconds> <cue_volume>
+        #        <cue_lead_silence> <device_name> <archive_path> <output_device_name>
+        self.assertEqual(cmd[-7:], ["880.0", "0.3", "0.4", "0.2", "", "", ""])
         # Cleanup: reap the fake process's drain thread cleanly.
         fake_proc.kill()
         handle.stderr_thread.join(timeout=5.0)
@@ -448,7 +734,8 @@ class TestReadinessHandshake(unittest.TestCase):
         fake_proc = _FakePopen([f"phase={s.READY_PHASE}\n"], exit_after_lines=True, returncode=0)
 
         def fake_start(path, samplerate, blocksize, max_seconds, silence_seconds, start_timeout_seconds,
-                        cue_freq_hz=0.0, cue_seconds=0.3, cue_volume=0.4, cue_lead_silence=0.2):
+                        cue_freq_hz=0.0, cue_seconds=0.3, cue_volume=0.4, cue_lead_silence=0.2,
+                        device_name="", archive_path="", output_device_name=""):
             order.append("worker-ready")
             captured_cue_kwargs.update(
                 cue_freq_hz=cue_freq_hz, cue_seconds=cue_seconds,

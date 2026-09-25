@@ -79,9 +79,48 @@ there is nothing left to go stale between calls.
 | `SPEAK_SPEED` | `1.0` | Speech rate multiplier |
 | `SPEAK_LANGUAGE` | `en` | Whisper language hint |
 | `SPEAK_ACK_TEXT` | `Processing.` | Spoken after every successful `listen`, right after the rising chime |
+| `SPEAK_INPUT_DEVICE` | unset | Substring of an input device's name (e.g. `Logi USB Headset`). When set, the record worker resolves it via `sd.query_devices(name, kind="input")` -- `kind="input"` so a device that exposes both an input and output entry under the same name (a USB headset) resolves to its input side without an ambiguous-match error. No fallback: zero or multiple matches raises rather than silently using the default device. When unset, recording uses the current default-device behaviour, unchanged. |
+| `SPEAK_SAVE_DIR` | unset | Absolute path to an existing, writable directory. When set, every successful `listen`/`converse` capture that produced a non-empty transcript is saved as `<dir>/<UTC timestamp>_<n>.wav` (mono int16) plus a sibling `<same name>.txt` with the Whisper transcript -- a ready-made voice-clone reference set. The directory must already exist and be writable; it is never created automatically, and the server fails at startup if it isn't. |
+| `SPEAK_OUTPUT_DEVICE` | unset | Substring of an output device's name (e.g. `Logi USB Headset`). Resolved via `sd.query_devices(name, kind="output")` -- `kind="output"` so a device with both input and output entries under the same name resolves to its output side. No fallback: zero or multiple matches raises. Applies to every playback path: `speak`'s streamed TTS (`play-stream`), the server's tone cues (`play`, used for the ear-closed/timeout beeps and the "Processing" ack), and the in-worker ear-open cue played by the `record` worker itself. When unset, playback uses the current default-device behaviour, unchanged. |
 
 Models are cached under `~/.cache/huggingface`. Audio devices are whatever
-macOS has as default input and output. Set them in System Settings, Sound.
+macOS has as default input and output. Set them in System Settings, Sound,
+unless `SPEAK_INPUT_DEVICE`/`SPEAK_OUTPUT_DEVICE` override them.
+
+### Native-rate capture and archiving
+
+When `SPEAK_INPUT_DEVICE` names a device whose native sample rate
+(`default_samplerate`) is above 16 kHz, the record worker opens the input
+stream at that native rate instead of 16 kHz. Every block is resampled down
+to 16 kHz (`scipy.signal.resample_poly`) before it reaches Silero VAD and
+Whisper, so the transcription path is byte-for-byte the same 16 kHz
+contract as before -- `SPEAK_INPUT_DEVICE` never changes what gets
+transcribed, only what gets archived. When `SPEAK_SAVE_DIR` is also set,
+the un-resampled native-rate audio is captured alongside the resampled
+16 kHz stream and saved to the archive -- higher-fidelity material for
+voice cloning than the 16 kHz path Whisper needs. If the device's native
+rate is at or below 16 kHz, or `SPEAK_INPUT_DEVICE` is unset, the archived
+WAV is simply the 16 kHz capture -- there is no second stream to prefer.
+
+### Configuring in `~/.claude.json`
+
+All three variables go in the `speak` MCP server's `env` block:
+
+```json
+"speak": {
+  "command": "/Users/frankg/workspace/algolearn/live/algolearn-speak/.venv/bin/algolearn-speak",
+  "env": {
+    "SPEAK_INPUT_DEVICE": "Logi USB Headset",
+    "SPEAK_OUTPUT_DEVICE": "Logi USB Headset",
+    "SPEAK_SAVE_DIR": "/absolute/path/to/an/existing/writable/directory"
+  }
+}
+```
+
+A session restart (new Claude Code session, or `/mcp` then reconnect) is
+required to pick up any of these -- this MCP server never restarts
+itself (see "Audio process isolation" above), and its env is read once at
+process start.
 
 ## Registration with Claude Code
 

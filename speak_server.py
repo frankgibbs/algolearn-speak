@@ -41,6 +41,11 @@ SPEED = float(os.environ.get("SPEAK_SPEED", "1.0"))
 LANGUAGE = os.environ.get("SPEAK_LANGUAGE", "en")
 ACK_TEXT = os.environ.get("SPEAK_ACK_TEXT", "Processing.")  # spoken after each successful listen
 
+# Opt-in voice-clone archival. Both unset by default -> zero behaviour change.
+INPUT_DEVICE = os.environ.get("SPEAK_INPUT_DEVICE", "")   # substring match, resolved in the worker
+OUTPUT_DEVICE = os.environ.get("SPEAK_OUTPUT_DEVICE", "")  # substring match, resolved in the worker
+SAVE_DIR = os.environ.get("SPEAK_SAVE_DIR", "")            # if set, every successful capture is archived here
+
 MIC_RATE = 16_000          # Whisper and Silero both want 16 kHz mono
 VAD_FRAME = 512            # Silero frame size at 16 kHz (32 ms)
 TTS_RATE = 24_000          # Kokoro output rate
@@ -159,6 +164,21 @@ def _last_phase(stderr: bytes | str | None) -> str:
     return phases[-1] if phases else "unknown (no phase status line seen)"
 
 
+def _last_archive_rate(stderr_lines: list[str]) -> int:
+    """Reads the worker's `archive-rate=<hz>` stderr line (see
+    speak_audio_worker.py's cmd_record) -- the worker is the only place that
+    resolves the input device's native rate, since this process never
+    imports sounddevice. Raises if archiving audio was returned but no rate
+    line was ever seen: that would mean stale/incoherent state between this
+    process and the worker, and saving a WAV with a guessed rate is worse
+    than failing loudly."""
+    for line in stderr_lines:
+        line = line.strip()
+        if line.startswith("archive-rate="):
+            return int(line.split("=", 1)[1])
+    raise RuntimeError("worker produced archive audio but never reported archive-rate=<hz> on stderr")
+
+
 def _stderr_tail(proc: subprocess.CompletedProcess, lines: int = 20) -> str:
     tail = "\n".join(proc.stderr.strip().splitlines()[-lines:])
     return tail or "(worker produced no stderr)"
@@ -192,7 +212,7 @@ def _play_pcm(audio: np.ndarray, samplerate: int) -> None:
         # generous fixed budget: playback itself has no fixed duration bound
         # here since callers pass short cues and full TTS chunks alike.
         duration = len(audio) / samplerate
-        _run_worker("play", path, str(samplerate), timeout=duration + 30.0)
+        _run_worker("play", path, str(samplerate), OUTPUT_DEVICE, timeout=duration + 30.0)
     finally:
         os.unlink(path)
 
@@ -213,7 +233,7 @@ def _play_pcm_stream(chunks: list[np.ndarray], samplerate: int, timeout: float) 
     payload = b"".join(chunk.astype(np.float32).tobytes() for chunk in chunks)
     for attempt in (1, 2):
         proc = subprocess.Popen(
-            _worker_command("play-stream", str(samplerate)),
+            _worker_command("play-stream", str(samplerate), OUTPUT_DEVICE),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -272,6 +292,7 @@ def _drain_stderr(pipe, lines: list[str], ready_event: threading.Event) -> None:
 def _start_record_worker(
     path: str, samplerate: int, blocksize: int, max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
     cue_freq_hz: float = 0.0, cue_seconds: float = 0.3, cue_volume: float = 0.4, cue_lead_silence: float = 0.2,
+    device_name: str = "", archive_path: str = "", output_device_name: str = "",
 ) -> _RecordHandle:
     """Launch the record worker and block only until it signals readiness
     (mic open, and the ear-open cue -- if `cue_freq_hz > 0` -- already
@@ -299,6 +320,7 @@ def _start_record_worker(
                 "record", path, str(samplerate), str(blocksize),
                 str(max_seconds), str(silence_seconds), str(start_timeout_seconds),
                 str(cue_freq_hz), str(cue_seconds), str(cue_volume), str(cue_lead_silence),
+                device_name, archive_path, output_device_name,
             ),
             # No stdout pipe: `record` never writes to stdout (see
             # speak_audio_worker.py), so there's nothing to drain and no
@@ -395,6 +417,7 @@ def _finish_record_worker(handle: _RecordHandle, cap_seconds: float, start_timeo
 def _record_pcm(
     samplerate: int, blocksize: int, max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
     cue_freq_hz: float = 0.0, cue_seconds: float = 0.3, cue_volume: float = 0.4, cue_lead_silence: float = 0.2,
+    device_name: str = "", output_device_name: str = "",
 ) -> np.ndarray:
     """Record via the worker subprocess. If `cue_freq_hz > 0`, the worker
     plays the "ear open" cue itself, in-process, right after the mic opens
@@ -402,20 +425,68 @@ def _record_pcm(
     speak_audio_worker.py's cmd_record docstring for why the cue must be
     played by the same process that owns the input stream (playing it via a
     separate `play` subprocess can silently lose the cue on a Bluetooth
-    device mid-HFP-renegotiation)."""
+    device mid-HFP-renegotiation).
+
+    `device_name`, if non-empty, is resolved in the worker (this process
+    never touches sounddevice) -- see speak_audio_worker.py's
+    `_resolve_input_device`. Always returns the 16kHz stream -- unchanged
+    contract regardless of `device_name`. Callers that also want the
+    native-rate archive copy (SPEAK_SAVE_DIR) use `_record_pcm_with_archive`
+    instead."""
+    audio, _archive_audio, _archive_rate = _record_pcm_with_archive(
+        samplerate, blocksize, max_seconds, silence_seconds, start_timeout_seconds,
+        cue_freq_hz, cue_seconds, cue_volume, cue_lead_silence,
+        device_name, want_archive=False, output_device_name=output_device_name,
+    )
+    return audio
+
+
+def _record_pcm_with_archive(
+    samplerate: int, blocksize: int, max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
+    cue_freq_hz: float = 0.0, cue_seconds: float = 0.3, cue_volume: float = 0.4, cue_lead_silence: float = 0.2,
+    device_name: str = "", want_archive: bool = False, output_device_name: str = "",
+) -> tuple[np.ndarray, np.ndarray | None, int]:
+    """Same recording as `_record_pcm`, plus (when `want_archive` is True and
+    `device_name` resolves to a native rate above `samplerate`) the
+    un-resampled native-rate copy the worker captured alongside it -- see
+    speak_audio_worker.py's cmd_record `archive_pcm_path` argument.
+
+    Returns `(audio, archive_audio, archive_rate)`: `audio` is always the
+    16kHz stream (unchanged contract). `archive_audio`/`archive_rate` are
+    non-None only when `want_archive` is True AND the worker actually
+    captured at a native rate above `samplerate` -- otherwise the archive
+    would be identical to `audio` at `samplerate`, which the caller can use
+    directly instead."""
     with tempfile.NamedTemporaryFile(prefix="speak-record-", suffix=".pcm", delete=False) as f:
         path = f.name
     os.unlink(path)  # the worker creates it; we just need a unique name
+    archive_path = ""
+    if want_archive and device_name:
+        with tempfile.NamedTemporaryFile(prefix="speak-record-archive-", suffix=".pcm", delete=False) as f:
+            archive_path = f.name
+        os.unlink(archive_path)
     try:
         handle = _start_record_worker(
             path, samplerate, blocksize, max_seconds, silence_seconds, start_timeout_seconds,
             cue_freq_hz, cue_seconds, cue_volume, cue_lead_silence,
+            device_name, archive_path, output_device_name,
         )
         cap_seconds = start_timeout_seconds + max_seconds
-        return _finish_record_worker(handle, cap_seconds, start_timeout_seconds)
+        audio = _finish_record_worker(handle, cap_seconds, start_timeout_seconds)
+        archive_audio = None
+        archive_rate = samplerate
+        if archive_path and os.path.exists(archive_path):
+            archive_audio = np.fromfile(archive_path, dtype=np.float32)
+            if archive_audio.size == 0:
+                archive_audio = None
+            else:
+                archive_rate = _last_archive_rate(handle.stderr_lines)
+        return audio, archive_audio, archive_rate
     finally:
         if os.path.exists(path):
             os.unlink(path)
+        if archive_path and os.path.exists(archive_path):
+            os.unlink(archive_path)
 
 
 def _speak_impl(text: str) -> float:
@@ -452,6 +523,59 @@ def _speak_impl(text: str) -> float:
     return samples / TTS_RATE
 
 
+_save_counter_lock = threading.Lock()
+_save_counter = 0
+
+
+def _check_save_dir(path: str) -> None:
+    """No fallback: SPEAK_SAVE_DIR must already exist and be writable. Never
+    created here -- an agent or a fat-fingered path silently spawning a new
+    directory on disk is worse than a clear startup failure."""
+    if not os.path.isdir(path):
+        raise RuntimeError(f"SPEAK_SAVE_DIR={path!r} does not exist or is not a directory; create it first (it is never created automatically)")
+    if not os.access(path, os.W_OK):
+        raise RuntimeError(f"SPEAK_SAVE_DIR={path!r} is not writable")
+
+
+def _save_capture(audio: np.ndarray, samplerate: int, text: str) -> None:
+    """Write `<SAVE_DIR>/<UTC timestamp>_<n>.wav` (mono int16 at `samplerate`)
+    plus a sibling `.txt` with the Whisper transcript, for use as voice-clone
+    reference material. Only called for captures that already produced a
+    non-empty transcript (see _listen_impl) -- silence/noise clips are never
+    archived. `_check_save_dir` has already validated SAVE_DIR at startup;
+    this still fails loudly (no try/except) if the write itself fails, e.g.
+    the directory was removed after startup."""
+    global _save_counter
+    with _save_counter_lock:
+        _save_counter += 1
+        n = _save_counter
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    base = os.path.join(SAVE_DIR, f"{stamp}_{n}")
+    pcm16 = np.clip(audio, -1.0, 1.0)
+    pcm16 = (pcm16 * 32767.0).astype(np.int16)
+    _write_wav(f"{base}.wav", pcm16, samplerate)
+    with open(f"{base}.txt", "w", encoding="utf-8") as f:
+        f.write(text)
+    log.info("saved capture to %s.wav (%.1fs at %dHz)", base, len(audio) / samplerate, samplerate)
+
+
+def _write_wav(path: str, pcm16: np.ndarray, samplerate: int) -> None:
+    """Minimal mono 16-bit PCM WAV writer -- no extra dependency for
+    something this small (44-byte header, then raw samples)."""
+    import struct
+
+    data = pcm16.tobytes()
+    with open(path, "wb") as f:
+        f.write(b"RIFF")
+        f.write(struct.pack("<I", 36 + len(data)))
+        f.write(b"WAVE")
+        f.write(b"fmt ")
+        f.write(struct.pack("<IHHIIHH", 16, 1, 1, samplerate, samplerate * 2, 2, 16))
+        f.write(b"data")
+        f.write(struct.pack("<I", len(data)))
+        f.write(data)
+
+
 def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
     engines.wait()
     import mlx_whisper
@@ -470,9 +594,10 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
     # cue finishes playing (`phase=cue-played`), not from stream-open.
     try:
         # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep
-        audio = _record_pcm(
+        audio, archive_audio, archive_rate = _record_pcm_with_archive(
             MIC_RATE, VAD_FRAME, max_seconds, silence_seconds, start_timeout_seconds,
             cue_freq_hz=880.0, cue_seconds=0.3, cue_volume=0.4, cue_lead_silence=0.2,
+            device_name=INPUT_DEVICE, want_archive=bool(SAVE_DIR), output_device_name=OUTPUT_DEVICE,
         )
     except TimeoutError:
         _cue(330.0)
@@ -484,6 +609,14 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
     log.info("listen: %.1fs of audio transcribed in %.1fs: %r", len(audio) / MIC_RATE, time.time() - t0, text)
     if not text:
         raise RuntimeError(f"speech was detected ({len(audio) / MIC_RATE:.1f}s) but Whisper returned no text")
+    if SAVE_DIR:
+        # Prefer the native-rate archive (better clone reference material)
+        # when one was actually captured; otherwise the 16kHz stream already
+        # in hand is the only copy that exists.
+        if archive_audio is not None:
+            _save_capture(archive_audio, archive_rate, text)
+        else:
+            _save_capture(audio, MIC_RATE, text)
     _ack()
     return text
 
@@ -553,6 +686,8 @@ async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    if SAVE_DIR:
+        _check_save_dir(SAVE_DIR)
     threading.Thread(target=engines.load, name="engine-load", daemon=True).start()
     mcp.run()
 

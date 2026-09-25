@@ -107,9 +107,38 @@ Code, pass `-e NAME=value` to `claude mcp add`.
 | `SPEAK_SPEED` | `1.0` | Speech rate multiplier |
 | `SPEAK_LANGUAGE` | `en` | Whisper language hint |
 | `SPEAK_ACK_TEXT` | `Processing.` | Word spoken after each successful `listen` |
+| `SPEAK_INPUT_DEVICE` | unset | Substring of an input device's name, e.g. `Logi USB Headset`. Resolved via `kind="input"` so a headset with both input and output entries under the same name doesn't raise an ambiguous-match error. Unset means the current default-device behaviour. |
+| `SPEAK_SAVE_DIR` | unset | Absolute path to an existing, writable directory. When set, every successful capture with a non-empty transcript is saved there as a `.wav` + matching `.txt` transcript -- voice-clone reference material. The directory must already exist; it is never created for you. |
+| `SPEAK_OUTPUT_DEVICE` | unset | Substring of an output device's name, e.g. `Logi USB Headset`. Resolved via `kind="output"` so a headset with both input and output entries under the same name doesn't raise an ambiguous-match error. Applies to `speak`'s TTS playback, the tone/ack cues, and the ear-open cue. Unset means the current default-device behaviour. |
 
 Audio devices are whatever macOS has as default input and output. Change them
-in System Settings, Sound.
+in System Settings, Sound, unless `SPEAK_INPUT_DEVICE`/`SPEAK_OUTPUT_DEVICE`
+override them -- set both to the same device to put the mic and speakers on
+one headset.
+
+If `SPEAK_INPUT_DEVICE` names a device whose native rate is above 16 kHz, the
+worker records at that native rate and resamples down to 16 kHz for VAD and
+Whisper (transcription is unaffected); when `SPEAK_SAVE_DIR` is also set, the
+archived `.wav` keeps the un-resampled, higher-fidelity native-rate audio.
+
+To set these for Claude Code, edit the `speak` entry's `env` block in
+`~/.claude.json`:
+
+```json
+"speak": {
+  "command": "/Users/frankg/workspace/algolearn/live/algolearn-speak/.venv/bin/algolearn-speak",
+  "env": {
+    "SPEAK_INPUT_DEVICE": "Logi USB Headset",
+    "SPEAK_OUTPUT_DEVICE": "Logi USB Headset",
+    "SPEAK_SAVE_DIR": "/absolute/path/to/an/existing/writable/directory"
+  }
+}
+```
+
+Then start a new Claude Code session, or run `/mcp` and reconnect `speak`, for
+the new environment to take effect -- the server reads its environment once at
+startup and, per this repo's audio-process-isolation design, is never
+restarted by its own code.
 
 ## Troubleshooting
 

@@ -22,6 +22,7 @@ dependencies = [
     { name = "mlx-audio" },
     { name = "mlx-whisper" },
     { name = "numpy" },
+    { name = "scipy" },
     { name = "silero-vad" },
     { name = "sounddevice" },
 ]
@@ -34,6 +35,7 @@ requires-dist = [
     { name = "mlx-audio", specifier = ">=0.5.1" },
     { name = "mlx-whisper", specifier = ">=0.4.3" },
     { name = "numpy", specifier = ">=1.26" },
+    { name = "scipy", specifier = ">=1.11" },
     { name = "silero-vad", specifier = ">=5.1" },
     { name = "sounddevice", specifier = ">=0.5.6" },
 ]
