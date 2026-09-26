@@ -9,15 +9,19 @@ MCP server (stdio) exposing four tools:
   status()        -> report whether speak/listen/converse are busy and how many
                      calls are queued behind the current one
 
-speak/listen/converse are serialized through one process-wide lock (see
-_SerializingLock below): a second caller queues and waits rather than being
-rejected or talking over the first.
+speak/listen/converse are serialized through one lock that is BOTH
+process-wide and cross-process (see _SerializingLock below): a second
+caller -- whether another thread in this process or a second
+speak_server.py process started by a second Claude Code session --
+queues and waits rather than being rejected or talking over the first.
 
 Everything runs on the Mac. No audio leaves the machine.
 """
 
 from __future__ import annotations
 
+import fcntl
+import json
 import logging
 import os
 import queue
@@ -104,27 +108,118 @@ class Engines:
 
 engines = Engines()
 
+# ---------------------------------------------------------------- cross-process lock
+#
+# Two Claude Code sessions each launch their OWN speak_server.py process, so
+# an in-process threading.Lock (below) only serializes calls within one
+# process -- it cannot stop two processes from opening the mic/speaker at
+# once. LOCK_DIR/LOCK_PATH are a well-known filesystem location every
+# speak_server.py instance on this Mac agrees on, so flock() on LOCK_PATH is
+# the actual cross-process mutex; SIDECAR_PATH is written by whoever holds it
+# so a process that does NOT hold the lock can identify who does (pid, tool,
+# since) for status() without needing IPC.
 
-class _SerializingLock:
-    """Process-wide FIFO-ish queue for the three audio tools.
+LOCK_DIR = os.path.expanduser("~/.algolearn-speak")
+LOCK_PATH = os.path.join(LOCK_DIR, "audio.lock")
+SIDECAR_PATH = os.path.join(LOCK_DIR, "audio.lock.json")
 
-    `speak`, `listen`, and `converse` share one Mac microphone/speaker pair,
-    so two calls (e.g. from two agents driving this same MCP server) must
-    never run at once -- one waits for the other to finish, then proceeds
-    (a queue, never a rejection). This wraps `threading.Lock` (the actual
-    mutual exclusion) with a plain counter and the name of the tool
-    currently holding it, so `status()` can report `busy`/`current_tool`/
-    `waiting` without changing the underlying exclusion semantics: a bare
-    Lock already blocks every other waiter until release, which is exactly
-    the "wait then proceed" behaviour asked for -- this just makes that
-    state observable.
+
+class _CrossProcessLock:
+    """An advisory, cross-process exclusive lock via fcntl.flock on a
+    well-known lockfile, plus a small JSON sidecar naming the current holder.
+
+    `acquire()` opens (creating if needed) LOCK_PATH and blocks on
+    `flock(LOCK_EX)` -- the kernel queues concurrent acquirers and wakes them
+    one at a time on release, which is the "wait then proceed, never reject"
+    behaviour asked for, now across processes rather than just threads.
+    While held, the sidecar file holds `{"pid", "tool", "since"}` so
+    `external_holder()` (called by a process that does NOT hold the lock) can
+    report who does, without flock() itself exposing that -- flock only ever
+    tells a non-holder "locked or not", never by whom.
+
+    Not reentrant, and not meant to be: exactly one `acquire`/`release` pair
+    per tool call, exactly like the in-process lock it sits beside.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, lock_path: str, sidecar_path: str) -> None:
+        self._lock_path = lock_path
+        self._sidecar_path = sidecar_path
+        self._fd: int | None = None
+
+    def acquire(self, tool_name: str) -> None:
+        os.makedirs(os.path.dirname(self._lock_path), exist_ok=True)
+        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)  # blocks until free; queues fairly at the kernel level
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+        sidecar = {"pid": os.getpid(), "tool": tool_name, "since": time.time()}
+        with open(self._sidecar_path, "w", encoding="utf-8") as f:
+            json.dump(sidecar, f)
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            if os.path.exists(self._sidecar_path):
+                os.unlink(self._sidecar_path)
+        finally:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
+
+    def external_holder(self) -> dict | None:
+        """Called only when THIS process does not currently hold the lock
+        (see _SerializingLock.snapshot). Probes with a non-blocking
+        LOCK_EX|LOCK_NB on a fresh fd: if that succeeds, nothing else holds
+        it, so release immediately and return None. If it fails (EWOULDBLOCK/
+        EAGAIN), some other process holds it -- read the sidecar it wrote to
+        report who. The sidecar can legitimately be missing or mid-write
+        (created just after the flock, removed just before releasing it), so
+        a missing/unparseable sidecar under a held lock is reported as
+        unknown rather than raised -- this is a best-effort status probe, not
+        the correctness mechanism (flock is)."""
+        if not os.path.exists(self._lock_path):
+            return None
+        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None
+        except OSError:
+            try:
+                with open(self._sidecar_path, encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, ValueError):
+                return {"pid": None, "tool": None, "since": None}
+        finally:
+            os.close(fd)
+
+
+class _SerializingLock:
+    """Process-wide (in-process) AND cross-process FIFO-ish queue for the
+    three audio tools.
+
+    `speak`, `listen`, and `converse` share one Mac microphone/speaker pair,
+    so two calls -- from two threads in this process, OR from two separate
+    speak_server.py processes started by two Claude Code sessions -- must
+    never run at once. One waits for the other to finish, then proceeds (a
+    queue, never a rejection). The in-process `threading.Lock` handles the
+    first case; `_CrossProcessLock` (flock on a well-known lockfile) handles
+    the second. `acquire()` takes the in-process lock first (so this
+    process's own waiter count/current-tool bookkeeping stays correct even
+    while blocked on the cross-process lock), then the file lock; `release()`
+    reverses the order.
+    """
+
+    def __init__(self, lock_path: str = LOCK_PATH, sidecar_path: str = SIDECAR_PATH) -> None:
         self._lock = threading.Lock()
-        self._state_lock = threading.Lock()  # protects the two fields below only
+        self._state_lock = threading.Lock()  # protects the fields below only
         self._current_tool: str | None = None
         self._waiting = 0
+        self._cross = _CrossProcessLock(lock_path, sidecar_path)
 
     def acquire(self, tool_name: str) -> None:
         with self._state_lock:
@@ -134,18 +229,38 @@ class _SerializingLock:
         finally:
             with self._state_lock:
                 self._waiting -= 1
+        try:
+            self._cross.acquire(tool_name)
+        except BaseException:
+            self._lock.release()
+            raise
         with self._state_lock:
             self._current_tool = tool_name
 
     def release(self) -> None:
         with self._state_lock:
             self._current_tool = None
+        self._cross.release()
         self._lock.release()
 
     def snapshot(self) -> tuple[bool, str | None, int]:
-        """Returns (busy, current_tool, waiting) without blocking."""
+        """Returns (busy, current_tool, waiting) without blocking. `busy`/
+        `current_tool` reflect this process's own in-process state first; if
+        this process is idle, checks whether another process holds the
+        cross-process lock and reports that instead (current_tool becomes
+        "<tool> (pid <n>, other process)"), so status() is honest across
+        processes, not just within one."""
         with self._state_lock:
-            return self._current_tool is not None, self._current_tool, self._waiting
+            current_tool, waiting = self._current_tool, self._waiting
+        if current_tool is not None:
+            return True, current_tool, waiting
+        holder = self._cross.external_holder()
+        if holder is None:
+            return False, None, waiting
+        tool = holder.get("tool")
+        pid = holder.get("pid")
+        label = f"{tool or 'unknown'} (pid {pid or '?'}, other process)"
+        return True, label, waiting
 
 
 audio_lock = _SerializingLock()   # speak, listen, and converse are serialized through this -- see class docstring
@@ -722,11 +837,13 @@ async def speak(text: str) -> str:
 
     Write it as spoken prose: short sentences, no markdown, no code. Returns the spoken duration.
 
-    Status: calls to speak/listen/converse are serialized through one process-wide
-    lock -- there is only one microphone and one speaker. If another call is in
-    progress, this one queues and waits for it to finish, then proceeds; it is
-    never rejected. Use `status()` to see what is currently running and how many
-    calls are waiting.
+    Status: calls to speak/listen/converse are serialized through one lock
+    that is both process-wide and cross-process (a second Claude Code
+    session running its own speak_server.py is included) -- there is only
+    one microphone and one speaker on this Mac. If another call is in
+    progress anywhere, this one queues and waits for it to finish, then
+    proceeds; it is never rejected. Use `status()` to see what is currently
+    running (including in another process) and how many calls are waiting.
     """
     seconds = await _run(_speak_sync, text)
     return f"spoke for {seconds:.1f}s"
@@ -741,11 +858,13 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 1.2, start
     `silence_seconds` of quiet following speech, or at `max_seconds` of speech. Raises
     TimeoutError if nobody speaks within `start_timeout_seconds`.
 
-    Status: calls to speak/listen/converse are serialized through one process-wide
-    lock -- there is only one microphone and one speaker. If another call is in
-    progress, this one queues and waits for it to finish, then proceeds; it is
-    never rejected. Use `status()` to see what is currently running and how many
-    calls are waiting.
+    Status: calls to speak/listen/converse are serialized through one lock
+    that is both process-wide and cross-process (a second Claude Code
+    session running its own speak_server.py is included) -- there is only
+    one microphone and one speaker on this Mac. If another call is in
+    progress anywhere, this one queues and waits for it to finish, then
+    proceeds; it is never rejected. Use `status()` to see what is currently
+    running (including in another process) and how many calls are waiting.
     """
     return await _run(_listen_sync, max_seconds, silence_seconds, start_timeout_seconds)
 
@@ -754,24 +873,30 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 1.2, start
 async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float = 1.2, start_timeout_seconds: float = 45.0) -> str:
     """Say `text`, then listen for the reply. One spoken round trip; returns the user's words.
 
-    Status: calls to speak/listen/converse are serialized through one process-wide
-    lock -- there is only one microphone and one speaker. If another call is in
-    progress, this one queues and waits for it to finish, then proceeds; it is
-    never rejected. Use `status()` to see what is currently running and how many
-    calls are waiting.
+    Status: calls to speak/listen/converse are serialized through one lock
+    that is both process-wide and cross-process (a second Claude Code
+    session running its own speak_server.py is included) -- there is only
+    one microphone and one speaker on this Mac. If another call is in
+    progress anywhere, this one queues and waits for it to finish, then
+    proceeds; it is never rejected. Use `status()` to see what is currently
+    running (including in another process) and how many calls are waiting.
     """
     return await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)
 
 
 @mcp.tool()
 async def status() -> dict:
-    """Report whether speak/listen/converse are busy right now.
+    """Report whether speak/listen/converse are busy right now, in this
+    process or in another one (e.g. a second Claude Code session's own
+    speak_server.py).
 
     Returns `{"busy": bool, "current_tool": str | None, "waiting": int}`.
-    `current_tool` is the name of the tool currently holding the audio lock
-    (or null if idle). `waiting` is how many other calls are queued behind
-    it -- they will run in the order they arrived, one at a time, once the
-    current call finishes. Never raises and never blocks on the audio lock.
+    `current_tool` is the name of the tool currently holding the lock, or
+    `"<tool> (pid <n>, other process)"` when a different process holds it,
+    or null if idle. `waiting` counts only callers queued in THIS process
+    (this process's own threads waiting on the in-process lock); it cannot
+    see how many callers another process has queued. Never raises and never
+    blocks.
     """
     busy, current_tool, waiting = audio_lock.snapshot()
     return {"busy": busy, "current_tool": current_tool, "waiting": waiting}

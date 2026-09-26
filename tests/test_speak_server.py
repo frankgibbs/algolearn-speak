@@ -811,71 +811,102 @@ class TestReadinessHandshake(unittest.TestCase):
         self.assertIn("failed twice before signalling readiness", str(ctx.exception))
 
 
+def _make_test_lock():
+    """A _SerializingLock pointed at a throwaway temp lockfile/sidecar --
+    NEVER the real ~/.algolearn-speak/audio.lock, which a live speak_server.py
+    session on this Mac may actually be holding. Returns (lock, tmpdir);
+    caller is responsible for cleaning up tmpdir."""
+    import tempfile
+
+    tmpdir = tempfile.mkdtemp(prefix="speak-lock-test-")
+    lock = s._SerializingLock(
+        lock_path=os.path.join(tmpdir, "audio.lock"),
+        sidecar_path=os.path.join(tmpdir, "audio.lock.json"),
+    )
+    return lock, tmpdir
+
+
 class TestSerializingLock(unittest.TestCase):
     """The lock behind speak/listen/converse must queue a second caller
     (wait then proceed) rather than reject it, and `status()` must report
-    busy/current_tool/waiting without itself blocking on the lock."""
+    busy/current_tool/waiting without itself blocking on the lock. Every
+    test here uses its own throwaway lockfile (see _make_test_lock) so it
+    never touches the real ~/.algolearn-speak lock a live session might hold."""
 
     def test_snapshot_reports_idle_when_unheld(self):
-        lock = s._SerializingLock()
-        self.assertEqual(lock.snapshot(), (False, None, 0))
+        lock, tmpdir = _make_test_lock()
+        try:
+            self.assertEqual(lock.snapshot(), (False, None, 0))
+        finally:
+            _rmtree(tmpdir)
 
     def test_snapshot_reports_current_tool_while_held(self):
-        lock = s._SerializingLock()
-        lock.acquire("speak")
+        lock, tmpdir = _make_test_lock()
         try:
-            self.assertEqual(lock.snapshot(), (True, "speak", 0))
+            lock.acquire("speak")
+            try:
+                self.assertEqual(lock.snapshot(), (True, "speak", 0))
+            finally:
+                lock.release()
+            self.assertEqual(lock.snapshot(), (False, None, 0))
         finally:
-            lock.release()
-        self.assertEqual(lock.snapshot(), (False, None, 0))
+            _rmtree(tmpdir)
 
     def test_second_caller_queues_and_waits_rather_than_being_rejected(self):
         import time
 
-        lock = s._SerializingLock()
-        order: list[str] = []
-        second_acquired = threading.Event()
+        lock, tmpdir = _make_test_lock()
+        try:
+            order: list[str] = []
+            second_acquired = threading.Event()
 
-        lock.acquire("listen")
-        order.append("first-acquired")
+            lock.acquire("listen")
+            order.append("first-acquired")
 
-        def second_caller():
-            lock.acquire("converse")
-            try:
-                order.append("second-acquired")
-                second_acquired.set()
-            finally:
-                lock.release()
+            def second_caller():
+                lock.acquire("converse")
+                try:
+                    order.append("second-acquired")
+                    second_acquired.set()
+                finally:
+                    lock.release()
 
-        t = threading.Thread(target=second_caller)
-        t.start()
-        # Give the second caller a moment to reach the blocking acquire() so
-        # `waiting` reflects it before the first caller releases.
-        deadline = time.time() + 2.0
-        while lock.snapshot()[2] < 1 and time.time() < deadline:
-            time.sleep(0.01)
-        busy, current_tool, waiting = lock.snapshot()
-        self.assertTrue(busy)
-        self.assertEqual(current_tool, "listen")
-        self.assertEqual(waiting, 1)
-        self.assertFalse(second_acquired.is_set(), "second caller must wait, not run concurrently")
+            t = threading.Thread(target=second_caller)
+            t.start()
+            # Give the second caller a moment to reach the blocking acquire() so
+            # `waiting` reflects it before the first caller releases.
+            deadline = time.time() + 2.0
+            while lock.snapshot()[2] < 1 and time.time() < deadline:
+                time.sleep(0.01)
+            busy, current_tool, waiting = lock.snapshot()
+            self.assertTrue(busy)
+            self.assertEqual(current_tool, "listen")
+            self.assertEqual(waiting, 1)
+            self.assertFalse(second_acquired.is_set(), "second caller must wait, not run concurrently")
 
-        order.append("first-releasing")
-        lock.release()
-        t.join(timeout=5.0)
+            order.append("first-releasing")
+            lock.release()
+            t.join(timeout=5.0)
 
-        self.assertEqual(order, ["first-acquired", "first-releasing", "second-acquired"])
-        self.assertEqual(lock.snapshot(), (False, None, 0))
+            self.assertEqual(order, ["first-acquired", "first-releasing", "second-acquired"])
+            self.assertEqual(lock.snapshot(), (False, None, 0))
+        finally:
+            _rmtree(tmpdir)
 
     def test_speak_sync_and_listen_sync_never_overlap(self):
         # End-to-end through the real _speak_sync/_listen_sync wrappers
         # (engines faked out), proving the lock is actually held for the
-        # whole duration of each call, not just acquired and dropped.
+        # whole duration of each call, not just acquired and dropped. Uses a
+        # throwaway lock swapped in for the module-global s.audio_lock so
+        # this never touches the real ~/.algolearn-speak lockfile.
         orig_ready = s.engines.ready.is_set()
         orig_error = s.engines.error
         orig_kokoro = s.engines.kokoro
+        orig_audio_lock = s.audio_lock
         s.engines.ready.set()
         s.engines.error = None
+        test_lock, tmpdir = _make_test_lock()
+        s.audio_lock = test_lock
 
         active = []
         overlapped = []
@@ -919,25 +950,156 @@ class TestSerializingLock(unittest.TestCase):
             s.engines.error = orig_error
             if not orig_ready:
                 s.engines.ready.clear()
+            s.audio_lock = orig_audio_lock
+            _rmtree(tmpdir)
 
         self.assertEqual(overlapped, [], "speak and listen must never run concurrently")
-        self.assertEqual(s.audio_lock.snapshot(), (False, None, 0))
+        self.assertEqual(test_lock.snapshot(), (False, None, 0))
 
     def test_status_tool_reports_idle_snapshot(self):
         import asyncio
 
-        result = asyncio.run(s.status())
+        orig_audio_lock = s.audio_lock
+        test_lock, tmpdir = _make_test_lock()
+        s.audio_lock = test_lock
+        try:
+            result = asyncio.run(s.status())
+        finally:
+            s.audio_lock = orig_audio_lock
+            _rmtree(tmpdir)
         self.assertEqual(result, {"busy": False, "current_tool": None, "waiting": 0})
 
     def test_status_tool_reports_busy_snapshot_without_blocking(self):
         import asyncio
 
-        s.audio_lock.acquire("speak")
+        orig_audio_lock = s.audio_lock
+        test_lock, tmpdir = _make_test_lock()
+        s.audio_lock = test_lock
+        test_lock.acquire("speak")
         try:
             result = asyncio.run(s.status())
         finally:
-            s.audio_lock.release()
+            test_lock.release()
+            s.audio_lock = orig_audio_lock
+            _rmtree(tmpdir)
         self.assertEqual(result, {"busy": True, "current_tool": "speak", "waiting": 0})
+
+
+def _rmtree(path: str) -> None:
+    import shutil
+
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _cross_process_worker(lock_path: str, sidecar_path: str, tool_name: str, hold_seconds: float, order_path: str) -> None:
+    """Module-level (picklable, importable under `spawn`) target for
+    TestCrossProcessLock: acquires the real _CrossProcessLock at the given
+    path, appends "<tool_name>-acquired" to the shared order file, holds it
+    for hold_seconds, appends "<tool_name>-released", then releases. Uses a
+    plain append-only text file rather than a multiprocessing.Queue/Manager
+    to keep the child's imports minimal (just this module) and avoid any
+    dependency on how the two processes were spawned."""
+    import time as _time
+
+    lock = s._CrossProcessLock(lock_path, sidecar_path)
+    lock.acquire(tool_name)
+    try:
+        with open(order_path, "a", encoding="utf-8") as f:
+            f.write(f"{tool_name}-acquired\n")
+        _time.sleep(hold_seconds)
+        with open(order_path, "a", encoding="utf-8") as f:
+            f.write(f"{tool_name}-released\n")
+    finally:
+        lock.release()
+
+
+class TestCrossProcessLock(unittest.TestCase):
+    """Two SEPARATE OS processes (multiprocessing, spawn context -- neither
+    forks nor shares this test process's memory, so this genuinely exercises
+    flock() across processes, not just across threads in one interpreter)
+    contending for the same lockfile must run strictly one after the other,
+    never concurrently -- this is the actual fix for "two Claude sessions,
+    two speak_server.py processes, talking over each other". Every test uses
+    its own throwaway lockfile, never the real ~/.algolearn-speak path."""
+
+    def test_two_processes_contending_for_the_file_lock_run_strictly_in_turn(self):
+        import multiprocessing
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp(prefix="speak-crossproc-test-")
+        try:
+            lock_path = os.path.join(tmpdir, "audio.lock")
+            sidecar_path = os.path.join(tmpdir, "audio.lock.json")
+            order_path = os.path.join(tmpdir, "order.log")
+
+            ctx = multiprocessing.get_context("spawn")
+            p1 = ctx.Process(target=_cross_process_worker, args=(lock_path, sidecar_path, "speak", 0.4, order_path))
+            p2 = ctx.Process(target=_cross_process_worker, args=(lock_path, sidecar_path, "listen", 0.4, order_path))
+            p1.start()
+            import time
+            time.sleep(0.05)  # give p1 a head start so it acquires first, deterministically
+            p2.start()
+            p1.join(timeout=15.0)
+            p2.join(timeout=15.0)
+
+            self.assertEqual(p1.exitcode, 0)
+            self.assertEqual(p2.exitcode, 0)
+
+            with open(order_path, encoding="utf-8") as f:
+                order = [line.strip() for line in f if line.strip()]
+
+            # Whichever process won the race to acquire first, it must fully
+            # release before the second one ever acquires -- never interleaved.
+            self.assertEqual(len(order), 4)
+            first_tool = order[0].split("-")[0]
+            second_tool = "listen" if first_tool == "speak" else "speak"
+            self.assertEqual(order, [
+                f"{first_tool}-acquired", f"{first_tool}-released",
+                f"{second_tool}-acquired", f"{second_tool}-released",
+            ])
+        finally:
+            _rmtree(tmpdir)
+
+    def test_status_reflects_lock_held_by_another_process(self):
+        import multiprocessing
+        import tempfile
+        import time
+
+        tmpdir = tempfile.mkdtemp(prefix="speak-crossproc-test-")
+        try:
+            lock_path = os.path.join(tmpdir, "audio.lock")
+            sidecar_path = os.path.join(tmpdir, "audio.lock.json")
+            order_path = os.path.join(tmpdir, "order.log")
+
+            ctx = multiprocessing.get_context("spawn")
+            holder = ctx.Process(target=_cross_process_worker, args=(lock_path, sidecar_path, "converse", 1.5, order_path))
+            holder.start()
+            try:
+                # Wait for the holder to actually acquire before probing --
+                # avoids a flaky race where we probe before it opens the lock.
+                deadline = time.time() + 10.0
+                while not os.path.exists(order_path) and time.time() < deadline:
+                    time.sleep(0.02)
+                time.sleep(0.1)  # small margin past the acquire so the sidecar write has landed
+
+                # This process itself does not hold the lock, so
+                # _SerializingLock.snapshot() must consult _CrossProcessLock
+                # and report the other process's tool/pid, not idle.
+                probe_lock = s._SerializingLock(lock_path=lock_path, sidecar_path=sidecar_path)
+                busy, current_tool, waiting = probe_lock.snapshot()
+                self.assertTrue(busy)
+                self.assertIn("converse", current_tool)
+                self.assertIn(f"pid {holder.pid}", current_tool)
+                self.assertEqual(waiting, 0)
+            finally:
+                holder.join(timeout=15.0)
+                self.assertEqual(holder.exitcode, 0)
+
+            # After the holder releases, a fresh probe must see idle again.
+            probe_lock = s._SerializingLock(lock_path=lock_path, sidecar_path=sidecar_path)
+            self.assertEqual(probe_lock.snapshot(), (False, None, 0))
+        finally:
+            _rmtree(tmpdir)
 
 
 if __name__ == "__main__":

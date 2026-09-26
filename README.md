@@ -84,11 +84,15 @@ Say something after the beep. Your words should be printed.
 | `converse(text, ...)` | `speak` then `listen`. Returns your words. |
 | `status()` | Returns `{"busy": bool, "current_tool": str \| None, "waiting": int}` -- what's running now and how many calls are queued behind it. Never blocks. |
 
-`speak`, `listen`, and `converse` are serialized through one process-wide lock:
-if two callers (e.g. two agents) use this server at once, the second one
-queues and waits for the first to finish, then proceeds -- it is never
-rejected or allowed to talk over the first. `status()` reports the queue
-depth and which tool currently holds the lock.
+`speak`, `listen`, and `converse` are serialized through one lock that is both
+process-wide (a `threading.Lock`, for two calls in the same server process)
+and cross-process (an `fcntl.flock` on `~/.algolearn-speak/audio.lock`, for
+two separate `speak_server.py` processes -- e.g. two Claude Code sessions
+each running their own copy of this server): if two callers use the mic/
+speaker at once, the second one queues and waits for the first to finish,
+then proceeds -- it is never rejected or allowed to talk over the first.
+`status()` reports the queue depth and which tool currently holds the lock,
+including `"<tool> (pid <n>, other process)"` when another process holds it.
 
 ## Audio cues
 
