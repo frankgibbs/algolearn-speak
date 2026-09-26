@@ -1,11 +1,17 @@
 """algolearn-speak: a local ear and voice for Claude Code.
 
-MCP server (stdio) exposing three tools:
+MCP server (stdio) exposing four tools:
 
   speak(text)     -> synthesise with Kokoro (MLX) and play through the default output
   listen(...)     -> record from the default input until you stop talking (Silero VAD),
                      transcribe with Whisper (MLX), return the text
   converse(text)  -> speak, then listen
+  status()        -> report whether speak/listen/converse are busy and how many
+                     calls are queued behind the current one
+
+speak/listen/converse are serialized through one process-wide lock (see
+_SerializingLock below): a second caller queues and waits rather than being
+rejected or talking over the first.
 
 Everything runs on the Mac. No audio leaves the machine.
 """
@@ -97,7 +103,52 @@ class Engines:
 
 
 engines = Engines()
-audio_lock = threading.Lock()   # speak and listen never overlap
+
+
+class _SerializingLock:
+    """Process-wide FIFO-ish queue for the three audio tools.
+
+    `speak`, `listen`, and `converse` share one Mac microphone/speaker pair,
+    so two calls (e.g. from two agents driving this same MCP server) must
+    never run at once -- one waits for the other to finish, then proceeds
+    (a queue, never a rejection). This wraps `threading.Lock` (the actual
+    mutual exclusion) with a plain counter and the name of the tool
+    currently holding it, so `status()` can report `busy`/`current_tool`/
+    `waiting` without changing the underlying exclusion semantics: a bare
+    Lock already blocks every other waiter until release, which is exactly
+    the "wait then proceed" behaviour asked for -- this just makes that
+    state observable.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state_lock = threading.Lock()  # protects the two fields below only
+        self._current_tool: str | None = None
+        self._waiting = 0
+
+    def acquire(self, tool_name: str) -> None:
+        with self._state_lock:
+            self._waiting += 1
+        try:
+            self._lock.acquire()
+        finally:
+            with self._state_lock:
+                self._waiting -= 1
+        with self._state_lock:
+            self._current_tool = tool_name
+
+    def release(self) -> None:
+        with self._state_lock:
+            self._current_tool = None
+        self._lock.release()
+
+    def snapshot(self) -> tuple[bool, str | None, int]:
+        """Returns (busy, current_tool, waiting) without blocking."""
+        with self._state_lock:
+            return self._current_tool is not None, self._current_tool, self._waiting
+
+
+audio_lock = _SerializingLock()   # speak, listen, and converse are serialized through this -- see class docstring
 
 # ---------------------------------------------------------------- helpers
 
@@ -621,19 +672,28 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
     return text
 
 def _speak_sync(text: str) -> float:
-    with audio_lock:
+    audio_lock.acquire("speak")
+    try:
         return _speak_impl(text)
+    finally:
+        audio_lock.release()
 
 
 def _listen_sync(max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
-    with audio_lock:
+    audio_lock.acquire("listen")
+    try:
         return _listen_impl(max_seconds, silence_seconds, start_timeout_seconds)
+    finally:
+        audio_lock.release()
 
 
 def _converse_sync(text: str, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
-    with audio_lock:
+    audio_lock.acquire("converse")
+    try:
         _speak_impl(text)
         return _listen_impl(max_seconds, silence_seconds, start_timeout_seconds)
+    finally:
+        audio_lock.release()
 
 # ---------------------------------------------------------------- MCP surface
 
@@ -661,6 +721,12 @@ async def speak(text: str) -> str:
     """Say `text` out loud through the Mac's speakers and return once playback finishes.
 
     Write it as spoken prose: short sentences, no markdown, no code. Returns the spoken duration.
+
+    Status: calls to speak/listen/converse are serialized through one process-wide
+    lock -- there is only one microphone and one speaker. If another call is in
+    progress, this one queues and waits for it to finish, then proceeds; it is
+    never rejected. Use `status()` to see what is currently running and how many
+    calls are waiting.
     """
     seconds = await _run(_speak_sync, text)
     return f"spoke for {seconds:.1f}s"
@@ -674,14 +740,41 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 1.2, start
     the word "Processing" means the transcript was captured and is on its way to you. Recording ends after
     `silence_seconds` of quiet following speech, or at `max_seconds` of speech. Raises
     TimeoutError if nobody speaks within `start_timeout_seconds`.
+
+    Status: calls to speak/listen/converse are serialized through one process-wide
+    lock -- there is only one microphone and one speaker. If another call is in
+    progress, this one queues and waits for it to finish, then proceeds; it is
+    never rejected. Use `status()` to see what is currently running and how many
+    calls are waiting.
     """
     return await _run(_listen_sync, max_seconds, silence_seconds, start_timeout_seconds)
 
 
 @mcp.tool()
 async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float = 1.2, start_timeout_seconds: float = 45.0) -> str:
-    """Say `text`, then listen for the reply. One spoken round trip; returns the user's words."""
+    """Say `text`, then listen for the reply. One spoken round trip; returns the user's words.
+
+    Status: calls to speak/listen/converse are serialized through one process-wide
+    lock -- there is only one microphone and one speaker. If another call is in
+    progress, this one queues and waits for it to finish, then proceeds; it is
+    never rejected. Use `status()` to see what is currently running and how many
+    calls are waiting.
+    """
     return await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)
+
+
+@mcp.tool()
+async def status() -> dict:
+    """Report whether speak/listen/converse are busy right now.
+
+    Returns `{"busy": bool, "current_tool": str | None, "waiting": int}`.
+    `current_tool` is the name of the tool currently holding the audio lock
+    (or null if idle). `waiting` is how many other calls are queued behind
+    it -- they will run in the order they arrived, one at a time, once the
+    current call finishes. Never raises and never blocks on the audio lock.
+    """
+    busy, current_tool, waiting = audio_lock.snapshot()
+    return {"busy": busy, "current_tool": current_tool, "waiting": waiting}
 
 
 def main() -> None:

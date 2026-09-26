@@ -811,5 +811,134 @@ class TestReadinessHandshake(unittest.TestCase):
         self.assertIn("failed twice before signalling readiness", str(ctx.exception))
 
 
+class TestSerializingLock(unittest.TestCase):
+    """The lock behind speak/listen/converse must queue a second caller
+    (wait then proceed) rather than reject it, and `status()` must report
+    busy/current_tool/waiting without itself blocking on the lock."""
+
+    def test_snapshot_reports_idle_when_unheld(self):
+        lock = s._SerializingLock()
+        self.assertEqual(lock.snapshot(), (False, None, 0))
+
+    def test_snapshot_reports_current_tool_while_held(self):
+        lock = s._SerializingLock()
+        lock.acquire("speak")
+        try:
+            self.assertEqual(lock.snapshot(), (True, "speak", 0))
+        finally:
+            lock.release()
+        self.assertEqual(lock.snapshot(), (False, None, 0))
+
+    def test_second_caller_queues_and_waits_rather_than_being_rejected(self):
+        import time
+
+        lock = s._SerializingLock()
+        order: list[str] = []
+        second_acquired = threading.Event()
+
+        lock.acquire("listen")
+        order.append("first-acquired")
+
+        def second_caller():
+            lock.acquire("converse")
+            try:
+                order.append("second-acquired")
+                second_acquired.set()
+            finally:
+                lock.release()
+
+        t = threading.Thread(target=second_caller)
+        t.start()
+        # Give the second caller a moment to reach the blocking acquire() so
+        # `waiting` reflects it before the first caller releases.
+        deadline = time.time() + 2.0
+        while lock.snapshot()[2] < 1 and time.time() < deadline:
+            time.sleep(0.01)
+        busy, current_tool, waiting = lock.snapshot()
+        self.assertTrue(busy)
+        self.assertEqual(current_tool, "listen")
+        self.assertEqual(waiting, 1)
+        self.assertFalse(second_acquired.is_set(), "second caller must wait, not run concurrently")
+
+        order.append("first-releasing")
+        lock.release()
+        t.join(timeout=5.0)
+
+        self.assertEqual(order, ["first-acquired", "first-releasing", "second-acquired"])
+        self.assertEqual(lock.snapshot(), (False, None, 0))
+
+    def test_speak_sync_and_listen_sync_never_overlap(self):
+        # End-to-end through the real _speak_sync/_listen_sync wrappers
+        # (engines faked out), proving the lock is actually held for the
+        # whole duration of each call, not just acquired and dropped.
+        orig_ready = s.engines.ready.is_set()
+        orig_error = s.engines.error
+        orig_kokoro = s.engines.kokoro
+        s.engines.ready.set()
+        s.engines.error = None
+
+        active = []
+        overlapped = []
+
+        class FakeKokoro:
+            def generate(self, **kwargs):
+                active.append("speak")
+                if len(active) > 1:
+                    overlapped.append(True)
+                import time
+                time.sleep(0.1)
+                active.remove("speak")
+
+                class R:
+                    audio = np.zeros(10, dtype=np.float32)
+
+                yield R()
+
+        s.engines.kokoro = FakeKokoro()
+
+        def fake_listen_impl(*args, **kwargs):
+            active.append("listen")
+            if len(active) > 1:
+                overlapped.append(True)
+            import time
+            time.sleep(0.1)
+            active.remove("listen")
+            return "heard"
+
+        try:
+            with mock.patch.object(s, "_play_pcm_stream"):
+                with mock.patch.object(s, "_listen_impl", side_effect=fake_listen_impl):
+                    t1 = threading.Thread(target=s._speak_sync, args=("hello",))
+                    t2 = threading.Thread(target=s._listen_sync, args=(5, 1.2, 3))
+                    t1.start()
+                    t2.start()
+                    t1.join(timeout=5.0)
+                    t2.join(timeout=5.0)
+        finally:
+            s.engines.kokoro = orig_kokoro
+            s.engines.error = orig_error
+            if not orig_ready:
+                s.engines.ready.clear()
+
+        self.assertEqual(overlapped, [], "speak and listen must never run concurrently")
+        self.assertEqual(s.audio_lock.snapshot(), (False, None, 0))
+
+    def test_status_tool_reports_idle_snapshot(self):
+        import asyncio
+
+        result = asyncio.run(s.status())
+        self.assertEqual(result, {"busy": False, "current_tool": None, "waiting": 0})
+
+    def test_status_tool_reports_busy_snapshot_without_blocking(self):
+        import asyncio
+
+        s.audio_lock.acquire("speak")
+        try:
+            result = asyncio.run(s.status())
+        finally:
+            s.audio_lock.release()
+        self.assertEqual(result, {"busy": True, "current_tool": "speak", "waiting": 0})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -82,8 +82,13 @@ Say something after the beep. Your words should be printed.
 | `speak(text)` | Says `text` through the default output. Streams sentence by sentence. Returns the spoken duration. |
 | `listen(max_seconds=120, silence_seconds=1.2, start_timeout_seconds=45)` | High beep, records the default input until you have been quiet for `silence_seconds` (or spoke for `max_seconds`). Low beep, transcribes, then a rising chime and "Processing". Raises if nobody speaks within `start_timeout_seconds`. |
 | `converse(text, ...)` | `speak` then `listen`. Returns your words. |
+| `status()` | Returns `{"busy": bool, "current_tool": str \| None, "waiting": int}` -- what's running now and how many calls are queued behind it. Never blocks. |
 
-`speak` and `listen` never overlap.
+`speak`, `listen`, and `converse` are serialized through one process-wide lock:
+if two callers (e.g. two agents) use this server at once, the second one
+queues and waits for the first to finish, then proceeds -- it is never
+rejected or allowed to talk over the first. `status()` reports the queue
+depth and which tool currently holds the lock.
 
 ## Audio cues
 
