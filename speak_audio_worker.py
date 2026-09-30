@@ -69,8 +69,9 @@ Commands:
       capture is not active, since in that case `out_pcm_path` already *is*
       the native-rate capture.
 
-      The "ear open" cue is played from INSIDE this process, right after
-      the input stream opens and before the frame-read loop starts -- NOT
+      The "ear open" cue is played from INSIDE this process, to completion
+      BEFORE the input stream is opened (opening the mic on a Bluetooth
+      headset switches it to the HFP profile and can swallow output) -- NOT
       by a separate `play` worker. Two processes each opening one
       direction-split half (input vs output) of the same Bluetooth device
       (e.g. AirPods) at the same time can lose the cue during HFP profile
@@ -79,8 +80,9 @@ Commands:
       future caller that wants a silent start).
 
       Readiness ordering: torch/sounddevice/silero_vad are imported,
-      `load_silero_vad()` runs, and `sd.InputStream` is opened BEFORE
-      anything is signalled to the caller. Once the stream is open, the
+      `load_silero_vad()` runs, the cue plays to completion, and only then
+      is `sd.InputStream` opened. Nothing is signalled until the stream is
+      open. Once the stream is open, the
       process prints `phase=stream-open` to stderr and flushes, then
       starts a background thread that reads and buffers frames from the
       stream immediately -- even while the cue plays -- so frames PortAudio
@@ -420,13 +422,19 @@ def cmd_record(
             reader_error.append(e)
             frame_q.put(None)  # unblock a main-thread get() waiting on this queue
 
+    # The cue plays to completion BEFORE the mic is opened: opening an input
+    # stream on a Bluetooth headset (AirPods) flips it into the HFP
+    # headset/mic profile and can swallow output, so the beep must be over
+    # first. Nothing reads the mic until after the cue has finished.
+    if cue_freq_hz > 0:
+        sd.play(cue_pcm(cue_freq_hz, cue_seconds, cue_volume, cue_lead_silence), samplerate=TONE_RATE, device=cue_output_device_index)
+        sd.wait()
+
     with sd.InputStream(
         samplerate=capture_rate, channels=1, dtype="float32", blocksize=capture_blocksize, device=device_index,
     ) as mic:
-        # Readiness signal #1: the stream is open. Start the reader thread
-        # immediately, BEFORE playing the cue, so frames PortAudio delivers
-        # during the ~0.5s cue are pulled off the stream and queued rather
-        # than left to a fixed-size internal buffer that could overflow.
+        # The stream is open (cue already finished). Start the reader thread
+        # immediately so frames are pulled off the stream as they arrive.
         t_open = time.time()
         _log_phase("stream-open")
         if archiving:
@@ -438,14 +446,8 @@ def cmd_record(
         reader_thread = threading.Thread(target=read_frames, args=(mic,), daemon=True)
         reader_thread.start()
 
-        if cue_freq_hz > 0:
-            sd.play(cue_pcm(cue_freq_hz, cue_seconds, cue_volume, cue_lead_silence), samplerate=TONE_RATE, device=cue_output_device_index)
-            sd.wait()
-        # Readiness signal #2: the cue (if any) has finished playing. This,
-        # not `stream-open`, is what a caller should measure
-        # start_timeout_seconds from -- frames spoken during/right after the
-        # cue are already sitting in frame_q from the reader thread, so
-        # nothing is lost even though the timeout clock starts only now.
+        # Readiness: the cue (if any) has already finished AND the mic is
+        # open, so the caller's start_timeout_seconds clock starts now.
         _log_phase("cue-played")
 
         while True:

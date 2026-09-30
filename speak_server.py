@@ -753,16 +753,16 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
     # AirPods) that splits into direction-specific CoreAudio entries, two
     # processes each opening one half of the device at the same time can
     # silently lose the cue during HFP profile renegotiation. Playing it
-    # in-process also means the mic is already buffering (via a background
-    # reader thread, started before the cue plays) for the cue's own
-    # duration, so speech spoken during/right after the beep is never lost.
+    # in-process also lets it play to completion BEFORE the mic is opened
+    # (opening the mic first flips Bluetooth headsets to HFP and swallows the
+    # beep). Speech during the beep is therefore not captured.
     # start_timeout_seconds is enforced by the worker from the moment the
     # cue finishes playing (`phase=cue-played`), not from stream-open.
     try:
         # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep
         audio, archive_audio, archive_rate = _record_pcm_with_archive(
             MIC_RATE, VAD_FRAME, max_seconds, silence_seconds, start_timeout_seconds,
-            cue_freq_hz=880.0, cue_seconds=0.3, cue_volume=0.4, cue_lead_silence=0.2,
+            cue_freq_hz=880.0, cue_seconds=0.5, cue_volume=0.5, cue_lead_silence=0.2,
             device_name=INPUT_DEVICE, want_archive=bool(SAVE_DIR), output_device_name=OUTPUT_DEVICE,
         )
     except TimeoutError:
@@ -850,7 +850,7 @@ async def speak(text: str) -> str:
 
 
 @mcp.tool()
-async def listen(max_seconds: float = 120.0, silence_seconds: float = 1.2, start_timeout_seconds: float = 45.0) -> str:
+async def listen(max_seconds: float = 120.0, silence_seconds: float = 2.0, start_timeout_seconds: float = 45.0) -> str:
     """Listen on the Mac's microphone until the user finishes talking and return what they said.
 
     A high beep means the ear is open, a low beep means it closed, and a rising chime plus
@@ -870,7 +870,7 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 1.2, start
 
 
 @mcp.tool()
-async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float = 1.2, start_timeout_seconds: float = 45.0) -> str:
+async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float = 2.0, start_timeout_seconds: float = 45.0) -> str:
     """Say `text`, then listen for the reply. One spoken round trip; returns the user's words.
 
     Status: calls to speak/listen/converse are serialized through one lock
