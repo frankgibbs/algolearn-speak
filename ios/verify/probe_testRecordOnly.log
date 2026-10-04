@@ -1,0 +1,35 @@
+Command line invocation:
+    /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -project UITapper.xcodeproj -scheme UITapper -destination "platform=iOS Simulator,id=96CF3880-2DB4-4BB4-B637-5BB2F0842522" -derivedDataPath ../DerivedData test-without-building "-only-testing:UITapperTests/AudioProbeTests/testRecordOnly"
+
+2026-10-03 22:16:29.882909-0700 UITapperTests-Runner[95738:3331613] [Default] Running tests...
+    t =      nans Interface orientation changed to Portrait
+Test Suite 'Selected tests' started at 2026-10-03 22:16:30.400.
+Test Suite 'UITapperTests.xctest' started at 2026-10-03 22:16:30.400.
+Test Suite 'AudioProbeTests' started at 2026-10-03 22:16:30.400.
+Test Case '-[UITapperTests.AudioProbeTests testRecordOnly]' started.
+    t =     0.00s Start Test at 2026-10-03 22:16:30.401
+    t =     0.02s Set Up
+2026-10-03 22:16:30.446133-0700 UITapperTests-Runner[95738:3331613] [plugin] AddInstanceForFactory: No factory registered for id <CFUUID 0x600000220c60> F8BB1C28-BAE8-11D6-9C31-00039315CD46
+2026-10-03 22:16:30.514731-0700 UITapperTests-Runner[95738:3331613] PROBE session active; route in=["MicrophoneBuiltIn"] out=[] rate=48000.000000
+2026-10-03 22:16:39.559745-0700 UITapperTests-Runner[95738:3331613] [default] Initialize: RPC timeout. Apparently deadlocked. Aborting now.
+2026-10-03 22:16:46.212789-0700 UITapperTests-Runner[95786:3332445] [Default] Running tests...
+    t =      nans Interface orientation changed to Portrait
+
+Restarting after unexpected exit, crash, or test timeout; summary will include totals from previous launches.
+
+Test Suite 'Selected tests' started at 2026-10-03 22:16:46.793.
+Test Suite 'UITapperTests.xctest' started at 2026-10-03 22:16:46.793.
+Test Suite 'UITapperTests.xctest' passed at 2026-10-03 22:16:46.794.
+	 Executed 0 tests, with 0 failures (0 unexpected) in 0.000 (0.000) seconds
+Test Suite 'Selected tests' passed at 2026-10-03 22:16:46.794.
+	 Executed 0 tests, with 0 failures (0 unexpected) in 0.000 (0.001) seconds
+2026-10-03 22:16:59.987 xcodebuild[95732:3331398] [MT] IDETestOperationsObserverDebug: 31.370 elapsed -- Testing started completed.
+2026-10-03 22:16:59.987 xcodebuild[95732:3331398] [MT] IDETestOperationsObserverDebug: 0.000 sec, +0.000 sec -- start
+2026-10-03 22:16:59.987 xcodebuild[95732:3331398] [MT] IDETestOperationsObserverDebug: 31.370 sec, +31.370 sec -- end
+
+Test session results, code coverage, and logs:
+	/Users/frankg/workspace/algolearn/live/algolearn-speak/ios/verify/DerivedData/Logs/Test/Test-UITapper-2026.10.03_22-16-28--0700.xcresult
+
+** TEST EXECUTE FAILED **
+
+Testing started

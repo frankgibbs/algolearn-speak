@@ -1,0 +1,425 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		2CF791C51846695F5A77E4BD /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 312A933E8C916AAB476DADFD /* ContentView.swift */; };
+		65C69F21119E89BC2AB1DFB4 /* ProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 144AB64EA0E5B674B4EDF526 /* ProtocolTests.swift */; };
+		7BABE16CCC352E908A0C1E72 /* AlgolearnSpeakApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 45132244E97784F562D25600 /* AlgolearnSpeakApp.swift */; };
+		9EDD50563121D4277648F8A3 /* Protocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AE187A8B49B04463615A4C1 /* Protocol.swift */; };
+		DAC8834634A326F9B665F04E /* PhoneLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1E149C54E3E38ECE67B08EC7 /* PhoneLink.swift */; };
+		E15D810CF788941F47BBA9FA /* AudioPipelineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9811E393029A917D01E001B4 /* AudioPipelineTests.swift */; };
+		E896A1C2E3223AA3B2640F92 /* AudioEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62079FDECD4F2AFB18DC0524 /* AudioEngine.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		645CCDD0A57013AF5B28308A /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = E8EAB380D3649B55E0D9FAA3 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 6828D8D6682A415CCC3D701A;
+			remoteInfo = AlgolearnSpeak;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		144AB64EA0E5B674B4EDF526 /* ProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProtocolTests.swift; sourceTree = "<group>"; };
+		1E149C54E3E38ECE67B08EC7 /* PhoneLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneLink.swift; sourceTree = "<group>"; };
+		312A933E8C916AAB476DADFD /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		45132244E97784F562D25600 /* AlgolearnSpeakApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlgolearnSpeakApp.swift; sourceTree = "<group>"; };
+		57BA0AA82266CA271D7C2F90 /* AlgolearnSpeakTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = AlgolearnSpeakTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		5AE187A8B49B04463615A4C1 /* Protocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Protocol.swift; sourceTree = "<group>"; };
+		5D7EB7693C4F8ECB80A474C0 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		62079FDECD4F2AFB18DC0524 /* AudioEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioEngine.swift; sourceTree = "<group>"; };
+		9811E393029A917D01E001B4 /* AudioPipelineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioPipelineTests.swift; sourceTree = "<group>"; };
+		C199D3B6D2D342597FC94737 /* AlgolearnSpeak.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = AlgolearnSpeak.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		28FA51DEB2AA0029F681C3BA /* AlgolearnSpeak */ = {
+			isa = PBXGroup;
+			children = (
+				45132244E97784F562D25600 /* AlgolearnSpeakApp.swift */,
+				62079FDECD4F2AFB18DC0524 /* AudioEngine.swift */,
+				312A933E8C916AAB476DADFD /* ContentView.swift */,
+				5D7EB7693C4F8ECB80A474C0 /* Info.plist */,
+				1E149C54E3E38ECE67B08EC7 /* PhoneLink.swift */,
+				5AE187A8B49B04463615A4C1 /* Protocol.swift */,
+			);
+			path = AlgolearnSpeak;
+			sourceTree = "<group>";
+		};
+		B1E6EAB2C4B407AC2CDCF2F4 /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				9811E393029A917D01E001B4 /* AudioPipelineTests.swift */,
+				144AB64EA0E5B674B4EDF526 /* ProtocolTests.swift */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		B26227AB9B5BB3854468FCEF /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				C199D3B6D2D342597FC94737 /* AlgolearnSpeak.app */,
+				57BA0AA82266CA271D7C2F90 /* AlgolearnSpeakTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		F437DB3E0F8C578325E47F33 = {
+			isa = PBXGroup;
+			children = (
+				28FA51DEB2AA0029F681C3BA /* AlgolearnSpeak */,
+				B1E6EAB2C4B407AC2CDCF2F4 /* Tests */,
+				B26227AB9B5BB3854468FCEF /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		6828D8D6682A415CCC3D701A /* AlgolearnSpeak */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C22CB7C7B91EF72A0E612A32 /* Build configuration list for PBXNativeTarget "AlgolearnSpeak" */;
+			buildPhases = (
+				9F1FADD8F804F8CE1006AF1B /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = AlgolearnSpeak;
+			packageProductDependencies = (
+			);
+			productName = AlgolearnSpeak;
+			productReference = C199D3B6D2D342597FC94737 /* AlgolearnSpeak.app */;
+			productType = "com.apple.product-type.application";
+		};
+		DE92BA1F55DC05AE8D52393F /* AlgolearnSpeakTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A2BA7CD7DA70B184F9542240 /* Build configuration list for PBXNativeTarget "AlgolearnSpeakTests" */;
+			buildPhases = (
+				EDEC9C662AE19B89D4269CF7 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				4DFD778781C63B3BD2918C4A /* PBXTargetDependency */,
+			);
+			name = AlgolearnSpeakTests;
+			packageProductDependencies = (
+			);
+			productName = AlgolearnSpeakTests;
+			productReference = 57BA0AA82266CA271D7C2F90 /* AlgolearnSpeakTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		E8EAB380D3649B55E0D9FAA3 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					6828D8D6682A415CCC3D701A = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
+					DE92BA1F55DC05AE8D52393F = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = B9418EC0337681CFDEB5AFC1 /* Build configuration list for PBXProject "AlgolearnSpeak" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = F437DB3E0F8C578325E47F33;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = B26227AB9B5BB3854468FCEF /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				6828D8D6682A415CCC3D701A /* AlgolearnSpeak */,
+				DE92BA1F55DC05AE8D52393F /* AlgolearnSpeakTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		9F1FADD8F804F8CE1006AF1B /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7BABE16CCC352E908A0C1E72 /* AlgolearnSpeakApp.swift in Sources */,
+				E896A1C2E3223AA3B2640F92 /* AudioEngine.swift in Sources */,
+				2CF791C51846695F5A77E4BD /* ContentView.swift in Sources */,
+				DAC8834634A326F9B665F04E /* PhoneLink.swift in Sources */,
+				9EDD50563121D4277648F8A3 /* Protocol.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		EDEC9C662AE19B89D4269CF7 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E15D810CF788941F47BBA9FA /* AudioPipelineTests.swift in Sources */,
+				65C69F21119E89BC2AB1DFB4 /* ProtocolTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		4DFD778781C63B3BD2918C4A /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 6828D8D6682A415CCC3D701A /* AlgolearnSpeak */;
+			targetProxy = 645CCDD0A57013AF5B28308A /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		2F322423ED009A3A163207E1 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = ai.algolearn.speak.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/AlgolearnSpeak.app/AlgolearnSpeak";
+			};
+			name = Debug;
+		};
+		3797ABD1426E99E28C30AB57 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				INFOPLIST_FILE = AlgolearnSpeak/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = ai.algolearn.speak;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		44993229F802DFE187B7AE3E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = ai.algolearn.speak.tests;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/AlgolearnSpeak.app/AlgolearnSpeak";
+			};
+			name = Release;
+		};
+		78433C1D788AB4E35983B8F6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+		A26757CFC332F0D609CE52A3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		D1E561FCD18AE8F7FC0F95CF /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_PREVIEWS = YES;
+				INFOPLIST_FILE = AlgolearnSpeak/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = ai.algolearn.speak;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A2BA7CD7DA70B184F9542240 /* Build configuration list for PBXNativeTarget "AlgolearnSpeakTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2F322423ED009A3A163207E1 /* Debug */,
+				44993229F802DFE187B7AE3E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		B9418EC0337681CFDEB5AFC1 /* Build configuration list for PBXProject "AlgolearnSpeak" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A26757CFC332F0D609CE52A3 /* Debug */,
+				78433C1D788AB4E35983B8F6 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		C22CB7C7B91EF72A0E612A32 /* Build configuration list for PBXNativeTarget "AlgolearnSpeak" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				D1E561FCD18AE8F7FC0F95CF /* Debug */,
+				3797ABD1426E99E28C30AB57 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = E8EAB380D3649B55E0D9FAA3 /* Project object */;
+}

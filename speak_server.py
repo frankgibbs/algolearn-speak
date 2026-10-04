@@ -38,6 +38,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 import speak_audio_worker
+from speak_phone_audio import TIMEOUT as PHONE_TIMEOUT, PhoneAudioServer
 from speak_tone import cue_pcm, tone
 
 log = logging.getLogger("speak")
@@ -60,6 +61,38 @@ MIC_RATE = 16_000          # Whisper and Silero both want 16 kHz mono
 VAD_FRAME = 512            # Silero frame size at 16 kHz (32 ms)
 TTS_RATE = 24_000          # Kokoro output rate
 SENTENCE_SPLIT = r"(?<=[.!?])\s+"
+
+# ---------------------------------------------------------------- phone audio device
+#
+# docs/DESIGN_PHONE_AUDIO.md section 2: when a phone is connected it IS the
+# audio device, otherwise the Mac's devices are. The choice is made ONCE at
+# the start of each tool call (`_begin_call`, under the audio lock) and holds
+# for the whole call: a phone that disconnects mid-call makes that call raise,
+# it never switches to the Mac mid-operation. `phone` is replaced by a started
+# server in main(); until then (and in tests) it is an unstarted one, which
+# reports connected() == False.
+
+PHONE_PORT_DEFAULT = 8772
+phone = PhoneAudioServer()
+_route = "mac"  # "phone" | "mac"; written only by _begin_call/_end_call, under audio_lock
+
+
+def _begin_call() -> str:
+    global _route
+    _route = "phone" if phone.connected() else "mac"
+    return _route
+
+
+def _end_call(route: str) -> None:
+    global _route
+    if route == "phone":
+        phone.set_state("idle")
+    _route = "mac"
+
+
+def _audio_note(route: str) -> str:
+    return f"\n(audio: {route})"
+
 
 # ---------------------------------------------------------------- engines
 
@@ -371,6 +404,9 @@ def _run_worker(*args: str, timeout: float) -> subprocess.CompletedProcess:
 
 
 def _play_pcm(audio: np.ndarray, samplerate: int) -> None:
+    if _route == "phone":
+        phone.play(audio, samplerate)
+        return
     with tempfile.NamedTemporaryFile(prefix="speak-play-", suffix=".pcm", delete=False) as f:
         path = f.name
     try:
@@ -396,6 +432,11 @@ def _play_pcm_stream(chunks: list[np.ndarray], samplerate: int, timeout: float) 
     other's pipe); communicate() feeds stdin and drains stdout/stderr
     concurrently on our behalf.
     """
+    if _route == "phone":
+        # One segment per TTS chunk (a sentence); the phone's `played` per
+        # segment bounds the wait, so `timeout` (the worker's budget) is unused.
+        phone.play_segments([chunk.reshape(-1) for chunk in chunks], samplerate)
+        return
     payload = b"".join(chunk.astype(np.float32).tobytes() for chunk in chunks)
     for attempt in (1, 2):
         proc = subprocess.Popen(
@@ -655,6 +696,28 @@ def _record_pcm_with_archive(
             os.unlink(archive_path)
 
 
+def _record_for_route(
+    max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
+) -> tuple[np.ndarray, np.ndarray | None, int]:
+    """The listen() capture on whichever device this call was routed to.
+    Phone: the ear-open cue goes to the phone, VAD runs here on its 16 kHz
+    blocks; no native-rate archive exists, so the 16 kHz capture is the archive."""
+    if _route == "phone":
+        audio = phone.record(
+            max_seconds, silence_seconds, start_timeout_seconds,
+            cue=cue_pcm(880.0, 0.5, 0.5, 0.2),
+        )
+        if audio is PHONE_TIMEOUT:
+            raise TimeoutError(f"no speech detected within {start_timeout_seconds:.0f}s")
+        return audio, None, MIC_RATE
+    # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep
+    return _record_pcm_with_archive(
+        MIC_RATE, VAD_FRAME, max_seconds, silence_seconds, start_timeout_seconds,
+        cue_freq_hz=880.0, cue_seconds=0.5, cue_volume=0.5, cue_lead_silence=0.2,
+        device_name=INPUT_DEVICE, want_archive=bool(SAVE_DIR), output_device_name=OUTPUT_DEVICE,
+    )
+
+
 def _speak_impl(text: str) -> float:
     engines.wait()
     text = _plain(text)
@@ -759,16 +822,13 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
     # start_timeout_seconds is enforced by the worker from the moment the
     # cue finishes playing (`phase=cue-played`), not from stream-open.
     try:
-        # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep
-        audio, archive_audio, archive_rate = _record_pcm_with_archive(
-            MIC_RATE, VAD_FRAME, max_seconds, silence_seconds, start_timeout_seconds,
-            cue_freq_hz=880.0, cue_seconds=0.5, cue_volume=0.5, cue_lead_silence=0.2,
-            device_name=INPUT_DEVICE, want_archive=bool(SAVE_DIR), output_device_name=OUTPUT_DEVICE,
-        )
+        audio, archive_audio, archive_rate = _record_for_route(max_seconds, silence_seconds, start_timeout_seconds)
     except TimeoutError:
         _cue(330.0)
         raise
     _cue(440.0)  # ear closed
+    if _route == "phone":
+        phone.set_state("processing")
 
     t0 = time.time()
     text = mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER_MODEL, language=LANGUAGE)["text"].strip()
@@ -786,29 +846,44 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
     _ack()
     return text
 
-def _speak_sync(text: str) -> float:
+def _speak_sync(text: str) -> tuple[float, str]:
     audio_lock.acquire("speak")
+    route = "mac"
     try:
-        return _speak_impl(text)
+        route = _begin_call()
+        return _speak_impl(text), route
     finally:
-        audio_lock.release()
+        try:
+            _end_call(route)
+        finally:
+            audio_lock.release()
 
 
-def _listen_sync(max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
+def _listen_sync(max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> tuple[str, str]:
     audio_lock.acquire("listen")
+    route = "mac"
     try:
-        return _listen_impl(max_seconds, silence_seconds, start_timeout_seconds)
+        route = _begin_call()
+        return _listen_impl(max_seconds, silence_seconds, start_timeout_seconds), route
     finally:
-        audio_lock.release()
+        try:
+            _end_call(route)
+        finally:
+            audio_lock.release()
 
 
-def _converse_sync(text: str, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
+def _converse_sync(text: str, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> tuple[str, str]:
     audio_lock.acquire("converse")
+    route = "mac"
     try:
+        route = _begin_call()
         _speak_impl(text)
-        return _listen_impl(max_seconds, silence_seconds, start_timeout_seconds)
+        return _listen_impl(max_seconds, silence_seconds, start_timeout_seconds), route
     finally:
-        audio_lock.release()
+        try:
+            _end_call(route)
+        finally:
+            audio_lock.release()
 
 # ---------------------------------------------------------------- MCP surface
 
@@ -845,8 +920,8 @@ async def speak(text: str) -> str:
     proceeds; it is never rejected. Use `status()` to see what is currently
     running (including in another process) and how many calls are waiting.
     """
-    seconds = await _run(_speak_sync, text)
-    return f"spoke for {seconds:.1f}s"
+    seconds, route = await _run(_speak_sync, text)
+    return f"spoke for {seconds:.1f}s{_audio_note(route)}"
 
 
 @mcp.tool()
@@ -866,7 +941,8 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 2.0, start
     proceeds; it is never rejected. Use `status()` to see what is currently
     running (including in another process) and how many calls are waiting.
     """
-    return await _run(_listen_sync, max_seconds, silence_seconds, start_timeout_seconds)
+    text, route = await _run(_listen_sync, max_seconds, silence_seconds, start_timeout_seconds)
+    return text + _audio_note(route)
 
 
 @mcp.tool()
@@ -881,7 +957,8 @@ async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float
     proceeds; it is never rejected. Use `status()` to see what is currently
     running (including in another process) and how many calls are waiting.
     """
-    return await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)
+    reply, route = await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)
+    return reply + _audio_note(route)
 
 
 @mcp.tool()
@@ -890,7 +967,9 @@ async def status() -> dict:
     process or in another one (e.g. a second Claude Code session's own
     speak_server.py).
 
-    Returns `{"busy": bool, "current_tool": str | None, "waiting": int}`.
+    Returns `{"busy": bool, "current_tool": str | None, "waiting": int, "audio": "phone" | "mac"}`.
+    `audio` is the device the NEXT call will use: "phone" while a phone is
+    connected to the phone-audio port, otherwise "mac".
     `current_tool` is the name of the tool currently holding the lock, or
     `"<tool> (pid <n>, other process)"` when a different process holds it,
     or null if idle. `waiting` counts only callers queued in THIS process
@@ -899,7 +978,7 @@ async def status() -> dict:
     blocks.
     """
     busy, current_tool, waiting = audio_lock.snapshot()
-    return {"busy": busy, "current_tool": current_tool, "waiting": waiting}
+    return {"busy": busy, "current_tool": current_tool, "waiting": waiting, "audio": "phone" if phone.connected() else "mac"}
 
 
 def main() -> None:
@@ -907,6 +986,9 @@ def main() -> None:
     if SAVE_DIR:
         _check_save_dir(SAVE_DIR)
     threading.Thread(target=engines.load, name="engine-load", daemon=True).start()
+    global phone
+    phone = PhoneAudioServer(host="0.0.0.0", port=int(os.environ.get("SPEAK_PHONE_PORT", PHONE_PORT_DEFAULT)))
+    phone.start()
     mcp.run()
 
 

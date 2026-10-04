@@ -30,8 +30,46 @@ responsive during a long `listen`.
   speak_audio_worker <play|play-stream|record> ...`) for every single audio
   operation and exits when that operation finishes. See "Audio process
   isolation" below for why.
+- `speak_phone_audio.py` — `PhoneAudioServer`: the phone as mic/speaker over WebSocket (see "Phone as mic/speaker"). Never imports `sounddevice`.
 - `pyproject.toml` — uv project, Python 3.12 (mlx-whisper pulls torch; Kokoro
   needs `misaki[en]`; Silero adds only torchaudio on top of that).
+
+## Phone as mic/speaker
+
+The iPhone app (design: `docs/DESIGN_PHONE_AUDIO.md`) can be the audio device.
+The server runs a WebSocket server (`speak_phone_audio.PhoneAudioServer`, a
+background thread with its own asyncio loop) on **TCP 8772**, bound to
+`0.0.0.0` (override the port with `SPEAK_PHONE_PORT`, read once at startup).
+Plain `ws://` on the LAN; no TLS or auth (v1, WiFi only).
+
+- **Routing rule:** at the START of each `speak`/`listen`/`converse` call
+  (under the audio lock) the server checks whether a phone is connected. If so
+  the whole call -- TTS, ear-open/ear-closed cues, the chime and "Processing"
+  -- goes to the phone, and `listen` records from the phone mic; otherwise
+  everything uses the Mac's devices through the worker, unchanged. A phone that
+  connects mid-call takes effect on the next call; one that disconnects
+  mid-call makes that call raise (`phone disconnected during listen/speak`),
+  never a silent switch to the Mac.
+- `status()` returns `audio: "phone" | "mac"` (the device the next call will
+  use); every `speak`/`listen`/`converse` result ends with `(audio: phone)` or
+  `(audio: mac)` on its own line.
+- Only the I/O moves. Kokoro, Whisper and the lock stay on the Mac. VAD runs in
+  the server process on the phone's 16 kHz PCM16 blocks with the same
+  parameters, pre-roll and timeout/cap logic as the worker's `cmd_record`
+  (Silero is loaded once at startup; no PortAudio involved).
+- Protocol: JSON text frames for control (`hello`/`ready`/`state`/`play_start`/
+  `play_end`/`played`/`mic_start`/`mic_stop`/`ping`/`pong`), binary frames for
+  PCM16 mono (phone->server 16 kHz, server->phone 24 kHz). One phone at a
+  time (a second is closed with reason `busy`); a `hello` with other rates is
+  closed `bad-rates`; two missed pongs (5 s ping) drop the connection; a
+  `played` later than segment duration + 10 s raises.
+- **Pointing the app at the Mac:** in the app's server-address field enter
+  the Mac's LAN IP (`192.168.86.188`; port 8772) and press Connect. Check with
+  the `status` tool: `audio` becomes `phone`. Disconnect and it returns to
+  `mac`. The Mac must allow incoming connections to the Python process
+  (macOS firewall prompt on first run).
+- Tests: `tests/test_speak_phone_audio.py` (real in-process websockets client,
+  stub VAD for the plumbing plus one real-Silero silence test).
 
 ## Audio process isolation
 

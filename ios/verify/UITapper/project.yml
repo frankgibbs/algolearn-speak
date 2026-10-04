@@ -1,0 +1,21 @@
+name: UITapper
+options:
+  bundleIdPrefix: ai.algolearn.verify
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  UITapperTests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [UITapperTests]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.algolearn.verify.uitapper
+        CODE_SIGNING_ALLOWED: NO
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  UITapper:
+    build:
+      targets: {UITapperTests: all}
+    test:
+      targets: [UITapperTests]

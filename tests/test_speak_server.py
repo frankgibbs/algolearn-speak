@@ -967,7 +967,7 @@ class TestSerializingLock(unittest.TestCase):
         finally:
             s.audio_lock = orig_audio_lock
             _rmtree(tmpdir)
-        self.assertEqual(result, {"busy": False, "current_tool": None, "waiting": 0})
+        self.assertEqual(result, {"busy": False, "current_tool": None, "waiting": 0, "audio": "mac"})
 
     def test_status_tool_reports_busy_snapshot_without_blocking(self):
         import asyncio
@@ -982,7 +982,7 @@ class TestSerializingLock(unittest.TestCase):
             test_lock.release()
             s.audio_lock = orig_audio_lock
             _rmtree(tmpdir)
-        self.assertEqual(result, {"busy": True, "current_tool": "speak", "waiting": 0})
+        self.assertEqual(result, {"busy": True, "current_tool": "speak", "waiting": 0, "audio": "mac"})
 
 
 def _rmtree(path: str) -> None:

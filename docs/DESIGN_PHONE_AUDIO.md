@@ -164,3 +164,46 @@ replacing the Mac worker (it stays the default device).
    the Mac again.
 4. Then the owner installs on the phone and the same three checks run over
    WiFi with his voice.
+
+## 9. Build, review and verification record (2026-10-04)
+
+Built as designed: `speak_phone_audio.py` + `speak_server.py` routing (124
+tests green, 45 of them for the phone path, run 3× without flakes) and the
+SwiftUI app under `ios/AlgolearnSpeak` (XcodeGen project; builds for the
+iPhone 17 Pro simulator with zero warnings; 18 unit tests). Independent code
+review found and the builders fixed: a lock leak when the idle-state send
+failed in a `finally`; unbounded blocking sends (now time-bounded, transport
+aborted, "phone unresponsive" raised; pinger bounded); the stale slot after
+a silent drop (newcomer probes the holder, replaces it if dead); `busy` made
+retryable in the app for ~60 s; background reconnect while the audio session
+is live, up to 120 s; the 5 s idle receive timeout raised to 60 s; logging of
+silent drops; added failure-path tests on both sides.
+
+End-to-end (design §8): the SERVER checks all pass against a protocol-
+faithful stand-in client (`ios/verify/phone_standin.py`): `audio: phone`,
+speak routed with the `played` round trip, listen → exact transcript,
+`audio: mac` after disconnect, mid-call disconnects raise. Timings on
+localhost: speak call → first `play_start` 347 ms (the whole sentence is
+synthesised before the first segment — §6's streaming assumption is
+optimistic; first-sound latency is Kokoro's synthesis time); listen call →
+`mic_start` 0.73 s. The REAL app in the simulator builds, launches,
+connects and the server flips to `audio: phone`; it then aborted in
+CoreAudio 9 s later in all 3 runs — root-caused to the Mac's audio INPUT
+being stalled machine-wide at the time (PortAudio and a native AVAudioEngine
+probe both hang on any input device; output is fine; `ios/verify/VERIFY.md`
+has the evidence). The Mac-path `listen` is affected the same way until
+coreaudiod is restarted or the Mac rebooted. Device verification (§8 step 4)
+is pending that.
+
+## 10. OPEN QUESTION (owner to decide): a second speak server process
+
+`main()` binds port 8772. Two Claude Code sessions each run their own speak
+server today (the cross-process audio flock exists for that), so the second
+one now fails to start with "Address already in use". Options offered:
+(a) **Mac-only, visible** — if 8772 is taken, that server runs with the Mac
+devices only, reports `phone: port busy` in status, retries the bind in the
+background and takes the phone when the first session exits (a fallback by
+the house rule, hence the question); (b) **per-session port** via
+`SPEAK_PHONE_PORT`, with a port field in the app; (c) **fail loudly** — one
+voice session at a time. Until decided, the code does (c) with an error
+message naming `SPEAK_PHONE_PORT`.
