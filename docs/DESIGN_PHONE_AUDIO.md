@@ -1,6 +1,6 @@
 # Design: the iPhone as the speak server's microphone and speaker
 
-Written 2026-10-04. Status: design for build. Owner request (voice/text,
+Written 2026-10-04 (section 10 added 2026-10-05). Status: design for build. Owner request (voice/text,
 2026-10-04): "a mobile app I can side load on my iPhone that mimics the speak
 MCP but uses the mic and speakers on my phone over WiFi or cellular."
 Decisions the owner made are marked **Owner decision**; decisions I made are
@@ -83,8 +83,8 @@ phone counterpart of `speak_audio_worker.py` — the only other code that
 performs audio I/O; everything else stays where it is).
 
 - `PhoneAudioServer` — a `websockets` server on a background thread with
-  its own asyncio loop, started by `speak_server.main()` beside the engine
-  loader. Holds the single connection, the state, and two queues: mic
+  its own asyncio loop, hosted by the `speak-phone` daemon (section 10).
+  Holds the single connection, the state, and two queues: mic
   frames in, speaker segments out. Exposes synchronous methods for the
   server's worker thread: `connected() -> bool`, `play(pcm_f32, rate)`
   (blocks until `played`), `record(max_seconds, silence_seconds,
@@ -195,15 +195,39 @@ has the evidence). The Mac-path `listen` is affected the same way until
 coreaudiod is restarted or the Mac rebooted. Device verification (§8 step 4)
 is pending that.
 
-## 10. OPEN QUESTION (owner to decide): a second speak server process
+## 10. A single always-on phone process (Owner decision, 2026-10-05)
 
-`main()` binds port 8772. Two Claude Code sessions each run their own speak
-server today (the cross-process audio flock exists for that), so the second
-one now fails to start with "Address already in use". Options offered:
-(a) **Mac-only, visible** — if 8772 is taken, that server runs with the Mac
-devices only, reports `phone: port busy` in status, retries the bind in the
-background and takes the phone when the first session exits (a fallback by
-the house rule, hence the question); (b) **per-session port** via
-`SPEAK_PHONE_PORT`, with a port field in the app; (c) **fail loudly** — one
-voice session at a time. Until decided, the code does (c) with an error
-message naming `SPEAK_PHONE_PORT`.
+Each Claude Code session runs its own speak server process, and only one
+process can bind TCP 8772. **Owner decision (Frank, 2026-10-05):** the phone
+link is split into its own single, always-on process, and every speak server
+becomes a client of it.
+
+- **`speak-phone` daemon** (`speak_phone_daemon.py`, console script
+  `speak-phone`, run by a launchd LaunchAgent with KeepAlive,
+  `launchd/com.algolearn.speak-phone.plist`) owns TCP 8772
+  (`SPEAK_PHONE_PORT` still overrides) and the one phone connection, using
+  `PhoneAudioServer` and the section 3 protocol unchanged. The iOS app needs
+  no change.
+- **Speak servers** (any number) never bind 8772. Each talks to the daemon
+  over a local Unix socket, `~/.algolearn-speak/phone.sock` (mode 0600;
+  `SPEAK_PHONE_SOCKET` overrides it). A Unix socket was chosen over a second
+  localhost TCP port because it needs no port allocation and is reachable
+  only by the owning user. One request per connection, one reply; framing is
+  a 4-byte header length, a JSON header, then raw float32 PCM. Operations:
+  `ping`, `connected`, `set_state`, `play_segments`, `record`.
+- **Routing rule (unchanged):** at the start of each `speak`/`listen`/
+  `converse` call, under the cross-process audio flock, the server asks the
+  daemon whether a phone is connected; if yes the whole call goes to the phone
+  through the daemon, otherwise to the Mac devices through the worker. The
+  daemon not running means no phone is connected, so the Mac is used. A phone
+  disconnect mid-call raises with the section 4 messages; a daemon that is
+  missing or dies mid-call raises too, and nothing switches to the Mac within
+  a call. The flock is the only serialiser; the daemon adds no queue.
+- **VAD runs in the daemon.** It receives the phone's 32 ms blocks, so the
+  blocks never cross the local socket, and Silero (torch) is loaded once in
+  one process instead of once per session. The parameters, pre-roll,
+  timeout and cap logic are the same code (`PhoneAudioServer.record`). The
+  speak server receives the finished 16 kHz capture, the recorded-audio
+  contract that `cmd_record`'s worker already presents, and transcribes it.
+- `status()` reports `audio: phone|mac` and `phone_daemon: true|false`
+  (whether the daemon answers on its socket).

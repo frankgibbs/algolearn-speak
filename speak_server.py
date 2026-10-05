@@ -38,7 +38,8 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 import speak_audio_worker
-from speak_phone_audio import TIMEOUT as PHONE_TIMEOUT, PhoneAudioServer
+from speak_phone_audio import TIMEOUT as PHONE_TIMEOUT
+from speak_phone_daemon import PhoneClient
 from speak_tone import cue_pcm, tone
 
 log = logging.getLogger("speak")
@@ -68,12 +69,12 @@ SENTENCE_SPLIT = r"(?<=[.!?])\s+"
 # audio device, otherwise the Mac's devices are. The choice is made ONCE at
 # the start of each tool call (`_begin_call`, under the audio lock) and holds
 # for the whole call: a phone that disconnects mid-call makes that call raise,
-# it never switches to the Mac mid-operation. `phone` is replaced by a started
-# server in main(); until then (and in tests) it is an unstarted one, which
-# reports connected() == False.
+# it never switches to the Mac mid-operation. `phone` is a client of the
+# always-on `speak-phone` daemon (speak_phone_daemon.py), which owns TCP 8772
+# and the phone connection; this process never binds that port. Daemon not
+# running = no phone connected = Mac.
 
-PHONE_PORT_DEFAULT = 8772
-phone = PhoneAudioServer()
+phone = PhoneClient()
 _route = "mac"  # "phone" | "mac"; written only by _begin_call/_end_call, under audio_lock
 
 
@@ -967,9 +968,10 @@ async def status() -> dict:
     process or in another one (e.g. a second Claude Code session's own
     speak_server.py).
 
-    Returns `{"busy": bool, "current_tool": str | None, "waiting": int, "audio": "phone" | "mac"}`.
+    Returns `{"busy": bool, "current_tool": str | None, "waiting": int, "audio": "phone" | "mac", "phone_daemon": bool}`.
     `audio` is the device the NEXT call will use: "phone" while a phone is
-    connected to the phone-audio port, otherwise "mac".
+    connected to the `speak-phone` daemon, otherwise "mac".
+    `phone_daemon` is whether that daemon is reachable.
     `current_tool` is the name of the tool currently holding the lock, or
     `"<tool> (pid <n>, other process)"` when a different process holds it,
     or null if idle. `waiting` counts only callers queued in THIS process
@@ -978,7 +980,7 @@ async def status() -> dict:
     blocks.
     """
     busy, current_tool, waiting = audio_lock.snapshot()
-    return {"busy": busy, "current_tool": current_tool, "waiting": waiting, "audio": "phone" if phone.connected() else "mac"}
+    return {"busy": busy, "current_tool": current_tool, "waiting": waiting, "audio": "phone" if phone.connected() else "mac", "phone_daemon": phone.daemon_reachable()}
 
 
 def main() -> None:
@@ -986,9 +988,6 @@ def main() -> None:
     if SAVE_DIR:
         _check_save_dir(SAVE_DIR)
     threading.Thread(target=engines.load, name="engine-load", daemon=True).start()
-    global phone
-    phone = PhoneAudioServer(host="0.0.0.0", port=int(os.environ.get("SPEAK_PHONE_PORT", PHONE_PORT_DEFAULT)))
-    phone.start()
     mcp.run()
 
 

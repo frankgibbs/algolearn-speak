@@ -18,6 +18,7 @@ import unittest
 from unittest import mock
 
 os.environ["SPEAK_AUDIO_DRY_RUN"] = "1"
+os.environ["SPEAK_PHONE_SOCKET"] = "/nonexistent-speak-phone-test/phone.sock"  # never the live daemon
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np

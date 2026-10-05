@@ -97,26 +97,45 @@ including `"<tool> (pid <n>, other process)"` when another process holds it.
 ## Phone as mic/speaker
 
 The iPhone app (design: `docs/DESIGN_PHONE_AUDIO.md`) can be the audio device.
-The server runs a WebSocket server (`speak_phone_audio.PhoneAudioServer`, a
-background thread with its own asyncio loop) on **TCP 8772**, bound to
-`0.0.0.0` (override the port with `SPEAK_PHONE_PORT`, read once at startup).
-Plain `ws://` on the LAN; no TLS or auth (v1, WiFi only).
+The phone link is its own always-on process, the **`speak-phone` daemon**
+(`speak_phone_daemon.py`, console script `speak-phone`), run by launchd. It
+hosts `speak_phone_audio.PhoneAudioServer` on **TCP 8772**, bound to `0.0.0.0`
+(override the port with `SPEAK_PHONE_PORT`, read once at daemon start), and
+holds the one phone connection. Plain `ws://` on the LAN; no TLS or auth (v1,
+WiFi only). Speak servers (one per Claude Code session, any number) never bind
+8772: each is a client of the daemon over a local **Unix socket**
+(`~/.algolearn-speak/phone.sock`, mode 0600; override with `SPEAK_PHONE_SOCKET`
+in both the daemon and the speak server's env). The speak server's `phone`
+object is a `PhoneClient` with the same methods as `PhoneAudioServer`
+(`connected`, `set_state`, `play`, `play_segments`, `record`); each call is one
+request/reply on the socket (length-prefixed JSON header + raw float32 PCM).
 
+- **Install the daemon:** `uv sync`, then
+  `cp launchd/com.algolearn.speak-phone.plist ~/Library/LaunchAgents/ &&
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.algolearn.speak-phone.plist`.
+  Logs: `~/Library/Logs/speak-phone.log`. Uninstall:
+  `launchctl bootout gui/$(id -u)/com.algolearn.speak-phone && rm
+  ~/Library/LaunchAgents/com.algolearn.speak-phone.plist`. The plist hardcodes
+  the `.venv/bin/speak-phone` path of this checkout. If 8772 is already held
+  the daemon exits with the bind error and launchd keeps retrying (see the log).
 - **Routing rule:** at the START of each `speak`/`listen`/`converse` call
-  (under the audio lock) the server checks whether a phone is connected. If so
-  the whole call -- TTS, ear-open/ear-closed cues, the chime and "Processing"
-  -- goes to the phone, and `listen` records from the phone mic; otherwise
-  everything uses the Mac's devices through the worker, unchanged. A phone that
-  connects mid-call takes effect on the next call; one that disconnects
+  (under the audio lock) the server asks the daemon whether a phone is
+  connected. If so the whole call -- TTS, ear-open/ear-closed cues, the chime
+  and "Processing" -- goes to the phone via the daemon, and `listen` records
+  from the phone mic; otherwise everything uses the Mac's devices through the
+  worker, unchanged. **Daemon not running = no phone connected = Mac.** A phone
+  that connects mid-call takes effect on the next call; one that disconnects
   mid-call makes that call raise (`phone disconnected during listen/speak`),
-  never a silent switch to the Mac.
+  never a silent switch to the Mac. A daemon that dies mid-call raises too.
 - `status()` returns `audio: "phone" | "mac"` (the device the next call will
-  use); every `speak`/`listen`/`converse` result ends with `(audio: phone)` or
-  `(audio: mac)` on its own line.
-- Only the I/O moves. Kokoro, Whisper and the lock stay on the Mac. VAD runs in
-  the server process on the phone's 16 kHz PCM16 blocks with the same
+  use) and `phone_daemon: true | false` (whether the daemon answers on its
+  socket); every `speak`/`listen`/`converse` result ends with `(audio: phone)`
+  or `(audio: mac)` on its own line.
+- Only the I/O moves. Kokoro, Whisper and the lock stay in the speak server.
+  VAD runs in the **daemon**, on the phone's 16 kHz PCM16 blocks, with the same
   parameters, pre-roll and timeout/cap logic as the worker's `cmd_record`
-  (Silero is loaded once at startup; no PortAudio involved).
+  (Silero loaded once at daemon start; no PortAudio involved). The speak server
+  receives the finished 16 kHz capture over the socket and transcribes it.
 - Protocol: JSON text frames for control (`hello`/`ready`/`state`/`play_start`/
   `play_end`/`played`/`mic_start`/`mic_stop`/`ping`/`pong`), binary frames for
   PCM16 mono (phone->server 16 kHz, server->phone 24 kHz). One phone at a
@@ -124,12 +143,15 @@ Plain `ws://` on the LAN; no TLS or auth (v1, WiFi only).
   closed `bad-rates`; two missed pongs (5 s ping) drop the connection; a
   `played` later than segment duration + 10 s raises.
 - **Pointing the app at the Mac:** in the app's server-address field enter
-  the Mac's LAN IP (`192.168.86.188`; port 8772) and press Connect. Check with
+  the Mac's LAN IP (`192.168.86.188`; port 8772) and press Connect (the daemon must be running). Check with
   the `status` tool: `audio` becomes `phone`. Disconnect and it returns to
   `mac`. The Mac must allow incoming connections to the Python process
   (macOS firewall prompt on first run).
 - Tests: `tests/test_speak_phone_audio.py` (real in-process websockets client,
   stub VAD for the plumbing plus one real-Silero silence test).
+  `tests/test_speak_phone_daemon.py` (daemon + client over a temp Unix socket
+  and an ephemeral TCP port; two real speak-server processes against one
+  daemon; no daemon = both Mac). Run all: `.venv/bin/python -m unittest discover -s tests`.
 
 ## Audio cues
 

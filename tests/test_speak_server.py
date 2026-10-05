@@ -17,6 +17,7 @@ import unittest
 from unittest import mock
 
 os.environ["SPEAK_AUDIO_DRY_RUN"] = "1"
+os.environ["SPEAK_PHONE_SOCKET"] = "/nonexistent-speak-phone-test/phone.sock"  # never the live daemon
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -967,7 +968,7 @@ class TestSerializingLock(unittest.TestCase):
         finally:
             s.audio_lock = orig_audio_lock
             _rmtree(tmpdir)
-        self.assertEqual(result, {"busy": False, "current_tool": None, "waiting": 0, "audio": "mac"})
+        self.assertEqual(result, {"busy": False, "current_tool": None, "waiting": 0, "audio": "mac", "phone_daemon": False})
 
     def test_status_tool_reports_busy_snapshot_without_blocking(self):
         import asyncio
@@ -982,7 +983,7 @@ class TestSerializingLock(unittest.TestCase):
             test_lock.release()
             s.audio_lock = orig_audio_lock
             _rmtree(tmpdir)
-        self.assertEqual(result, {"busy": True, "current_tool": "speak", "waiting": 0, "audio": "mac"})
+        self.assertEqual(result, {"busy": True, "current_tool": "speak", "waiting": 0, "audio": "mac", "phone_daemon": False})
 
 
 def _rmtree(path: str) -> None:
