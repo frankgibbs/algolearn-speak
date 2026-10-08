@@ -18,6 +18,7 @@ import unittest
 HERE = os.path.dirname(__file__)
 ROOT = os.path.abspath(os.path.join(HERE, ".."))
 os.environ["SPEAK_AUDIO_DRY_RUN"] = "1"
+os.environ["SPEAK_FTCALL_BIN"] = os.path.join(os.path.abspath(HERE), "fake_ftcall")  # never the real FaceTime banner; children inherit it
 sys.path.insert(0, ROOT)
 sys.path.insert(0, HERE)
 
@@ -53,7 +54,7 @@ import speak_server as s
 s.engines.load = lambda: None
 s.mcp.run = lambda *a, **k: None
 s.main()
-route = s._begin_call()
+route = s._begin_call("speak")
 if route == "phone":
     s._play_pcm(np.zeros(2400, dtype=np.float32), 24000)
     s._end_call("phone")

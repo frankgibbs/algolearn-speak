@@ -28,7 +28,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["speak_server.py", "speak_audio_worker.py", "speak_phone_audio.py", "speak_phone_daemon.py", "speak_tone.py"]
+only-include = ["speak_server.py", "speak_audio_worker.py", "speak_facetime.py", "speak_phone_audio.py", "speak_phone_daemon.py", "speak_tone.py"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

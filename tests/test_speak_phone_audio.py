@@ -18,6 +18,7 @@ import unittest
 from unittest import mock
 
 os.environ["SPEAK_AUDIO_DRY_RUN"] = "1"
+os.environ["SPEAK_FTCALL_BIN"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_ftcall")  # never the real FaceTime banner
 os.environ["SPEAK_PHONE_SOCKET"] = "/nonexistent-speak-phone-test/phone.sock"  # never the live daemon
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -540,9 +541,9 @@ class TestRouting(unittest.TestCase):
 
     def test_begin_call_follows_connected(self):
         self.fake_phone(False)
-        self.assertEqual(s._begin_call(), "mac")
+        self.assertEqual(s._begin_call("speak"), "mac")
         self.fake_phone(True)
-        self.assertEqual(s._begin_call(), "phone")
+        self.assertEqual(s._begin_call("speak"), "phone")
         s._end_call("phone")
         self.assertEqual(s._route, "mac")
 
@@ -550,14 +551,14 @@ class TestRouting(unittest.TestCase):
         ph = self.fake_phone(True)
         audio = np.zeros(100, dtype=np.float32)
         with mock.patch.object(s, "_run_worker") as worker:
-            s._begin_call()
+            s._begin_call("speak")
             s._play_pcm(audio, 24000)
             s._end_call("phone")
             ph.play.assert_called_once()
             worker.assert_not_called()
         ph2 = self.fake_phone(False)
         with mock.patch.object(s, "_run_worker") as worker:
-            s._begin_call()
+            s._begin_call("speak")
             s._play_pcm(audio, 24000)
             s._end_call("mac")
             worker.assert_called_once()
@@ -566,7 +567,7 @@ class TestRouting(unittest.TestCase):
     def test_play_stream_sends_one_segment_per_chunk(self):
         ph = self.fake_phone(True)
         chunks = [np.zeros((10, 1), dtype=np.float32), np.zeros((20, 1), dtype=np.float32)]
-        s._begin_call()
+        s._begin_call("speak")
         try:
             s._play_pcm_stream(chunks, 24000, timeout=1.0)
         finally:
@@ -578,7 +579,7 @@ class TestRouting(unittest.TestCase):
     def test_route_is_fixed_for_the_whole_call(self):
         # The phone drops after the call started: the call still targets the phone (and would raise there).
         ph = self.fake_phone(True)
-        s._begin_call()
+        s._begin_call("speak")
         ph.connected.return_value = False
         try:
             s._play_pcm(np.zeros(10, dtype=np.float32), 24000)
@@ -589,7 +590,7 @@ class TestRouting(unittest.TestCase):
     def test_record_routed_to_phone_timeout_raises_timeouterror(self):
         ph = self.fake_phone(True)
         ph.record.return_value = pa.TIMEOUT
-        s._begin_call()
+        s._begin_call("speak")
         try:
             with self.assertRaises(TimeoutError):
                 s._record_for_route(5, 1.0, 3)

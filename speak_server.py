@@ -1,11 +1,15 @@
 """algolearn-speak: a local ear and voice for Claude Code.
 
-MCP server (stdio) exposing four tools:
+MCP server (stdio) exposing six tools:
 
   speak(text)     -> synthesise with Kokoro (MLX) and play through the default output
   listen(...)     -> record from the default input until you stop talking (Silero VAD),
                      transcribe with Whisper (MLX), return the text
   converse(text)  -> speak, then listen
+  call()          -> FaceTime Audio call to the owner's iPhone; while it is up,
+                     speak/listen/converse run over the call
+                     (docs/DESIGN_FACETIME_CALL.md)
+  hang_up()       -> end that call
   status()        -> report whether speak/listen/converse are busy and how many
                      calls are queued behind the current one
 
@@ -32,12 +36,15 @@ import tempfile
 import threading
 import time
 
+import datetime
+
 import anyio
 import numpy as np
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 import speak_audio_worker
+import speak_facetime
 from speak_phone_audio import TIMEOUT as PHONE_TIMEOUT
 from speak_phone_daemon import PhoneClient
 from speak_tone import cue_pcm, tone
@@ -58,6 +65,12 @@ INPUT_DEVICE = os.environ.get("SPEAK_INPUT_DEVICE", "")   # substring match, res
 OUTPUT_DEVICE = os.environ.get("SPEAK_OUTPUT_DEVICE", "")  # substring match, resolved in the worker
 SAVE_DIR = os.environ.get("SPEAK_SAVE_DIR", "")            # if set, every successful capture is archived here
 
+# FaceTime calls (docs/DESIGN_FACETIME_CALL.md section 9). Validated in main().
+CALL_NUMBER = os.environ.get("SPEAK_CALL_NUMBER", "")                       # E.164; `call` raises if unset
+CALL_OUTPUT_DEVICE = os.environ.get("SPEAK_CALL_OUTPUT_DEVICE", "BlackHole 2ch")  # we play into it; FaceTime's Microphone
+CALL_INPUT_DEVICE = os.environ.get("SPEAK_CALL_INPUT_DEVICE", "BlackHole 16ch")   # we record it; FaceTime's Output
+QUIET_HOURS = os.environ.get("SPEAK_QUIET_HOURS", "22:00-07:00")             # no-call window, local time
+
 MIC_RATE = 16_000          # Whisper and Silero both want 16 kHz mono
 VAD_FRAME = 512            # Silero frame size at 16 kHz (32 ms)
 TTS_RATE = 24_000          # Kokoro output rate
@@ -75,11 +88,34 @@ SENTENCE_SPLIT = r"(?<=[.!?])\s+"
 # running = no phone connected = Mac.
 
 phone = PhoneClient()
-_route = "mac"  # "phone" | "mac"; written only by _begin_call/_end_call, under audio_lock
+facetime = speak_facetime.FaceTime()
+_route = "mac"  # "facetime" | "phone" | "mac"; written only by _begin_call/_end_call, under audio_lock
+# True from an answered `call` until hang_up / a reported drop: while set, a call
+# that is no longer connected raises instead of routing to the Mac
+# (docs/DESIGN_FACETIME_CALL.md section 5). Per process: the session that placed the call.
+_call_expected = False
 
 
-def _begin_call() -> str:
+def _call_ended_error(tool: str, detail: str) -> RuntimeError:
+    """Clears the expectation: the drop is reported once, then the session calls back."""
+    global _call_expected
+    _call_expected = False
+    return RuntimeError(f"FaceTime call ended during {tool}; call back with the call tool ({detail})")
+
+
+def _begin_call(tool: str) -> str:
+    """A connected FaceTime call wins, then a connected phone, then the Mac
+    (docs/DESIGN_FACETIME_CALL.md section 5). A banner in any other state, or
+    an expected call that is gone, raises rather than routing to the Mac."""
     global _route
+    state, text = facetime.settled_state()
+    if state == "connected":
+        _route = "facetime"
+        return _route
+    if _call_expected:
+        raise _call_ended_error(tool, f"call state is {state}")
+    if state != "none":
+        raise RuntimeError(f"a FaceTime call banner is up but not connected (state {state}: {text!r}); not routing audio anywhere")
     _route = "phone" if phone.connected() else "mac"
     return _route
 
@@ -93,6 +129,42 @@ def _end_call(route: str) -> None:
 
 def _audio_note(route: str) -> str:
     return f"\n(audio: {route})"
+
+
+def _output_device() -> str:
+    return CALL_OUTPUT_DEVICE if _route == "facetime" else OUTPUT_DEVICE
+
+
+def _input_device() -> str:
+    return CALL_INPUT_DEVICE if _route == "facetime" else INPUT_DEVICE
+
+
+def _guard_call(route: str, tool: str, fn):
+    """On the facetime route, a call that is no longer connected when `fn`
+    finishes (or fails) makes the tool raise -- never a switch to the Mac's
+    devices (docs/DESIGN_FACETIME_CALL.md section 5). A transcript captured
+    before the drop is included in the message; a failure to read the call
+    state is reported together with the original error, never instead of it."""
+    if route != "facetime":
+        return fn()
+    try:
+        result = fn()
+    except Exception as e:
+        try:
+            state = facetime.settled_state()[0]
+        except Exception as check:
+            raise RuntimeError(f"{tool} failed ({e}) and the FaceTime call state could not be read ({check})") from e
+        if state != "connected":
+            raise _call_ended_error(tool, str(e)) from e
+        raise
+    partial = f"transcript before the drop: {result!r}" if isinstance(result, str) else "no transcript"
+    try:
+        state = facetime.settled_state()[0]
+    except Exception as check:
+        raise RuntimeError(f"{tool} finished ({partial}) but the FaceTime call state could not be read ({check})") from check
+    if state != "connected":
+        raise _call_ended_error(tool, f"call state is {state}; {partial}")
+    return result
 
 
 # ---------------------------------------------------------------- engines
@@ -415,7 +487,7 @@ def _play_pcm(audio: np.ndarray, samplerate: int) -> None:
         # generous fixed budget: playback itself has no fixed duration bound
         # here since callers pass short cues and full TTS chunks alike.
         duration = len(audio) / samplerate
-        _run_worker("play", path, str(samplerate), OUTPUT_DEVICE, timeout=duration + 30.0)
+        _run_worker("play", path, str(samplerate), _output_device(), timeout=duration + 30.0)
     finally:
         os.unlink(path)
 
@@ -441,7 +513,7 @@ def _play_pcm_stream(chunks: list[np.ndarray], samplerate: int, timeout: float) 
     payload = b"".join(chunk.astype(np.float32).tobytes() for chunk in chunks)
     for attempt in (1, 2):
         proc = subprocess.Popen(
-            _worker_command("play-stream", str(samplerate), OUTPUT_DEVICE),
+            _worker_command("play-stream", str(samplerate), _output_device()),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -711,11 +783,13 @@ def _record_for_route(
         if audio is PHONE_TIMEOUT:
             raise TimeoutError(f"no speech detected within {start_timeout_seconds:.0f}s")
         return audio, None, MIC_RATE
-    # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep
+    # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep.
+    # No voice-clone archive on the facetime route: call-codec audio is not reference material.
     return _record_pcm_with_archive(
         MIC_RATE, VAD_FRAME, max_seconds, silence_seconds, start_timeout_seconds,
         cue_freq_hz=880.0, cue_seconds=0.5, cue_volume=0.5, cue_lead_silence=0.2,
-        device_name=INPUT_DEVICE, want_archive=bool(SAVE_DIR), output_device_name=OUTPUT_DEVICE,
+        device_name=_input_device(), want_archive=bool(SAVE_DIR) and _route != "facetime",
+        output_device_name=_output_device(),
     )
 
 
@@ -836,7 +910,7 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
     log.info("listen: %.1fs of audio transcribed in %.1fs: %r", len(audio) / MIC_RATE, time.time() - t0, text)
     if not text:
         raise RuntimeError(f"speech was detected ({len(audio) / MIC_RATE:.1f}s) but Whisper returned no text")
-    if SAVE_DIR:
+    if SAVE_DIR and _route != "facetime":
         # Prefer the native-rate archive (better clone reference material)
         # when one was actually captured; otherwise the 16kHz stream already
         # in hand is the only copy that exists.
@@ -851,8 +925,8 @@ def _speak_sync(text: str) -> tuple[float, str]:
     audio_lock.acquire("speak")
     route = "mac"
     try:
-        route = _begin_call()
-        return _speak_impl(text), route
+        route = _begin_call("speak")
+        return _guard_call(route, "speak", lambda: _speak_impl(text)), route
     finally:
         try:
             _end_call(route)
@@ -864,8 +938,8 @@ def _listen_sync(max_seconds: float, silence_seconds: float, start_timeout_secon
     audio_lock.acquire("listen")
     route = "mac"
     try:
-        route = _begin_call()
-        return _listen_impl(max_seconds, silence_seconds, start_timeout_seconds), route
+        route = _begin_call("listen")
+        return _guard_call(route, "listen", lambda: _listen_impl(max_seconds, silence_seconds, start_timeout_seconds)), route
     finally:
         try:
             _end_call(route)
@@ -877,14 +951,55 @@ def _converse_sync(text: str, max_seconds: float, silence_seconds: float, start_
     audio_lock.acquire("converse")
     route = "mac"
     try:
-        route = _begin_call()
-        _speak_impl(text)
-        return _listen_impl(max_seconds, silence_seconds, start_timeout_seconds), route
+        route = _begin_call("converse")
+
+        def round_trip() -> str:
+            _speak_impl(text)
+            return _listen_impl(max_seconds, silence_seconds, start_timeout_seconds)
+
+        return _guard_call(route, "converse", round_trip), route
     finally:
         try:
             _end_call(route)
         finally:
             audio_lock.release()
+
+
+def _call_sync(override_quiet_hours: bool) -> str:
+    global _call_expected
+    if not CALL_NUMBER:
+        raise RuntimeError("SPEAK_CALL_NUMBER is not set; add it to the speak server's env block in ~/.claude.json")
+    audio_lock.acquire("call")
+    try:
+        # Checked under the lock: a call queued behind a long converse is judged when it would dial.
+        if not override_quiet_hours and speak_facetime.in_quiet_hours(
+            speak_facetime.parse_quiet_hours(QUIET_HOURS), datetime.datetime.now().time()
+        ):
+            return f"not called: quiet hours ({QUIET_HOURS})"
+        outcome = facetime.place_call(CALL_NUMBER, CALL_OUTPUT_DEVICE, CALL_INPUT_DEVICE)
+        _call_expected = outcome in (speak_facetime.ANSWERED, speak_facetime.ALREADY_CONNECTED)
+        return outcome
+    finally:
+        audio_lock.release()
+
+
+def _hang_up_sync() -> str:
+    global _call_expected
+    audio_lock.acquire("hang_up")
+    try:
+        outcome = facetime.hang_up()
+        _call_expected = False
+        return outcome
+    finally:
+        audio_lock.release()
+
+
+def _check_call_config() -> None:
+    """Fail at startup, not on the first call (docs/DESIGN_FACETIME_CALL.md section 9)."""
+    facetime.check_binary()
+    speak_facetime.parse_quiet_hours(QUIET_HOURS)
+    if CALL_NUMBER:
+        speak_facetime.validate_number(CALL_NUMBER)
 
 # ---------------------------------------------------------------- MCP surface
 
@@ -920,6 +1035,11 @@ async def speak(text: str) -> str:
     progress anywhere, this one queues and waits for it to finish, then
     proceeds; it is never rejected. Use `status()` to see what is currently
     running (including in another process) and how many calls are waiting.
+
+    FaceTime: while a call placed by `call()` is connected, this runs over
+    the call instead of the Mac's speaker and mic (the result ends with
+    `(audio: facetime)`). If the call ends mid-way this raises "FaceTime call
+    ended during ..."; the rule of engagement is to call back with `call()`.
     """
     seconds, route = await _run(_speak_sync, text)
     return f"spoke for {seconds:.1f}s{_audio_note(route)}"
@@ -941,6 +1061,11 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 2.0, start
     progress anywhere, this one queues and waits for it to finish, then
     proceeds; it is never rejected. Use `status()` to see what is currently
     running (including in another process) and how many calls are waiting.
+
+    FaceTime: while a call placed by `call()` is connected, this runs over
+    the call instead of the Mac's speaker and mic (the result ends with
+    `(audio: facetime)`). If the call ends mid-way this raises "FaceTime call
+    ended during ..."; the rule of engagement is to call back with `call()`.
     """
     text, route = await _run(_listen_sync, max_seconds, silence_seconds, start_timeout_seconds)
     return text + _audio_note(route)
@@ -957,9 +1082,46 @@ async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float
     progress anywhere, this one queues and waits for it to finish, then
     proceeds; it is never rejected. Use `status()` to see what is currently
     running (including in another process) and how many calls are waiting.
+
+    FaceTime: while a call placed by `call()` is connected, this runs over
+    the call instead of the Mac's speaker and mic (the result ends with
+    `(audio: facetime)`). If the call ends mid-way this raises "FaceTime call
+    ended during ..."; the rule of engagement is to call back with `call()`.
     """
     reply, route = await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)
     return reply + _audio_note(route)
+
+
+@mcp.tool()
+async def call(override_quiet_hours: bool = False) -> str:
+    """Place a FaceTime Audio call from the Mac to the owner's iPhone and wait for the answer.
+
+    Once answered, speak/listen/converse run over the call until it ends, so the
+    owner can talk wherever they are. Returns one of:
+      "answered"                              -- the owner picked up; start talking (converse)
+      "already connected"                     -- a call is already up; just talk
+      "not answered (declined or no answer)"  -- what you have can wait; do not
+                                                 call again for at least one hour
+      "not called: quiet hours (22:00-07:00)" -- nothing was dialed; no calls in
+                                                 that window
+    Quiet hours are a hard rule. Pass `override_quiet_hours=True` ONLY when the
+    owner has said in this conversation that they are up and want calls.
+
+    Rule of engagement: if speak/listen/converse raises "FaceTime call ended
+    during ...", the call dropped mid-conversation -- call back with this tool.
+    Hang up with `hang_up()` only when the owner asks; they can also hang up
+    themselves.
+    """
+    return await _run(_call_sync, override_quiet_hours)
+
+
+@mcp.tool()
+async def hang_up() -> str:
+    """End the FaceTime call placed by `call()`. Use only when the owner asks you to.
+
+    Returns "hung up" or "no active call".
+    """
+    return await _run(_hang_up_sync)
 
 
 @mcp.tool()
@@ -968,9 +1130,13 @@ async def status() -> dict:
     process or in another one (e.g. a second Claude Code session's own
     speak_server.py).
 
-    Returns `{"busy": bool, "current_tool": str | None, "waiting": int, "audio": "phone" | "mac", "phone_daemon": bool}`.
-    `audio` is the device the NEXT call will use: "phone" while a phone is
-    connected to the `speak-phone` daemon, otherwise "mac".
+    Returns `{"busy": bool, "current_tool": str | None, "waiting": int, "audio": "facetime" | "phone" | "mac" | "error", "phone_daemon": bool, "call": str}`.
+    `audio` is the device the NEXT call will use: "facetime" while a FaceTime
+    call is connected, else "phone" while a phone is connected to the
+    `speak-phone` daemon, otherwise "mac"; "error" when the next call would
+    raise (call state unreadable, a half-set-up banner, or a dropped call). `call` is the FaceTime call state
+    ("none", "click_to_call", "ringing", "connected", "unknown"), or
+    "error: <reason>" if it could not be read.
     `phone_daemon` is whether that daemon is reachable.
     `current_tool` is the name of the tool currently holding the lock, or
     `"<tool> (pid <n>, other process)"` when a different process holds it,
@@ -980,13 +1146,24 @@ async def status() -> dict:
     blocks.
     """
     busy, current_tool, waiting = audio_lock.snapshot()
-    return {"busy": busy, "current_tool": current_tool, "waiting": waiting, "audio": "phone" if phone.connected() else "mac", "phone_daemon": phone.daemon_reachable()}
+    try:
+        call_state = facetime.state()
+    except Exception as e:  # reported in the result, never hidden: status must not raise
+        call_state = f"error: {e}"
+    if call_state == "connected":
+        audio = "facetime"
+    elif call_state == "none" and not _call_expected:
+        audio = "phone" if phone.connected() else "mac"
+    else:
+        audio = "error"  # the next speak/listen/converse would raise (see _begin_call)
+    return {"busy": busy, "current_tool": current_tool, "waiting": waiting, "audio": audio, "phone_daemon": phone.daemon_reachable(), "call": call_state}
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     if SAVE_DIR:
         _check_save_dir(SAVE_DIR)
+    _check_call_config()
     threading.Thread(target=engines.load, name="engine-load", daemon=True).start()
     mcp.run()
 
