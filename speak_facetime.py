@@ -18,13 +18,15 @@ import time
 
 # SPEAK_FTCALL_BIN exists for tests only (they point it at tests/fake_ftcall), like SPEAK_AUDIO_DRY_RUN.
 FTCALL_BIN = os.environ.get("SPEAK_FTCALL_BIN") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "ftcall", "ftcall")
-STATES = ("none", "click_to_call", "ringing", "connected", "unknown")
+# "loading": a banner whose labels are not filled in yet (seen for ~1 s after dialing).
+STATES = ("none", "loading", "click_to_call", "ringing", "connected", "unknown")
 
 BANNER_TIMEOUT = 15.0      # dial -> "Click to Call" banner
 RING_START_TIMEOUT = 10.0  # Call pressed -> banner shows ringing (or connected)
 ANSWER_TIMEOUT = 90.0      # ringing -> connected
 HANGUP_TIMEOUT = 5.0       # End/Cancel pressed -> banner gone
-UNKNOWN_GRACE = 1.0        # an unreadable banner (mid-rebuild) is tolerated this long before it is an error
+UNKNOWN_GRACE = 1.0        # an unrecognised banner is tolerated this long in a row before it is an error
+SETTLE_TIMEOUT = 3.0       # how long settled_state waits out "loading" / "unknown"
 GONE_CONFIRM = 1.0         # a vanished banner while ringing must stay gone this long to count as not answered
 
 ANSWERED = "answered"
@@ -92,12 +94,12 @@ class FaceTime:
         return self.state_and_text()[0]
 
     def settled_state(self) -> tuple[str, str]:
-        """The state, re-read for up to UNKNOWN_GRACE while it is "unknown" (a
-        banner caught mid-rebuild). A persistent "unknown" is returned as is."""
-        deadline = time.monotonic() + UNKNOWN_GRACE
+        """The state, re-read for up to SETTLE_TIMEOUT while it is "loading" or
+        "unknown" (a banner mid-redraw). A persistent one is returned as is."""
+        deadline = time.monotonic() + SETTLE_TIMEOUT
         while True:
             state, text = self.state_and_text()
-            if state != "unknown" or time.monotonic() >= deadline:
+            if state not in ("loading", "unknown") or time.monotonic() >= deadline:
                 return state, text
             time.sleep(self.poll_seconds)
 
@@ -115,7 +117,8 @@ class FaceTime:
     def _poll(self, accept: tuple[str, ...], keep: tuple[str, ...], timeout: float) -> tuple[str, str] | None:
         """Poll until the state is in `accept` (returned) or `timeout` passes
         (None). States in `keep` keep polling; "unknown" keeps polling for up
-        to UNKNOWN_GRACE in a row; anything else raises with the banner text."""
+        to UNKNOWN_GRACE in a row; "loading" always keeps polling (bounded by
+        `timeout`); anything else raises with the banner text."""
         deadline = time.monotonic() + timeout
         unknown_since: float | None = None
         while True:
@@ -127,7 +130,7 @@ class FaceTime:
                 unknown_since = unknown_since if unknown_since is not None else now
                 if now - unknown_since >= UNKNOWN_GRACE:
                     raise RuntimeError(f"unexpected FaceTime banner: {text!r}")
-            elif state in keep:
+            elif state in keep or state == "loading":
                 unknown_since = None
             else:
                 raise RuntimeError(f"unexpected FaceTime banner state {state} ({text!r})")
@@ -165,7 +168,7 @@ class FaceTime:
             return self._after_dial(mic_device, output_device)
         except BaseException as e:
             try:
-                if self.state() == "click_to_call":
+                if self.settled_state()[0] == "click_to_call":
                     self.press("Cancel")
             except RuntimeError as cleanup:
                 raise RuntimeError(f"{e}; also failed to cancel a pending 'Click to Call' banner: {cleanup}") from e

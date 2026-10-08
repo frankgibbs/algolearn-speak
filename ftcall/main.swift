@@ -1,6 +1,6 @@
 // ftcall: read and drive the FaceTime call banner through the Accessibility API.
 //
-//   ftcall state            {"state": "none"|"click_to_call"|"ringing"|"connected"|"unknown", "text": "..."}
+//   ftcall state            {"state": "none"|"loading"|"click_to_call"|"ringing"|"connected"|"unknown", "text": "..."}
 //   ftcall press <button>   press the banner button labelled exactly <button> (Call, Cancel, End)
 //   ftcall devices          {"microphone": "...", "output": "..."} -- the checked items in FaceTime's Video menu
 //
@@ -64,11 +64,15 @@ func banners() -> [AXUIElement] {
     return found
 }
 
+/// Static-text labels. The "Click to Call" banner carries them in
+/// AXDescription, the in-call banner in AXValue; read both.
 func bannerTexts(_ b: AXUIElement) -> [String] {
-    descendants(b).filter { text($0, kAXRoleAttribute) == "AXStaticText" }.compactMap { text($0, kAXValueAttribute) }
+    descendants(b).filter { text($0, kAXRoleAttribute) == "AXStaticText" }
+        .compactMap { text($0, kAXValueAttribute) ?? text($0, kAXDescriptionAttribute) ?? text($0, kAXTitleAttribute) }
 }
 
 func classify(_ texts: [String]) -> String {
+    if texts.isEmpty { return "loading" }  // banner drawn, labels not filled in yet (seen for ~1 s after dialing)
     if texts.contains("Click to Call") { return "click_to_call" }
     if texts.contains("FaceTime Audio…") { return "ringing" }
     if texts.contains(where: { $0.range(of: #"^FaceTime Audio - \d+:\d{2}(:\d{2})?$"#, options: .regularExpression) != nil }) {

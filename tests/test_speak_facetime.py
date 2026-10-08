@@ -399,6 +399,19 @@ class TestRobustness(unittest.TestCase):
         f, _ = facetime(self)
         self.assertEqual(f.place_call("+15555550100", "BlackHole 2ch", "BlackHole 16ch"), ft.ANSWERED)
 
+    def test_long_loading_banner_after_dialing_is_waited_out(self):
+        # Seen live: the banner exists ~1.1 s with no labels before "Click to Call" fills in.
+        FakeBanner(self, ["none"] + ["loading|"] * 30 + ["click_to_call", "ringing", "connected"])
+        f, _ = facetime(self)
+        self.assertEqual(f.place_call("+15555550100", "BlackHole 2ch", "BlackHole 16ch"), ft.ANSWERED)
+
+    def test_cleanup_waits_for_a_loading_banner_before_cancelling(self):
+        banner = FakeBanner(self, ["none", "click_to_call", "loading|", "loading|", "click_to_call"], devices=None)
+        f, _ = facetime(self)
+        with self.assertRaises(RuntimeError):
+            f.place_call("+15555550100", "BlackHole 2ch", "BlackHole 16ch")
+        self.assertEqual(banner.presses(), ["Cancel"])
+
     def test_persistent_unknown_banner_raises(self):
         FakeBanner(self, ["none", "click_to_call", "ringing", "unknown|Call Failed"])
         f, _ = facetime(self)

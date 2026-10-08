@@ -43,7 +43,11 @@ Banner states seen in the spike (static text of the group):
 | `Click to Call` | Call, Cancel | Dial requested, waiting for the click |
 | `FaceTime Audio…` | Messages, FaceTime Video, Mute, Share, End | Ringing the phone |
 | `FaceTime Audio - M:SS` | same | Connected; the timer starts at 0:00 the moment the owner answers |
+| (group with no labels yet) | | Drawing; seen for about 1.1 s after dialing. Reported as `loading` |
 | (no group) | | No call |
+
+The "Click to Call" banner carries its labels in `AXDescription`; the in-call
+banner carries them in `AXValue`. `ftcall` reads both (Verified).
 
 Two separate BlackHole devices are required. With only one, FaceTime's
 microphone would also hear FaceTime's own output and echo the owner's
@@ -59,7 +63,9 @@ selection (Verified), so the menu is the source of truth.
 Source: `ftcall/main.swift`. Built with `ftcall/build.sh` into
 `ftcall/ftcall` (git-ignored). Commands:
 
-- `ftcall state` prints one JSON line: `{"state": "none"|"click_to_call"|"ringing"|"connected"|"unknown", "text": "<banner text>"}`.
+- `ftcall state` prints one JSON line: `{"state": "none"|"loading"|"click_to_call"|"ringing"|"connected"|"unknown", "text": "<banner text>"}`.
+  `loading` is a banner with no labels yet. Every wait keeps polling through
+  it, bounded by that wait's own timeout.
   `unknown` means a FaceTime banner whose text matches none of the known
   states (for example an incoming call), or more than one FaceTime banner
   at once. The server never treats it as one of the known states (see
@@ -124,10 +130,11 @@ If any step after dialing fails while the "Click to Call" banner is still
 up, the tool presses `Cancel` before raising, so a later click can never
 dial. If the cleanup fails too, the error names both failures.
 
-**Decision (pending the end-to-end test):** the spike saw no banner text for
-a declined or unanswered call. If FaceTime shows a final banner such as
-"Call Failed" or "Unavailable", it reads as `unknown` and the tool raises
-with that text. The end-to-end test adds any such text as a named state.
+**Decision:** the spike saw no banner text for a declined or unanswered
+call, so none is named. If FaceTime shows a final banner such as "Call
+Failed" or "Unavailable", it reads as `unknown` and the tool raises with
+that text rather than guessing an outcome. The end-to-end test records what
+FaceTime actually shows.
 
 Declined and no-answer are reported together. **Decision:** the banner
 alone does not distinguish them, and both lead to the same action (wait an
@@ -145,6 +152,15 @@ under the audio lock. The order becomes:
    raise. Audio is never routed while a call is half set up.
 4. Phone connected → route `phone` (unchanged until retirement).
 5. Otherwise → route `mac`.
+
+**Decision: every voice call depends on reading the call state.** If
+`ftcall` cannot run (no Accessibility permission for the app that launched
+Claude Code, Notification Center not running, the binary missing), `speak`,
+`listen` and `converse` raise, even when no call was ever placed. They do
+not fall back to the Mac. Reason: the owner's standing rule against fallback
+logic. Guessing "no call" when the state is unreadable is exactly how audio
+would end up in an empty room. `status` reports `audio: "error"` in that
+case.
 
 **Decision: a "call expected" flag.** It is set when `call` returns
 `answered` or `already connected`. It is cleared by `hang_up`, by
