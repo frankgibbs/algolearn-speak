@@ -25,7 +25,25 @@ retired. That removal is a separate change made after this one passes its
 end-to-end test. Until then the phone route keeps working unchanged
 (`speak_server.py:81-91`).
 
-## 2. How the pieces fit (all Verified in the spike)
+## 2. The Mac must be unlocked (Verified 2026-10-08)
+
+- When the display slept and the screen locked mid-call, the FaceTime call
+  ended. On this Mac the screen locks immediately on display sleep, and the
+  display sleeps and the screensaver starts after 20 idle minutes.
+- Dialing while locked placed no call. The "Click to Call" banner did not
+  appear on the lock screen. After unlocking it appeared, but only as an
+  opaque `FaceTimeNotificationExtension` element with no buttons, so it
+  could not be pressed.
+- Research turned up no supported way around this. FaceTime skips the
+  prompt through a private Apple entitlement (`com.apple.FaceTime.NoPrompt`).
+  The calling service (TelephonyUtilities) is entitlement-gated, and
+  FaceTime has no scripting dictionary.
+
+**Owner decision:** `call` only works while the Mac is unlocked. From the
+moment a call connects until it ends, the server keeps the Mac from
+sleeping or locking (section 6, "Keep-awake").
+
+## 3. How the pieces fit (all Verified in the spike)
 
 | Piece | What it is |
 |---|---|
@@ -58,18 +76,21 @@ selected one with a check. `ftcall` reads those marks (Verified). The
 `defaults` key `PreferredAudioInputDeviceUID` does not reflect the real
 selection (Verified), so the menu is the source of truth.
 
-## 3. The `ftcall` helper
+## 4. The `ftcall` helper
 
 Source: `ftcall/main.swift`. Built with `ftcall/build.sh` into
 `ftcall/ftcall` (git-ignored). Commands:
 
-- `ftcall state` prints one JSON line: `{"state": "none"|"loading"|"click_to_call"|"ringing"|"connected"|"unknown", "text": "<banner text>"}`.
+- `ftcall state` prints one JSON line: `{"state": "locked"|"none"|"loading"|"click_to_call"|"ringing"|"connected"|"unknown", "text": "<banner text>"}`.
+  `locked` comes from the IORegistry's `IOConsoleLocked`, read before any
+  Accessibility call. While the screen is locked, Accessibility calls into
+  Notification Center hang (Verified: `ftcall` timed out after 10 s).
   `loading` is a banner with no labels yet. Every wait keeps polling through
   it, bounded by that wait's own timeout.
   `unknown` means a FaceTime banner whose text matches none of the known
   states (for example an incoming call), or more than one FaceTime banner
   at once. The server never treats it as one of the known states (see
-  section 4 for the short grace period).
+  section 5 for the short grace period).
 - `ftcall press <button>` presses the banner button whose label is exactly
   `<button>` (`Call`, `Cancel`, `End`). With more than one banner up it
   refuses rather than guess.
@@ -89,7 +110,7 @@ about 35 ms (Verified).
 launched, so macOS attributes it to Terminal. A Claude Code launched from
 another app needs that app granted too.
 
-## 4. The `call` tool
+## 5. The `call` tool
 
 ```
 call(override_quiet_hours: bool = False) -> str
@@ -99,10 +120,12 @@ Runs under the audio lock (`speak_server.py:235-300`) as tool name `call`,
 so no other session can speak or dial while it runs. Steps:
 
 1. `SPEAK_CALL_NUMBER` unset → raise.
-2. Quiet hours (section 6) and `override_quiet_hours` false → return
+2. Quiet hours (section 7) and `override_quiet_hours` false → return
    `not called: quiet hours (22:00-07:00)`. Nothing is dialed.
-3. `ftcall state` is `connected` → return `already connected`. Any other
-   state but `none` → raise (a call is in an unknown or half-set-up state).
+3. `ftcall state` is `connected` → return `already connected`. `locked` →
+   return `not called: the Mac is locked (FaceTime can only call while it is
+   unlocked)`; nothing is dialed. Any other state but `none` → raise (a call
+   is in an unknown or half-set-up state).
 4. `open facetime-audio://<number>`.
 5. Wait up to 15 s for `click_to_call`, else raise.
 6. `ftcall devices`. If the checked Microphone does not contain
@@ -140,7 +163,7 @@ Declined and no-answer are reported together. **Decision:** the banner
 alone does not distinguish them, and both lead to the same action (wait an
 hour), so a guess would add nothing.
 
-## 5. Routing while a call is up
+## 6. Routing while a call is up
 
 `_begin_call` (`speak_server.py:81-84`) picks the route once per tool call,
 under the audio lock. The order becomes:
@@ -152,6 +175,20 @@ under the audio lock. The order becomes:
    raise. Audio is never routed while a call is half set up.
 4. Phone connected → route `phone` (unchanged until retirement).
 5. Otherwise → route `mac`.
+
+**Keep-awake (Owner decision, section 2).** When `call` returns `answered`
+or `already connected`, the server starts `caffeinate -d -i -w <server pid>`,
+which blocks display sleep and idle sleep and exits if the server dies. It
+also declares user activity every 60 s (`caffeinate -u -t 1`). That resets
+the screensaver's idle timer, because on this Mac the screensaver locks the
+screen as well. A watcher thread reads the call state every 5 s and releases
+everything once the state is `none` or `locked`. `hang_up` and a reported
+drop release it too. If the state can't be read, the watcher keeps the Mac
+awake and logs a warning; staying awake is the safe side.
+
+A `locked` state means no call, because locking ends a call (section 2). On
+the routing path it is treated like `none`: an expected call that reads
+`locked` raises "call ended", otherwise audio goes to the phone or the Mac.
 
 **Decision: every voice call depends on reading the call state.** If
 `ftcall` cannot run (no Accessibility permission for the app that launched
@@ -203,7 +240,7 @@ The post-check is enough to keep the result honest.
 ended mid-conversation, the session calls back. This rule is written into
 the `call`, `speak`, `listen` and `converse` tool descriptions.
 
-## 6. When to call
+## 7. When to call
 
 - **Owner decision:** no calls from 22:00 to 07:00 local time, every day.
   `SPEAK_QUIET_HOURS` holds the window (default `22:00-07:00`). The `call`
@@ -221,7 +258,7 @@ the `call`, `speak`, `listen` and `converse` tool descriptions.
   whether anything is waiting, and the session then calls. That channel is
   outside this server and this document.
 
-## 7. The `hang_up` tool
+## 8. The `hang_up` tool
 
 ```
 hang_up() -> str
@@ -236,7 +273,7 @@ return `hung up`. If the state is `none`, return `no active call`. Anything
 else raises. If the press fails because the banner has already gone (the
 owner hung up at the same moment), the result is still `hung up`.
 
-## 8. `status`
+## 9. `status`
 
 `status` gains `"call": "<ftcall state>"`, or `"error: <reason>"` when the
 state can't be read. `audio` can now be `"facetime"` as well as `"phone"` /
@@ -246,7 +283,7 @@ dropped. Every tool result's trailing
 `(audio: ...)` note (`speak_server.py:94-95`) shows `facetime` on that
 route.
 
-## 9. Configuration
+## 10. Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -258,7 +295,7 @@ route.
 The `ftcall/ftcall` binary must exist. The server fails at startup with
 the build command if it doesn't.
 
-## 10. One-time setup on this Mac (done 2026-10-08)
+## 11. One-time setup on this Mac (done 2026-10-08)
 
 1. `brew install --cask blackhole-2ch blackhole-16ch` (needs the admin
    password), then `sudo killall coreaudiod` so the devices load without a
@@ -273,7 +310,7 @@ the build command if it doesn't.
 6. Add `SPEAK_CALL_NUMBER` to the `speak` server's `env` block in
    `~/.claude.json`, then reconnect with `/mcp`.
 
-## 11. Tests
+## 12. Tests
 
 `tests/test_speak_facetime.py` drives the Python side against a fake
 `ftcall` script that plays back a scripted sequence of states. The tests

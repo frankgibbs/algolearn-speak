@@ -1,4 +1,4 @@
-"""Tests for FaceTime calls (docs/DESIGN_FACETIME_CALL.md section 11).
+"""Tests for FaceTime calls (docs/DESIGN_FACETIME_CALL.md section 12).
 
 The real ftcall helper and the real `open facetime-audio://` are never used:
 SPEAK_FTCALL_BIN points at tests/fake_ftcall, which plays back a scripted
@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -201,14 +202,39 @@ class TestHangUp(unittest.TestCase):
                 f.hang_up()
 
 
+FAKE_CAFFEINATE = os.path.join(HERE, "fake_caffeinate")
+
+
+def caffeinate_log(case: unittest.TestCase) -> str:
+    path = os.path.join(tempfile.mkdtemp(prefix="fake-caffeinate-"), "log")
+    case.addCleanup(shutil.rmtree, os.path.dirname(path), True)
+    patcher = mock.patch.dict(os.environ, {"FAKE_CAFFEINATE_LOG": path})
+    patcher.start()
+    case.addCleanup(patcher.stop)
+    return path
+
+
+def read_lines(path: str) -> list[str]:
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return f.read().splitlines()
+
+
 class ServerCase(unittest.TestCase):
-    """speak_server with a FaceTime on the fake banner and stubbed engines."""
+    """speak_server with a FaceTime on the fake banner, a fake caffeinate, and stubbed engines."""
 
     def setUp(self):
         f, self.dialed = facetime(self)
         patcher = mock.patch.object(s, "facetime", f)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.caffeinate_log = caffeinate_log(self)
+        self.keep_awake = ft.KeepAwake(f, poll=0.05, pulse=0.1, caffeinate=FAKE_CAFFEINATE)
+        patcher = mock.patch.object(s, "keep_awake", self.keep_awake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.keep_awake.stop)
         self._orig = (s.engines.kokoro, s.engines.ready.is_set(), s.engines.error)
         s.engines.ready.set()
         s.engines.error = None
@@ -223,6 +249,7 @@ class ServerCase(unittest.TestCase):
         s.engines.kokoro = FakeKokoro()
 
     def tearDown(self):
+        self.keep_awake.stop()  # before cleanups remove the fake banner dir it polls
         s.engines.kokoro, ready, s.engines.error = self._orig
         if not ready:
             s.engines.ready.clear()
@@ -525,3 +552,95 @@ class TestCallExpected(ServerCase):
             with mock.patch.object(s, "CALL_NUMBER", "+15555550100"):
                 s._call_sync(True)
         self.assertEqual(seen, ["hang_up", "call"])
+
+
+class TestLocked(ServerCase):
+    def test_call_refuses_while_locked_without_dialing(self):
+        FakeBanner(self, ["locked"])
+        with mock.patch.object(s, "CALL_NUMBER", "+15555550100"):
+            self.assertEqual(s._call_sync(True), ft.NOT_CALLED_LOCKED)
+        self.assertEqual(self.dialed, [])
+        self.assertFalse(self.keep_awake.active())
+
+    def test_voice_uses_the_mac_while_locked(self):
+        FakeBanner(self, ["locked"])
+        _, route = s._speak_sync("hi")
+        self.assertEqual(route, "mac")
+
+    def test_lock_during_a_call_reports_the_drop(self):
+        FakeBanner(self, ["locked"])
+        with mock.patch.object(s, "_call_expected", True):
+            with self.assertRaisesRegex(RuntimeError, "call ended during speak.*locked"):
+                s._speak_sync("hi")
+
+    def test_hang_up_while_locked_is_no_active_call(self):
+        FakeBanner(self, ["locked"])
+        self.assertEqual(s._hang_up_sync(), ft.NO_ACTIVE_CALL)
+
+    def test_status_while_locked(self):
+        FakeBanner(self, ["locked"])
+        result = asyncio.run(s.status())
+        self.assertEqual((result["call"], result["audio"]), ("locked", "mac"))
+
+
+class TestKeepAwake(ServerCase):
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(s, "_call_expected", False)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _wait_until(self, predicate, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while not predicate():
+            if time.monotonic() > deadline:
+                self.fail("condition not met in time")
+            time.sleep(0.02)
+
+    def test_answered_call_holds_caffeinate_and_pulses_activity(self):
+        FakeBanner(self, ["none", "click_to_call", "ringing", "connected"])
+        with mock.patch.object(s, "CALL_NUMBER", "+15555550100"):
+            self.assertEqual(s._call_sync(True), ft.ANSWERED)
+        self.assertTrue(self.keep_awake.active())
+        self._wait_until(lambda: sum(l.startswith("-u") for l in read_lines(self.caffeinate_log)) >= 2)
+        held = [l for l in read_lines(self.caffeinate_log) if not l.startswith("-u")]
+        self.assertEqual(held, [f"-d -i -w {os.getpid()}"])
+
+    def test_watcher_releases_when_the_call_ends(self):
+        banner = FakeBanner(self, ["connected"])
+        self.keep_awake.start()
+        banner.set_states(["none"])
+        self._wait_until(lambda: not self.keep_awake.active())
+
+    def test_watcher_releases_when_the_screen_locks(self):
+        banner = FakeBanner(self, ["connected"])
+        self.keep_awake.start()
+        banner.set_states(["locked"])
+        self._wait_until(lambda: not self.keep_awake.active())
+
+    def test_watcher_stays_awake_when_the_state_is_unreadable(self):
+        banner = FakeBanner(self, ["connected"])
+        self.keep_awake.start()
+        open(os.path.join(banner.dir, "fail"), "w").close()
+        time.sleep(0.3)
+        self.assertTrue(self.keep_awake.active())
+
+    def test_hang_up_releases(self):
+        FakeBanner(self, ["connected", "connected", "none"])
+        self.keep_awake.start()
+        self.assertEqual(s._hang_up_sync(), ft.HUNG_UP)
+        self.assertFalse(self.keep_awake.active())
+
+    def test_reported_drop_releases(self):
+        FakeBanner(self, ["none"])
+        self.keep_awake.start()
+        with mock.patch.object(s, "_call_expected", True):
+            with self.assertRaises(RuntimeError):
+                s._speak_sync("hi")
+        self.assertFalse(self.keep_awake.active())
+
+    def test_not_answered_does_not_hold(self):
+        FakeBanner(self, ["none", "click_to_call", "ringing", "none"])
+        with mock.patch.object(ft, "GONE_CONFIRM", 0.05), mock.patch.object(s, "CALL_NUMBER", "+15555550100"):
+            self.assertEqual(s._call_sync(True), ft.NOT_ANSWERED)
+        self.assertFalse(self.keep_awake.active())

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stand-in for ftcall/ftcall in tests (docs/DESIGN_FACETIME_CALL.md section 11).
+"""Stand-in for ftcall/ftcall in tests (docs/DESIGN_FACETIME_CALL.md section 12).
 
 With FAKE_FTCALL_DIR unset: `state` is always none. With it set, that directory holds:
   states        one state per line ("<state>" or "<state>|<text>", or FAIL to make that

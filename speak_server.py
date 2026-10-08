@@ -65,7 +65,7 @@ INPUT_DEVICE = os.environ.get("SPEAK_INPUT_DEVICE", "")   # substring match, res
 OUTPUT_DEVICE = os.environ.get("SPEAK_OUTPUT_DEVICE", "")  # substring match, resolved in the worker
 SAVE_DIR = os.environ.get("SPEAK_SAVE_DIR", "")            # if set, every successful capture is archived here
 
-# FaceTime calls (docs/DESIGN_FACETIME_CALL.md section 9). Validated in main().
+# FaceTime calls (docs/DESIGN_FACETIME_CALL.md section 10). Validated in main().
 CALL_NUMBER = os.environ.get("SPEAK_CALL_NUMBER", "")                       # E.164; `call` raises if unset
 CALL_OUTPUT_DEVICE = os.environ.get("SPEAK_CALL_OUTPUT_DEVICE", "BlackHole 2ch")  # we play into it; FaceTime's Microphone
 CALL_INPUT_DEVICE = os.environ.get("SPEAK_CALL_INPUT_DEVICE", "BlackHole 16ch")   # we record it; FaceTime's Output
@@ -89,10 +89,11 @@ SENTENCE_SPLIT = r"(?<=[.!?])\s+"
 
 phone = PhoneClient()
 facetime = speak_facetime.FaceTime()
+keep_awake = speak_facetime.KeepAwake(facetime)
 _route = "mac"  # "facetime" | "phone" | "mac"; written only by _begin_call/_end_call, under audio_lock
 # True from an answered `call` until hang_up / a reported drop: while set, a call
 # that is no longer connected raises instead of routing to the Mac
-# (docs/DESIGN_FACETIME_CALL.md section 5). Per process: the session that placed the call.
+# (docs/DESIGN_FACETIME_CALL.md section 6). Per process: the session that placed the call.
 _call_expected = False
 
 
@@ -100,12 +101,13 @@ def _call_ended_error(tool: str, detail: str) -> RuntimeError:
     """Clears the expectation: the drop is reported once, then the session calls back."""
     global _call_expected
     _call_expected = False
+    keep_awake.stop()
     return RuntimeError(f"FaceTime call ended during {tool}; call back with the call tool ({detail})")
 
 
 def _begin_call(tool: str) -> str:
     """A connected FaceTime call wins, then a connected phone, then the Mac
-    (docs/DESIGN_FACETIME_CALL.md section 5). A banner in any other state, or
+    (docs/DESIGN_FACETIME_CALL.md section 6). A banner in any other state, or
     an expected call that is gone, raises rather than routing to the Mac."""
     global _route
     state, text = facetime.settled_state()
@@ -114,7 +116,7 @@ def _begin_call(tool: str) -> str:
         return _route
     if _call_expected:
         raise _call_ended_error(tool, f"call state is {state}")
-    if state != "none":
+    if state not in ("none", "locked"):
         raise RuntimeError(f"a FaceTime call banner is up but not connected (state {state}: {text!r}); not routing audio anywhere")
     _route = "phone" if phone.connected() else "mac"
     return _route
@@ -142,7 +144,7 @@ def _input_device() -> str:
 def _guard_call(route: str, tool: str, fn):
     """On the facetime route, a call that is no longer connected when `fn`
     finishes (or fails) makes the tool raise -- never a switch to the Mac's
-    devices (docs/DESIGN_FACETIME_CALL.md section 5). A transcript captured
+    devices (docs/DESIGN_FACETIME_CALL.md section 6). A transcript captured
     before the drop is included in the message; a failure to read the call
     state is reported together with the original error, never instead of it."""
     if route != "facetime":
@@ -978,6 +980,8 @@ def _call_sync(override_quiet_hours: bool) -> str:
             return f"not called: quiet hours ({QUIET_HOURS})"
         outcome = facetime.place_call(CALL_NUMBER, CALL_OUTPUT_DEVICE, CALL_INPUT_DEVICE)
         _call_expected = outcome in (speak_facetime.ANSWERED, speak_facetime.ALREADY_CONNECTED)
+        if _call_expected:
+            keep_awake.start()  # a lock or sleep would end the call; released when the call is gone
         return outcome
     finally:
         audio_lock.release()
@@ -989,13 +993,14 @@ def _hang_up_sync() -> str:
     try:
         outcome = facetime.hang_up()
         _call_expected = False
+        keep_awake.stop()
         return outcome
     finally:
         audio_lock.release()
 
 
 def _check_call_config() -> None:
-    """Fail at startup, not on the first call (docs/DESIGN_FACETIME_CALL.md section 9)."""
+    """Fail at startup, not on the first call (docs/DESIGN_FACETIME_CALL.md section 10)."""
     facetime.check_binary()
     speak_facetime.parse_quiet_hours(QUIET_HOURS)
     if CALL_NUMBER:
@@ -1104,6 +1109,10 @@ async def call(override_quiet_hours: bool = False) -> str:
                                                  call again for at least one hour
       "not called: quiet hours (22:00-07:00)" -- nothing was dialed; no calls in
                                                  that window
+      "not called: the Mac is locked ..."     -- nothing was dialed; FaceTime can
+                                                 only call while the Mac is unlocked
+    While a call is up the Mac is kept awake and unlocked (a lock ends the
+    call); that stops by itself when the call ends.
     Quiet hours are a hard rule. Pass `override_quiet_hours=True` ONLY when the
     owner has said in this conversation that they are up and want calls.
 
@@ -1134,7 +1143,8 @@ async def status() -> dict:
     `audio` is the device the NEXT call will use: "facetime" while a FaceTime
     call is connected, else "phone" while a phone is connected to the
     `speak-phone` daemon, otherwise "mac"; "error" when the next call would
-    raise (call state unreadable, a half-set-up banner, or a dropped call). `call` is the FaceTime call state
+    raise (call state unreadable, a half-set-up banner, or a dropped call).
+    `call` is "locked" while the screen is locked (no call is possible then). `call` is the FaceTime call state
     ("none", "click_to_call", "ringing", "connected", "unknown"), or
     "error: <reason>" if it could not be read.
     `phone_daemon` is whether that daemon is reachable.
@@ -1152,7 +1162,7 @@ async def status() -> dict:
         call_state = f"error: {e}"
     if call_state == "connected":
         audio = "facetime"
-    elif call_state == "none" and not _call_expected:
+    elif call_state in ("none", "locked") and not _call_expected:
         audio = "phone" if phone.connected() else "mac"
     else:
         audio = "error"  # the next speak/listen/converse would raise (see _begin_call)

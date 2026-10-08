@@ -1,11 +1,13 @@
 // ftcall: read and drive the FaceTime call banner through the Accessibility API.
 //
-//   ftcall state            {"state": "none"|"loading"|"click_to_call"|"ringing"|"connected"|"unknown", "text": "..."}
+//   ftcall state            {"state": "locked"|"none"|"loading"|"click_to_call"|"ringing"|"connected"|"unknown", "text": "..."}
+//                           "locked" is read from IOConsoleLocked before any AX call: while the
+//                           screen is locked, AX calls into Notification Center hang.
 //   ftcall press <button>   press the banner button labelled exactly <button> (Call, Cancel, End)
 //   ftcall devices          {"microphone": "...", "output": "..."} -- the checked items in FaceTime's Video menu
 //
 // Exit 0 on success, 2 without Accessibility permission, 3 on any other
-// failure (reason on stderr). See docs/DESIGN_FACETIME_CALL.md section 3.
+// failure (reason on stderr). See docs/DESIGN_FACETIME_CALL.md section 4.
 //
 // The call banner belongs to Notification Center, not FaceTime: an AX group
 // whose identifier (or description) is FACETIME_NOTIFICATION.
@@ -13,6 +15,7 @@
 import AppKit
 import ApplicationServices
 import Foundation
+import IOKit
 
 func fail(_ message: String, code: Int32 = 3) -> Never {
     FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
@@ -81,7 +84,17 @@ func classify(_ texts: [String]) -> String {
     return "unknown"
 }
 
+func consoleLocked() -> Bool {
+    let root = IORegistryGetRootEntry(kIOMainPortDefault)
+    defer { IOObjectRelease(root) }
+    guard let value = IORegistryEntryCreateCFProperty(root, "IOConsoleLocked" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Bool else {
+        fail("IOConsoleLocked is missing from the IORegistry root; cannot tell whether the screen is locked")
+    }
+    return value
+}
+
 func cmdState() {
+    if consoleLocked() { emit(["state": "locked", "text": ""]); return }
     let all = banners()
     if all.count > 1 {
         emit(["state": "unknown", "text": "\(all.count) FaceTime banners: " + all.map { bannerTexts($0).joined(separator: " | ") }.joined(separator: " // ")])

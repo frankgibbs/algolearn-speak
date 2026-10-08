@@ -11,15 +11,21 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import os
 import re
 import subprocess
+import threading
 import time
+
+log = logging.getLogger("speak")
 
 # SPEAK_FTCALL_BIN exists for tests only (they point it at tests/fake_ftcall), like SPEAK_AUDIO_DRY_RUN.
 FTCALL_BIN = os.environ.get("SPEAK_FTCALL_BIN") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "ftcall", "ftcall")
 # "loading": a banner whose labels are not filled in yet (seen for ~1 s after dialing).
-STATES = ("none", "loading", "click_to_call", "ringing", "connected", "unknown")
+# "locked": the screen is locked. Verified on this Mac: locking ends a FaceTime call,
+# and no call can be placed while locked, so "locked" always means "no call".
+STATES = ("locked", "none", "loading", "click_to_call", "ringing", "connected", "unknown")
 
 BANNER_TIMEOUT = 15.0      # dial -> "Click to Call" banner
 RING_START_TIMEOUT = 10.0  # Call pressed -> banner shows ringing (or connected)
@@ -29,6 +35,7 @@ UNKNOWN_GRACE = 1.0        # an unrecognised banner is tolerated this long in a 
 SETTLE_TIMEOUT = 3.0       # how long settled_state waits out "loading" / "unknown"
 GONE_CONFIRM = 1.0         # a vanished banner while ringing must stay gone this long to count as not answered
 
+NOT_CALLED_LOCKED = "not called: the Mac is locked (FaceTime can only call while it is unlocked)"
 ANSWERED = "answered"
 ALREADY_CONNECTED = "already connected"
 NOT_ANSWERED = "not answered (declined or no answer)"
@@ -147,7 +154,7 @@ class FaceTime:
             if self.settled_state()[0] == "none":
                 return
             raise
-        if self._poll(("none",), ("connected", "ringing", "click_to_call"), HANGUP_TIMEOUT) is None:
+        if self._poll(("none", "locked"), ("connected", "ringing", "click_to_call"), HANGUP_TIMEOUT) is None:
             state, text = self.state_and_text()
             raise RuntimeError(f"pressed {button} but the call banner did not go away within {HANGUP_TIMEOUT:.0f}s (state {state}: {text!r})")
 
@@ -160,6 +167,8 @@ class FaceTime:
         state, text = self.settled_state()
         if state == "connected":
             return ALREADY_CONNECTED
+        if state == "locked":
+            return NOT_CALLED_LOCKED
         if state != "none":
             raise RuntimeError(f"cannot dial: a FaceTime call banner is already up (state {state}: {text!r})")
 
@@ -208,7 +217,7 @@ class FaceTime:
 
     def hang_up(self) -> str:
         state, text = self.settled_state()
-        if state == "none":
+        if state in ("none", "locked"):
             return NO_ACTIVE_CALL
         if state in ("connected", "ringing"):
             self._press_end_and_wait("End")
@@ -217,3 +226,72 @@ class FaceTime:
         else:
             raise RuntimeError(f"cannot hang up: unexpected FaceTime banner (state {state}: {text!r})")
         return HUNG_UP
+
+
+class KeepAwake:
+    """While a call is up, keep the Mac from sleeping or locking: a display
+    lock or the screensaver lock ends a FaceTime call (verified on this Mac).
+
+    Holds `caffeinate -d -i -w <this pid>` (no display or idle sleep; exits on
+    its own if this process dies) and declares user activity every `pulse`
+    seconds (`caffeinate -u -t 1`), which resets the screensaver's idle timer.
+    A watcher thread polls the call state every `poll` seconds and stops
+    everything once the call is gone. docs/DESIGN_FACETIME_CALL.md section 6.
+    """
+
+    def __init__(self, facetime: FaceTime, poll: float = 5.0, pulse: float = 60.0, caffeinate: str = "caffeinate") -> None:
+        self.facetime = facetime
+        self.poll = poll
+        self.pulse = pulse
+        self.caffeinate = caffeinate
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._stop: threading.Event | None = None
+
+    def active(self) -> bool:
+        with self._lock:
+            return self._proc is not None
+
+    def start(self) -> None:
+        with self._lock:
+            if self._proc is not None:
+                return
+            self._proc = subprocess.Popen([self.caffeinate, "-d", "-i", "-w", str(os.getpid())],
+                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._stop = threading.Event()
+            threading.Thread(target=self._watch, args=(self._stop,), name="keep-awake", daemon=True).start()
+        self._declare_activity()
+        log.info("keep-awake on for the FaceTime call")
+
+    def stop(self) -> None:
+        with self._lock:
+            proc, stop = self._proc, self._stop
+            self._proc = self._stop = None
+        if proc is None:
+            return
+        stop.set()
+        proc.terminate()
+        proc.wait(timeout=5.0)
+        log.info("keep-awake off")
+
+    def _declare_activity(self) -> None:
+        subprocess.run([self.caffeinate, "-u", "-t", "1"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10.0)
+
+    def _watch(self, stop: threading.Event) -> None:
+        last_pulse = time.monotonic()
+        while not stop.wait(self.poll):
+            try:
+                state = self.facetime.state()
+            except Exception as e:
+                if stop.is_set():
+                    return  # stopped while this read was in flight
+                # Unreadable state: keep the Mac awake (the safe side) and say so.
+                log.warning("keep-awake: could not read the call state (%s); staying awake", e)
+                continue
+            if state not in ("connected", "loading", "unknown"):
+                log.info("keep-awake: call state is %s", state)
+                self.stop()
+                return
+            if time.monotonic() - last_pulse >= self.pulse:
+                self._declare_activity()
+                last_pulse = time.monotonic()

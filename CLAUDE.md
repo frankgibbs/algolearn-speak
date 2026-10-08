@@ -54,6 +54,11 @@ owner's iPhone over FaceTime Audio (works anywhere, no app/relay/port).
   a connected phone, then the Mac. A call that ends mid-operation raises
   `FaceTime call ended during ...`; the rule of engagement is to call back.
   No voice-clone archiving on the facetime route.
+- **Unlocked only (verified):** a screen lock ends a call, and nothing can be
+  dialed while locked. `call` returns `not called: the Mac is locked ...`.
+  While a call is up the server holds `caffeinate -d -i -w <pid>` and pulses
+  user activity every 60 s (the screensaver also locks), released when the
+  call ends. `ftcall state` reports `locked` without touching Accessibility.
 - **Quiet hours:** `call` refuses 22:00-07:00 local (`SPEAK_QUIET_HOURS`)
   unless `override_quiet_hours=True`, used only when the owner said they are
   up. After `not answered`, wait an hour before calling again.

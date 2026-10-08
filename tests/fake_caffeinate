@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stand-in for caffeinate in tests: logs its arguments to $FAKE_CAFFEINATE_LOG,
+# then either exits (-u pulses) or sleeps until terminated (the held assertion).
+echo "$*" >> "${FAKE_CAFFEINATE_LOG:-/dev/null}"
+case "$*" in
+  -u*) exit 0 ;;
+  *) exec sleep 600 ;;
+esac
