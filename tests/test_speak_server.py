@@ -9,6 +9,7 @@ sounddevice at all -- that's the point of the fix.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -18,7 +19,6 @@ from unittest import mock
 
 os.environ["SPEAK_AUDIO_DRY_RUN"] = "1"
 os.environ["SPEAK_FTCALL_BIN"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_ftcall")  # never the real FaceTime banner
-os.environ["SPEAK_PHONE_SOCKET"] = "/nonexistent-speak-phone-test/phone.sock"  # never the live daemon
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -828,6 +828,22 @@ def _make_test_lock():
     return lock, tmpdir
 
 
+class TestToolResultsCarryAudioNote(unittest.TestCase):
+    """Every speak/listen/converse result ends with `(audio: <route>)` on its own line."""
+
+    def test_speak(self):
+        with mock.patch.object(s, "_speak_sync", return_value=(1.5, "mac")):
+            self.assertEqual(asyncio.run(s.speak("hi")), "spoke for 1.5s\n(audio: mac)")
+
+    def test_listen(self):
+        with mock.patch.object(s, "_listen_sync", return_value=("hello there", "mac")):
+            self.assertEqual(asyncio.run(s.listen()), "hello there\n(audio: mac)")
+
+    def test_converse_over_facetime(self):
+        with mock.patch.object(s, "_converse_sync", return_value=("yes", "facetime")):
+            self.assertEqual(asyncio.run(s.converse("ok?")), "yes\n(audio: facetime)")
+
+
 class TestSerializingLock(unittest.TestCase):
     """The lock behind speak/listen/converse must queue a second caller
     (wait then proceed) rather than reject it, and `status()` must report
@@ -969,7 +985,7 @@ class TestSerializingLock(unittest.TestCase):
         finally:
             s.audio_lock = orig_audio_lock
             _rmtree(tmpdir)
-        self.assertEqual(result, {"busy": False, "current_tool": None, "waiting": 0, "audio": "mac", "phone_daemon": False, "call": "none"})
+        self.assertEqual(result, {"busy": False, "current_tool": None, "waiting": 0, "audio": "mac", "call": "none"})
 
     def test_status_tool_reports_busy_snapshot_without_blocking(self):
         import asyncio
@@ -984,7 +1000,7 @@ class TestSerializingLock(unittest.TestCase):
             test_lock.release()
             s.audio_lock = orig_audio_lock
             _rmtree(tmpdir)
-        self.assertEqual(result, {"busy": True, "current_tool": "speak", "waiting": 0, "audio": "mac", "phone_daemon": False, "call": "none"})
+        self.assertEqual(result, {"busy": True, "current_tool": "speak", "waiting": 0, "audio": "mac", "call": "none"})
 
 
 def _rmtree(path: str) -> None:

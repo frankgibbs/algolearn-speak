@@ -23,7 +23,6 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ["SPEAK_AUDIO_DRY_RUN"] = "1"
 os.environ["SPEAK_FTCALL_BIN"] = os.path.join(HERE, "fake_ftcall")
-os.environ["SPEAK_PHONE_SOCKET"] = "/nonexistent-speak-phone-test/phone.sock"
 sys.path.insert(0, os.path.dirname(HERE))
 
 import numpy as np

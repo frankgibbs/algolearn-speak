@@ -1,7 +1,0 @@
-22:29:14.863 standin ready: {"type": "ready", "server": "algolearn-speak", "version": "0.1.0"}
-22:29:14.863 standin state: idle
-22:29:17.326 standin state: speaking
-22:29:17.326 standin play_start #1 rate=24000
-22:29:17.329 standin play_end id=6 142800 bytes = 2.98s audio, received in 0.003s
-22:29:17.629 standin closing socket mid-speak (test)
-22:29:17.631 standin connection closed

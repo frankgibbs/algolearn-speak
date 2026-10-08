@@ -45,8 +45,6 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 import speak_audio_worker
 import speak_facetime
-from speak_phone_audio import TIMEOUT as PHONE_TIMEOUT
-from speak_phone_daemon import PhoneClient
 from speak_tone import cue_pcm, tone
 
 log = logging.getLogger("speak")
@@ -76,21 +74,15 @@ VAD_FRAME = 512            # Silero frame size at 16 kHz (32 ms)
 TTS_RATE = 24_000          # Kokoro output rate
 SENTENCE_SPLIT = r"(?<=[.!?])\s+"
 
-# ---------------------------------------------------------------- phone audio device
+# ---------------------------------------------------------------- audio route
 #
-# docs/DESIGN_PHONE_AUDIO.md section 2: when a phone is connected it IS the
-# audio device, otherwise the Mac's devices are. The choice is made ONCE at
-# the start of each tool call (`_begin_call`, under the audio lock) and holds
-# for the whole call: a phone that disconnects mid-call makes that call raise,
-# it never switches to the Mac mid-operation. `phone` is a client of the
-# always-on `speak-phone` daemon (speak_phone_daemon.py), which owns TCP 8772
-# and the phone connection; this process never binds that port. Daemon not
-# running = no phone connected = Mac.
+# The route is chosen ONCE at the start of each tool call (`_begin_call`, under
+# the audio lock) and holds for the whole call: "facetime" while a FaceTime
+# call is connected (docs/DESIGN_FACETIME_CALL.md), otherwise "mac".
 
-phone = PhoneClient()
 facetime = speak_facetime.FaceTime()
 keep_awake = speak_facetime.KeepAwake(facetime)
-_route = "mac"  # "facetime" | "phone" | "mac"; written only by _begin_call/_end_call, under audio_lock
+_route = "mac"  # "facetime" | "mac"; written only by _begin_call/_end_call, under audio_lock
 # True from an answered `call` until hang_up / a reported drop: while set, a call
 # that is no longer connected raises instead of routing to the Mac
 # (docs/DESIGN_FACETIME_CALL.md section 6). Per process: the session that placed the call.
@@ -106,7 +98,7 @@ def _call_ended_error(tool: str, detail: str) -> RuntimeError:
 
 
 def _begin_call(tool: str) -> str:
-    """A connected FaceTime call wins, then a connected phone, then the Mac
+    """A connected FaceTime call, otherwise the Mac
     (docs/DESIGN_FACETIME_CALL.md section 6). A banner in any other state, or
     an expected call that is gone, raises rather than routing to the Mac."""
     global _route
@@ -118,14 +110,12 @@ def _begin_call(tool: str) -> str:
         raise _call_ended_error(tool, f"call state is {state}")
     if state not in ("none", "locked"):
         raise RuntimeError(f"a FaceTime call banner is up but not connected (state {state}: {text!r}); not routing audio anywhere")
-    _route = "phone" if phone.connected() else "mac"
+    _route = "mac"
     return _route
 
 
-def _end_call(route: str) -> None:
+def _end_call() -> None:
     global _route
-    if route == "phone":
-        phone.set_state("idle")
     _route = "mac"
 
 
@@ -479,9 +469,6 @@ def _run_worker(*args: str, timeout: float) -> subprocess.CompletedProcess:
 
 
 def _play_pcm(audio: np.ndarray, samplerate: int) -> None:
-    if _route == "phone":
-        phone.play(audio, samplerate)
-        return
     with tempfile.NamedTemporaryFile(prefix="speak-play-", suffix=".pcm", delete=False) as f:
         path = f.name
     try:
@@ -507,11 +494,6 @@ def _play_pcm_stream(chunks: list[np.ndarray], samplerate: int, timeout: float) 
     other's pipe); communicate() feeds stdin and drains stdout/stderr
     concurrently on our behalf.
     """
-    if _route == "phone":
-        # One segment per TTS chunk (a sentence); the phone's `played` per
-        # segment bounds the wait, so `timeout` (the worker's budget) is unused.
-        phone.play_segments([chunk.reshape(-1) for chunk in chunks], samplerate)
-        return
     payload = b"".join(chunk.astype(np.float32).tobytes() for chunk in chunks)
     for attempt in (1, 2):
         proc = subprocess.Popen(
@@ -774,17 +756,7 @@ def _record_pcm_with_archive(
 def _record_for_route(
     max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
 ) -> tuple[np.ndarray, np.ndarray | None, int]:
-    """The listen() capture on whichever device this call was routed to.
-    Phone: the ear-open cue goes to the phone, VAD runs here on its 16 kHz
-    blocks; no native-rate archive exists, so the 16 kHz capture is the archive."""
-    if _route == "phone":
-        audio = phone.record(
-            max_seconds, silence_seconds, start_timeout_seconds,
-            cue=cue_pcm(880.0, 0.5, 0.5, 0.2),
-        )
-        if audio is PHONE_TIMEOUT:
-            raise TimeoutError(f"no speech detected within {start_timeout_seconds:.0f}s")
-        return audio, None, MIC_RATE
+    """The listen() capture on whichever devices this call was routed to."""
     # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep.
     # No voice-clone archive on the facetime route: call-codec audio is not reference material.
     return _record_pcm_with_archive(
@@ -904,8 +876,6 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
         _cue(330.0)
         raise
     _cue(440.0)  # ear closed
-    if _route == "phone":
-        phone.set_state("processing")
 
     t0 = time.time()
     text = mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER_MODEL, language=LANGUAGE)["text"].strip()
@@ -931,7 +901,7 @@ def _speak_sync(text: str) -> tuple[float, str]:
         return _guard_call(route, "speak", lambda: _speak_impl(text)), route
     finally:
         try:
-            _end_call(route)
+            _end_call()
         finally:
             audio_lock.release()
 
@@ -944,7 +914,7 @@ def _listen_sync(max_seconds: float, silence_seconds: float, start_timeout_secon
         return _guard_call(route, "listen", lambda: _listen_impl(max_seconds, silence_seconds, start_timeout_seconds)), route
     finally:
         try:
-            _end_call(route)
+            _end_call()
         finally:
             audio_lock.release()
 
@@ -962,7 +932,7 @@ def _converse_sync(text: str, max_seconds: float, silence_seconds: float, start_
         return _guard_call(route, "converse", round_trip), route
     finally:
         try:
-            _end_call(route)
+            _end_call()
         finally:
             audio_lock.release()
 
@@ -1139,15 +1109,14 @@ async def status() -> dict:
     process or in another one (e.g. a second Claude Code session's own
     speak_server.py).
 
-    Returns `{"busy": bool, "current_tool": str | None, "waiting": int, "audio": "facetime" | "phone" | "mac" | "error", "phone_daemon": bool, "call": str}`.
+    Returns `{"busy": bool, "current_tool": str | None, "waiting": int, "audio": "facetime" | "mac" | "error", "call": str}`.
     `audio` is the device the NEXT call will use: "facetime" while a FaceTime
-    call is connected, else "phone" while a phone is connected to the
-    `speak-phone` daemon, otherwise "mac"; "error" when the next call would
+    call is connected, otherwise "mac"; "error" when the next call would
     raise (call state unreadable, a half-set-up banner, or a dropped call).
-    `call` is "locked" while the screen is locked (no call is possible then). `call` is the FaceTime call state
-    ("none", "click_to_call", "ringing", "connected", "unknown"), or
-    "error: <reason>" if it could not be read.
-    `phone_daemon` is whether that daemon is reachable.
+    `call` is the FaceTime call state ("locked", "none", "loading",
+    "click_to_call", "ringing", "connected", "unknown"), or "error: <reason>"
+    if it could not be read. "locked" means the screen is locked, when no
+    call is possible.
     `current_tool` is the name of the tool currently holding the lock, or
     `"<tool> (pid <n>, other process)"` when a different process holds it,
     or null if idle. `waiting` counts only callers queued in THIS process
@@ -1163,10 +1132,10 @@ async def status() -> dict:
     if call_state == "connected":
         audio = "facetime"
     elif call_state in ("none", "locked") and not _call_expected:
-        audio = "phone" if phone.connected() else "mac"
+        audio = "mac"
     else:
         audio = "error"  # the next speak/listen/converse would raise (see _begin_call)
-    return {"busy": busy, "current_tool": current_tool, "waiting": waiting, "audio": audio, "phone_daemon": phone.daemon_reachable(), "call": call_state}
+    return {"busy": busy, "current_tool": current_tool, "waiting": waiting, "audio": audio, "call": call_state}
 
 
 def main() -> None:

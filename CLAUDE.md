@@ -15,6 +15,7 @@ Everything runs on this Mac. No audio or text leaves the machine.
 | `converse(text, ...)` | `speak` then `listen` under one lock. Returns the user's words. |
 | `call(override_quiet_hours=False)` | FaceTime Audio call from the Mac to the owner's iPhone; returns `answered`, `already connected`, `not answered (declined or no answer)` or `not called: quiet hours (...)`. While connected, `speak`/`listen`/`converse` run over the call. See "FaceTime calls". |
 | `hang_up()` | End that call (only when the owner asks). |
+| `status()` | `{busy, current_tool, waiting, audio: "facetime"\|"mac"\|"error", call}`: what holds the lock, where the next call's audio goes, and the FaceTime call state. Never blocks. Every `speak`/`listen`/`converse` result ends with `(audio: mac)` or `(audio: facetime)` on its own line. |
 
 `speak` and `listen` never overlap (a process-wide lock). Tool functions are
 async and run the audio work in a worker thread so the MCP event loop stays
@@ -32,8 +33,6 @@ responsive during a long `listen`.
   speak_audio_worker <play|play-stream|record> ...`) for every single audio
   operation and exits when that operation finishes. See "Audio process
   isolation" below for why.
-- `speak_phone_audio.py` — `PhoneAudioServer`: the phone as mic/speaker over WebSocket (see "Phone as mic/speaker"). Never imports `sounddevice`. Instantiated only by the daemon.
-- `speak_phone_daemon.py` — the `speak-phone` daemon (owns TCP 8772, run by launchd; `launchd/com.algolearn.speak-phone.plist`) and `PhoneClient`, which `speak_server` uses to talk to it over a Unix socket. `speak_server` never binds 8772.
 - `speak_facetime.py` — `FaceTime`: dial / answer detection / hang-up through the `ftcall` helper, plus the quiet-hours rule. Never touches audio devices.
 - `ftcall/main.swift` — the `ftcall` helper: reads and presses the FaceTime call banner (Notification Center) and reads FaceTime's Video-menu device choice via the Accessibility API. Build with `ftcall/build.sh` (the binary is git-ignored; the server refuses to start without it).
 - `pyproject.toml` — uv project, Python 3.12 (mlx-whisper pulls torch; Kokoro
@@ -50,8 +49,8 @@ owner's iPhone over FaceTime Audio (works anywhere, no app/relay/port).
   `BlackHole 16ch` (we record it). `call` checks FaceTime's Video menu and
   cancels with an error if they are wrong. Read the menu, not `defaults`.
 - **Routing:** at the start of each `speak`/`listen`/`converse`, a connected
-  FaceTime call wins (route `facetime`, result ends `(audio: facetime)`), then
-  a connected phone, then the Mac. A call that ends mid-operation raises
+  FaceTime call wins (route `facetime`, result ends `(audio: facetime)`),
+  otherwise the Mac. A call that ends mid-operation raises
   `FaceTime call ended during ...`; the rule of engagement is to call back.
   No voice-clone archiving on the facetime route.
 - **Unlocked only (verified):** a screen lock ends a call, and nothing can be
@@ -66,65 +65,6 @@ owner's iPhone over FaceTime Audio (works anywhere, no app/relay/port).
   (Terminal is granted). `ftcall` exits 2 without it.
 - Tests: `tests/test_speak_facetime.py` against `tests/fake_ftcall`
   (`SPEAK_FTCALL_BIN`, test-only); no test ever dials.
-
-## Phone as mic/speaker
-
-The iPhone app (design: `docs/DESIGN_PHONE_AUDIO.md`) can be the audio device.
-The phone link is its own always-on process, the **`speak-phone` daemon**
-(`speak_phone_daemon.py`, console script `speak-phone`), run by launchd. It
-hosts `speak_phone_audio.PhoneAudioServer` on **TCP 8772**, bound to `0.0.0.0`
-(override the port with `SPEAK_PHONE_PORT`, read once at daemon start), and
-holds the one phone connection. Plain `ws://` on the LAN; no TLS or auth (v1,
-WiFi only). Speak servers (one per Claude Code session, any number) never bind
-8772: each is a client of the daemon over a local **Unix socket**
-(`~/.algolearn-speak/phone.sock`, mode 0600; override with `SPEAK_PHONE_SOCKET`
-in both the daemon and the speak server's env). The speak server's `phone`
-object is a `PhoneClient` with the same methods as `PhoneAudioServer`
-(`connected`, `set_state`, `play`, `play_segments`, `record`); each call is one
-request/reply on the socket (length-prefixed JSON header + raw float32 PCM).
-
-- **Install the daemon:** `uv sync`, then
-  `cp launchd/com.algolearn.speak-phone.plist ~/Library/LaunchAgents/ &&
-  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.algolearn.speak-phone.plist`.
-  Logs: `~/Library/Logs/speak-phone.log`. Uninstall:
-  `launchctl bootout gui/$(id -u)/com.algolearn.speak-phone && rm
-  ~/Library/LaunchAgents/com.algolearn.speak-phone.plist`. The plist hardcodes
-  the `.venv/bin/speak-phone` path of this checkout. If 8772 is already held
-  the daemon exits with the bind error and launchd keeps retrying (see the log).
-- **Routing rule:** at the START of each `speak`/`listen`/`converse` call
-  (under the audio lock) the server asks the daemon whether a phone is
-  connected. If so the whole call -- TTS, ear-open/ear-closed cues, the chime
-  and "Processing" -- goes to the phone via the daemon, and `listen` records
-  from the phone mic; otherwise everything uses the Mac's devices through the
-  worker, unchanged. **Daemon not running = no phone connected = Mac.** A phone
-  that connects mid-call takes effect on the next call; one that disconnects
-  mid-call makes that call raise (`phone disconnected during listen/speak`),
-  never a silent switch to the Mac. A daemon that dies mid-call raises too.
-- `status()` returns `audio: "phone" | "mac"` (the device the next call will
-  use) and `phone_daemon: true | false` (whether the daemon answers on its
-  socket); every `speak`/`listen`/`converse` result ends with `(audio: phone)`
-  or `(audio: mac)` on its own line.
-- Only the I/O moves. Kokoro, Whisper and the lock stay in the speak server.
-  VAD runs in the **daemon**, on the phone's 16 kHz PCM16 blocks, with the same
-  parameters, pre-roll and timeout/cap logic as the worker's `cmd_record`
-  (Silero loaded once at daemon start; no PortAudio involved). The speak server
-  receives the finished 16 kHz capture over the socket and transcribes it.
-- Protocol: JSON text frames for control (`hello`/`ready`/`state`/`play_start`/
-  `play_end`/`played`/`mic_start`/`mic_stop`/`ping`/`pong`), binary frames for
-  PCM16 mono (phone->server 16 kHz, server->phone 24 kHz). One phone at a
-  time (a second is closed with reason `busy`); a `hello` with other rates is
-  closed `bad-rates`; two missed pongs (5 s ping) drop the connection; a
-  `played` later than segment duration + 10 s raises.
-- **Pointing the app at the Mac:** in the app's server-address field enter
-  the Mac's LAN IP (`192.168.86.188`; port 8772) and press Connect (the daemon must be running). Check with
-  the `status` tool: `audio` becomes `phone`. Disconnect and it returns to
-  `mac`. The Mac must allow incoming connections to the Python process
-  (macOS firewall prompt on first run).
-- Tests: `tests/test_speak_phone_audio.py` (real in-process websockets client,
-  stub VAD for the plumbing plus one real-Silero silence test).
-  `tests/test_speak_phone_daemon.py` (daemon + client over a temp Unix socket
-  and an ephemeral TCP port; two real speak-server processes against one
-  daemon; no daemon = both Mac). Run all: `.venv/bin/python -m unittest discover -s tests`.
 
 ## Audio process isolation
 
@@ -234,6 +174,7 @@ Check with `claude mcp list`. A new session, or `/mcp` then reconnect, picks it 
 ```
 uv sync                                   # install
 uv run algolearn-speak                    # run the server on stdio (for manual MCP testing)
+.venv/bin/python -m unittest discover -s tests   # run all tests
 ```
 
 Smoke test without MCP: import `speak_server`, call `engines.load()`, then

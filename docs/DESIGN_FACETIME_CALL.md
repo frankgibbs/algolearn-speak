@@ -3,8 +3,8 @@
 Written 2026-10-08. Status: built; end-to-end tested on a live call 2026-10-08.
 **Owner decision** marks something the owner decided (over voice, 2026-10-08).
 **Decision** marks something I decided, with the reason. **Verified** marks
-something observed on this Mac during the 2026-10-08 spike. Every claim
-about existing code carries file:line.
+something observed on this Mac during the 2026-10-08 spike. Claims about
+existing code name the function they were read from.
 
 ## 1. What this is
 
@@ -20,10 +20,9 @@ remote use. The owner asked for no LAN port and no third party such as
 Tailscale. Apple does not give third-party apps a server-carried audio
 channel, so the alternatives all needed a relay.
 
-**Owner decision:** the iPhone app and the `speak-phone` daemon will be
-retired. That removal is a separate change made after this one passes its
-end-to-end test. Until then the phone route keeps working unchanged
-(`speak_server.py:81-91`).
+**Owner decision:** the iPhone app and the `speak-phone` daemon are retired
+(removed 2026-10-08 after this design passed its end-to-end test; git
+history keeps them). FaceTime is the only remote path.
 
 ## 2. The Mac must be unlocked (Verified 2026-10-08)
 
@@ -116,7 +115,7 @@ another app needs that app granted too.
 call(override_quiet_hours: bool = False) -> str
 ```
 
-Runs under the audio lock (`speak_server.py:235-300`) as tool name `call`,
+Runs under the audio lock (`_SerializingLock` in `speak_server.py`) as tool name `call`,
 so no other session can speak or dial while it runs. Steps:
 
 1. `SPEAK_CALL_NUMBER` unset → raise.
@@ -165,7 +164,7 @@ hour), so a guess would add nothing.
 
 ## 6. Routing while a call is up
 
-`_begin_call` (`speak_server.py:81-84`) picks the route once per tool call,
+`_begin_call` in `speak_server.py` picks the route once per tool call,
 under the audio lock. The order becomes:
 
 1. `ftcall state` is `connected` → route `facetime`.
@@ -173,8 +172,7 @@ under the audio lock. The order becomes:
    `FaceTime call ended during <tool>`.
 3. A banner in any other state (`ringing`, `click_to_call`, `unknown`) →
    raise. Audio is never routed while a call is half set up.
-4. Phone connected → route `phone` (unchanged until retirement).
-5. Otherwise → route `mac`.
+4. Otherwise → route `mac`.
 
 **Keep-awake (Owner decision, section 2).** When `call` returns `answered`
 or `already connected`, the server starts `caffeinate -d -i -w <server pid>`,
@@ -188,7 +186,7 @@ awake and logs a warning; staying awake is the safe side.
 
 A `locked` state means no call, because locking ends a call (section 2). On
 the routing path it is treated like `none`: an expected call that reads
-`locked` raises "call ended", otherwise audio goes to the phone or the Mac.
+`locked` raises "call ended", otherwise audio goes to the Mac.
 
 **Owner decision (2026-10-08): the call is shared by every session.** The
 audio lock is cross-process, so `speak`, `listen`, `converse`, `call` and
@@ -218,9 +216,9 @@ that placed the call.
 
 On the `facetime` route every audio path uses the call devices instead of
 `SPEAK_OUTPUT_DEVICE` / `SPEAK_INPUT_DEVICE`: TTS playback
-(`speak_server.py:444`), tone cues and the "Processing" ack
-(`speak_server.py:418`), and the record worker's input plus its in-worker
-ear-open cue (`speak_server.py:715-719`). The Mac's own speakers and mic
+(`_play_pcm_stream`), tone cues and the "Processing" ack
+(`_play_pcm`), and the record worker's input plus its in-worker
+ear-open cue (`_record_for_route`). The Mac's own speakers and mic
 are untouched during a call.
 
 **Decision:** no voice-clone archiving on the `facetime` route, even when
@@ -283,11 +281,10 @@ owner hung up at the same moment), the result is still `hung up`.
 ## 9. `status`
 
 `status` gains `"call": "<ftcall state>"`, or `"error: <reason>"` when the
-state can't be read. `audio` can now be `"facetime"` as well as `"phone"` /
-`"mac"`. It reads `"error"` when the next voice call would raise: the call
+state can't be read. `audio` is `"facetime"` or `"mac"`. It reads `"error"` when the next voice call would raise: the call
 state is unreadable, a banner is half set up, or an expected call has
 dropped. Every tool result's trailing
-`(audio: ...)` note (`speak_server.py:94-95`) shows `facetime` on that
+`(audio: ...)` note (`_audio_note`) shows `facetime` on that
 route.
 
 ## 10. Configuration
