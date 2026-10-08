@@ -1,6 +1,6 @@
 # Design: the speak server calls the owner's iPhone over FaceTime Audio
 
-Written 2026-10-08. Status: built and under end-to-end test.
+Written 2026-10-08. Status: built; end-to-end tested on a live call 2026-10-08.
 **Owner decision** marks something the owner decided (over voice, 2026-10-08).
 **Decision** marks something I decided, with the reason. **Verified** marks
 something observed on this Mac during the 2026-10-08 spike. Every claim
@@ -189,6 +189,13 @@ awake and logs a warning; staying awake is the safe side.
 A `locked` state means no call, because locking ends a call (section 2). On
 the routing path it is treated like `none`: an expected call that reads
 `locked` raises "call ended", otherwise audio goes to the phone or the Mac.
+
+**Owner decision (2026-10-08): the call is shared by every session.** The
+audio lock is cross-process, so `speak`, `listen`, `converse`, `call` and
+`hang_up` from different Claude Code sessions take turns, and routing
+follows the one call. Any session that talks while the call is connected
+talks into it. A second session's `call` returns `already connected` and
+joins, with its own call-expected flag and keep-awake.
 
 **Decision: every voice call depends on reading the call state.** If
 `ftcall` cannot run (no Accessibility permission for the app that launched
