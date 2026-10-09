@@ -93,7 +93,7 @@ speak server (one per session)                 speak-telegram daemon (one per Ma
 | Request | Payload | Does |
 |---|---|---|
 | `ping` | none | liveness |
-| `state` | none | returns `none`, `ringing`, `connected` or `ended` |
+| `state` | none | returns the state (`none`, `ringing` or `connected`), the call's generation number, and how the last call ended (`remote`, `hung_up`, `failed` or `not_answered`) |
 | `call` | the opening greeting, 24 kHz float32 | dials, plays the greeting file, switches to raw frames; replies `answered`, `not answered` or `busy` |
 | `play` | PCM at a given rate | resamples to 48 kHz stereo, queues it on the pump, replies once it has gone out |
 | `record` | an ear-open cue, plus VAD parameters | plays the cue, then runs Silero on incoming audio with the speak server's rules; replies with the 16 kHz capture, or `timeout` |
@@ -126,9 +126,23 @@ All steps are the spike's working sequence:
    then start the 10 ms pump. The pump sends one 1920-byte frame every 10 ms
    for the whole call: queued audio when there is some, silence otherwise. If
    it falls more than 50 ms behind, it resets its clock instead of bursting.
-5. A `ChatUpdate` of `DISCARDED_CALL` (or `LEFT_CALL` / `BUSY_CALL`) marks
-   the call `ended`. Any `play` or `record` in flight then fails with "call
-   ended".
+5. A `ChatUpdate` of `DISCARDED_CALL` (or `LEFT_CALL` / `BUSY_CALL`) ends
+   the call with reason `remote`. Any `play` or `record` in flight then fails
+   with "call ended". An end update that arrives while no call is in
+   progress is ignored, so it can't end the next call.
+
+**Decision (from the independent code review): every failure tears the call
+down.** If the 10 ms pump stops on its own (for example, ntgcalls reports
+`NotInCallError` after a network loss and no end update arrives), or any step
+after the answer fails, the daemon leaves the call and ends it with reason
+`failed`. A call is never left "connected" with no pump. A timed-out request
+is cancelled rather than left running, so a late answer can't produce a call
+nobody expects, and queued audio never plays after a timeout error. Hanging
+up while it rings cancels the ring first, because the ringing `play()` holds
+py-tgcalls' per-chat lock.
+
+**Decision: a hang-up during the greeting counts as `not answered`,** so the
+session waits an hour instead of calling straight back.
 
 **Decision: `call` takes the opening sentence.** The model passes what it is
 calling about, for example "Hi Frank, the backtest finished. Got a minute?".
@@ -171,6 +185,16 @@ These carry over from FaceTime call mode unchanged, all **Owner decisions**
   of engagement):** the session calls back.
 - **Owner decision:** the call is shared by every session. They take turns
   through the cross-process audio lock.
+- **Decision (from the review):** any session that talks on the call
+  watches it from then on, not only the one that placed it. A later drop
+  raises in each such session instead of sending its next sentence to the
+  Mac's speakers. A call ended by `hang_up`, from any session at the owner's
+  request, is not a drop: no session calls back. Sessions tell the two apart
+  by the daemon's generation number and end reason.
+- **Decision (from the review):** if the owner hangs up right after
+  speaking, the cue played after the capture fails, and their words are
+  still transcribed. The tool then raises "call ended" with those words in
+  the message.
 - No voice-clone archiving on the call route: it is codec audio.
 
 ## 7. When to call
@@ -205,7 +229,12 @@ broken for private calls):
 
 A console script `speak-telegram` and a launchd plist
 `launchd/com.algolearn.speak-telegram.plist` are added, modeled on the
-removed `speak-phone` ones. `ffmpeg` (Homebrew) is required for the greeting
+removed `speak-phone` ones. The plist adds three settings:
+- `PATH` including `/opt/homebrew/bin`, for ffmpeg and ffprobe
+- `ProcessType` `Interactive`, so the 10 ms pump isn't scheduled like a
+  background job
+- `ExitTimeOut` 30, so a hang-up and disconnect finish before launchd sends
+  SIGKILL `ffmpeg` (Homebrew) is required for the greeting
 file: py-tgcalls' `MediaStream` plays a file through an `ffmpeg` shell
 command (read in `pytgcalls/types/stream/media_stream.py`).
 
@@ -223,8 +252,8 @@ command (read in `pytgcalls/types/stream/media_stream.py`).
 
 The FaceTime path:
 - `ftcall/` (Swift helper and build script)
-- `speak_facetime.py`, `tests/test_speak_facetime.py`, `tests/fake_ftcall`,
-  `tests/fake_caffeinate`
+- `speak_facetime.py`, `tests/test_speak_facetime.py`, `tests/fake_ftcall`
+  (`tests/fake_caffeinate` stays: the Telegram tests use it)
 - `docs/DESIGN_FACETIME_CALL.md`
 - the `SPEAK_CALL_NUMBER`, `SPEAK_CALL_OUTPUT_DEVICE` and
   `SPEAK_CALL_INPUT_DEVICE` settings, and the BlackHole routing in

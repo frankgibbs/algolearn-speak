@@ -6,9 +6,9 @@ MCP server (stdio) exposing six tools:
   listen(...)     -> record from the default input until you stop talking (Silero VAD),
                      transcribe with Whisper (MLX), return the text
   converse(text)  -> speak, then listen
-  call()          -> FaceTime Audio call to the owner's iPhone; while it is up,
+  call(greeting)  -> Telegram voice call to the owner; while it is up,
                      speak/listen/converse run over the call
-                     (docs/DESIGN_FACETIME_CALL.md)
+                     (docs/DESIGN_TELEGRAM_CALL.md)
   hang_up()       -> end that call
   status()        -> report whether speak/listen/converse are busy and how many
                      calls are queued behind the current one
@@ -44,7 +44,8 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 import speak_audio_worker
-import speak_facetime
+import speak_telegram as tg
+from speak_telegram_daemon import NOT_RUNNING, TelegramClient
 from speak_tone import cue_pcm, tone
 
 log = logging.getLogger("speak")
@@ -63,11 +64,8 @@ INPUT_DEVICE = os.environ.get("SPEAK_INPUT_DEVICE", "")   # substring match, res
 OUTPUT_DEVICE = os.environ.get("SPEAK_OUTPUT_DEVICE", "")  # substring match, resolved in the worker
 SAVE_DIR = os.environ.get("SPEAK_SAVE_DIR", "")            # if set, every successful capture is archived here
 
-# FaceTime calls (docs/DESIGN_FACETIME_CALL.md section 10). Validated in main().
-CALL_NUMBER = os.environ.get("SPEAK_CALL_NUMBER", "")                       # E.164; `call` raises if unset
-CALL_OUTPUT_DEVICE = os.environ.get("SPEAK_CALL_OUTPUT_DEVICE", "BlackHole 2ch")  # we play into it; FaceTime's Microphone
-CALL_INPUT_DEVICE = os.environ.get("SPEAK_CALL_INPUT_DEVICE", "BlackHole 16ch")   # we record it; FaceTime's Output
-QUIET_HOURS = os.environ.get("SPEAK_QUIET_HOURS", "22:00-07:00")             # no-call window, local time
+# Telegram calls (docs/DESIGN_TELEGRAM_CALL.md section 7). Validated in main().
+QUIET_HOURS = os.environ.get("SPEAK_QUIET_HOURS", "22:00-07:00")  # no-call window, local time
 
 MIC_RATE = 16_000          # Whisper and Silero both want 16 kHz mono
 VAD_FRAME = 512            # Silero frame size at 16 kHz (32 ms)
@@ -77,39 +75,46 @@ SENTENCE_SPLIT = r"(?<=[.!?])\s+"
 # ---------------------------------------------------------------- audio route
 #
 # The route is chosen ONCE at the start of each tool call (`_begin_call`, under
-# the audio lock) and holds for the whole call: "facetime" while a FaceTime
-# call is connected (docs/DESIGN_FACETIME_CALL.md), otherwise "mac".
+# the audio lock) and holds for the whole call: "telegram" while the
+# speak-telegram daemon reports a connected call (docs/DESIGN_TELEGRAM_CALL.md
+# section 6), otherwise "mac". `telegram` is a client of that daemon; this
+# process never touches Telegram itself. Daemon not running = no call = Mac,
+# unless a call is expected.
 
-facetime = speak_facetime.FaceTime()
-keep_awake = speak_facetime.KeepAwake(facetime)
-_route = "mac"  # "facetime" | "mac"; written only by _begin_call/_end_call, under audio_lock
+telegram = TelegramClient()
+_route = "mac"  # "telegram" | "mac"; written only by _begin_call/_end_call, under audio_lock
 # True from an answered `call` until hang_up / a reported drop: while set, a call
-# that is no longer connected raises instead of routing to the Mac
-# (docs/DESIGN_FACETIME_CALL.md section 6). Per process: the session that placed the call.
+# that is no longer connected raises instead of routing to the Mac. Per process:
+# the session that placed (or joined) the call.
 _call_expected = False
+_call_generation: int | None = None   # the daemon's generation of the call this session expects
 
 
 def _call_ended_error(tool: str, detail: str) -> RuntimeError:
     """Clears the expectation: the drop is reported once, then the session calls back."""
     global _call_expected
     _call_expected = False
-    keep_awake.stop()
-    return RuntimeError(f"FaceTime call ended during {tool}; call back with the call tool ({detail})")
+    return RuntimeError(f"Telegram call ended during {tool}; call back with the call tool ({detail})")
 
 
 def _begin_call(tool: str) -> str:
-    """A connected FaceTime call, otherwise the Mac
-    (docs/DESIGN_FACETIME_CALL.md section 6). A banner in any other state, or
-    an expected call that is gone, raises rather than routing to the Mac."""
-    global _route
-    state, text = facetime.settled_state()
-    if state == "connected":
-        _route = "facetime"
+    """A connected call, otherwise the Mac. Any session that talks on the call
+    expects it from then on (the call is shared), so a later drop raises in
+    every such session instead of moving to the Mac's speakers. A call ended
+    by hang_up -- from any session, on the owner's request -- is not a drop."""
+    global _route, _call_expected, _call_generation
+    info = telegram.info()
+    state = info["state"]
+    if state == tg.CONNECTED:
+        _call_expected, _call_generation = True, info["generation"]
+        _route = "telegram"
         return _route
+    if _call_expected and info["end_reason"] == tg.END_HUNG_UP and info["generation"] == _call_generation:
+        _call_expected = False   # hung up on request: the Mac is the device again, no call-back
     if _call_expected:
         raise _call_ended_error(tool, f"call state is {state}")
-    if state not in ("none", "locked"):
-        raise RuntimeError(f"a FaceTime call banner is up but not connected (state {state}: {text!r}); not routing audio anywhere")
+    if state not in (tg.NONE, NOT_RUNNING):
+        raise RuntimeError(f"a Telegram call is {state} but not connected; not routing audio anywhere")
     _route = "mac"
     return _route
 
@@ -123,40 +128,57 @@ def _audio_note(route: str) -> str:
     return f"\n(audio: {route})"
 
 
-def _output_device() -> str:
-    return CALL_OUTPUT_DEVICE if _route == "facetime" else OUTPUT_DEVICE
-
-
-def _input_device() -> str:
-    return CALL_INPUT_DEVICE if _route == "facetime" else INPUT_DEVICE
-
-
 def _guard_call(route: str, tool: str, fn):
-    """On the facetime route, a call that is no longer connected when `fn`
+    """On the telegram route, a call that is no longer connected when `fn`
     finishes (or fails) makes the tool raise -- never a switch to the Mac's
-    devices (docs/DESIGN_FACETIME_CALL.md section 6). A transcript captured
-    before the drop is included in the message; a failure to read the call
-    state is reported together with the original error, never instead of it."""
-    if route != "facetime":
+    devices. A transcript captured before the drop is included in the message;
+    a failure to read the call state is reported together with the original
+    error, never instead of it."""
+    if route != "telegram":
         return fn()
     try:
         result = fn()
     except Exception as e:
         try:
-            state = facetime.settled_state()[0]
+            state = telegram.state()
         except Exception as check:
-            raise RuntimeError(f"{tool} failed ({e}) and the FaceTime call state could not be read ({check})") from e
-        if state != "connected":
+            raise RuntimeError(f"{tool} failed ({e}) and the Telegram call state could not be read ({check})") from e
+        if state != tg.CONNECTED:
             raise _call_ended_error(tool, str(e)) from e
         raise
     partial = f"transcript before the drop: {result!r}" if isinstance(result, str) else "no transcript"
     try:
-        state = facetime.settled_state()[0]
+        state = telegram.state()
     except Exception as check:
-        raise RuntimeError(f"{tool} finished ({partial}) but the FaceTime call state could not be read ({check})") from check
-    if state != "connected":
+        raise RuntimeError(f"{tool} finished ({partial}) but the Telegram call state could not be read ({check})") from check
+    if state != tg.CONNECTED:
         raise _call_ended_error(tool, f"call state is {state}; {partial}")
     return result
+
+
+_QUIET_RE = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})$")
+
+
+def _parse_quiet_hours(window: str) -> tuple[int, int]:
+    """`HH:MM-HH:MM` -> (start, end) in minutes after midnight. May wrap midnight."""
+    m = _QUIET_RE.match(window)
+    if not m:
+        raise RuntimeError(f"SPEAK_QUIET_HOURS={window!r} is not HH:MM-HH:MM")
+    sh, sm, eh, em = (int(g) for g in m.groups())
+    if sh > 23 or eh > 23 or sm > 59 or em > 59:
+        raise RuntimeError(f"SPEAK_QUIET_HOURS={window!r} has an out-of-range time")
+    start, end = sh * 60 + sm, eh * 60 + em
+    if start == end:
+        raise RuntimeError(f"SPEAK_QUIET_HOURS={window!r} is an empty window")
+    return start, end
+
+
+def _in_quiet_hours(window: tuple[int, int], now: datetime.time) -> bool:
+    start, end = window
+    t = now.hour * 60 + now.minute
+    if start < end:
+        return start <= t < end
+    return t >= start or t < end  # wraps midnight
 
 
 # ---------------------------------------------------------------- engines
@@ -469,6 +491,9 @@ def _run_worker(*args: str, timeout: float) -> subprocess.CompletedProcess:
 
 
 def _play_pcm(audio: np.ndarray, samplerate: int) -> None:
+    if _route == "telegram":
+        telegram.play(audio, samplerate)
+        return
     with tempfile.NamedTemporaryFile(prefix="speak-play-", suffix=".pcm", delete=False) as f:
         path = f.name
     try:
@@ -476,7 +501,7 @@ def _play_pcm(audio: np.ndarray, samplerate: int) -> None:
         # generous fixed budget: playback itself has no fixed duration bound
         # here since callers pass short cues and full TTS chunks alike.
         duration = len(audio) / samplerate
-        _run_worker("play", path, str(samplerate), _output_device(), timeout=duration + 30.0)
+        _run_worker("play", path, str(samplerate), OUTPUT_DEVICE, timeout=duration + 30.0)
     finally:
         os.unlink(path)
 
@@ -494,10 +519,15 @@ def _play_pcm_stream(chunks: list[np.ndarray], samplerate: int, timeout: float) 
     other's pipe); communicate() feeds stdin and drains stdout/stderr
     concurrently on our behalf.
     """
+    if _route == "telegram":
+        # The daemon's pump paces it; play returns once every frame has gone out.
+        if chunks:
+            telegram.play(np.concatenate([chunk.reshape(-1) for chunk in chunks]), samplerate)
+        return
     payload = b"".join(chunk.astype(np.float32).tobytes() for chunk in chunks)
     for attempt in (1, 2):
         proc = subprocess.Popen(
-            _worker_command("play-stream", str(samplerate), _output_device()),
+            _worker_command("play-stream", str(samplerate), OUTPUT_DEVICE),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -756,14 +786,20 @@ def _record_pcm_with_archive(
 def _record_for_route(
     max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
 ) -> tuple[np.ndarray, np.ndarray | None, int]:
-    """The listen() capture on whichever devices this call was routed to."""
-    # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep.
-    # No voice-clone archive on the facetime route: call-codec audio is not reference material.
+    """The listen() capture on whichever device this call was routed to.
+    Telegram: the daemon plays the ear-open cue into the call and runs VAD on
+    the owner's audio; no archive (call-codec audio is not reference material)."""
+    if _route == "telegram":
+        audio = telegram.record(max_seconds, silence_seconds, start_timeout_seconds,
+                                cue_pcm(880.0, 0.5, 0.5, 0.2), TTS_RATE)
+        if audio is tg.TIMEOUT:
+            raise TimeoutError(f"no speech detected within {start_timeout_seconds:.0f}s")
+        return audio, None, MIC_RATE
+    # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep
     return _record_pcm_with_archive(
         MIC_RATE, VAD_FRAME, max_seconds, silence_seconds, start_timeout_seconds,
         cue_freq_hz=880.0, cue_seconds=0.5, cue_volume=0.5, cue_lead_silence=0.2,
-        device_name=_input_device(), want_archive=bool(SAVE_DIR) and _route != "facetime",
-        output_device_name=_output_device(),
+        device_name=INPUT_DEVICE, want_archive=bool(SAVE_DIR), output_device_name=OUTPUT_DEVICE,
     )
 
 
@@ -875,14 +911,14 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
     except TimeoutError:
         _cue(330.0)
         raise
-    _cue(440.0)  # ear closed
+    _after_capture(lambda: _cue(440.0))  # ear closed
 
     t0 = time.time()
     text = mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER_MODEL, language=LANGUAGE)["text"].strip()
     log.info("listen: %.1fs of audio transcribed in %.1fs: %r", len(audio) / MIC_RATE, time.time() - t0, text)
     if not text:
         raise RuntimeError(f"speech was detected ({len(audio) / MIC_RATE:.1f}s) but Whisper returned no text")
-    if SAVE_DIR and _route != "facetime":
+    if SAVE_DIR and _route != "telegram":
         # Prefer the native-rate archive (better clone reference material)
         # when one was actually captured; otherwise the 16kHz stream already
         # in hand is the only copy that exists.
@@ -890,8 +926,23 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
             _save_capture(archive_audio, archive_rate, text)
         else:
             _save_capture(audio, MIC_RATE, text)
-    _ack()
+    _after_capture(_ack)
     return text
+
+
+def _after_capture(play) -> None:
+    """Cues played after the owner's words are captured. On the telegram route a
+    call that has just ended (the owner said their piece and hung up) makes them
+    fail; the words must still be transcribed and returned, so that failure is
+    skipped here and _guard_call then raises "call ended" WITH the transcript.
+    Any failure while the call is still connected raises as usual."""
+    try:
+        play()
+    except RuntimeError:
+        if _route == "telegram" and telegram.state() != tg.CONNECTED:
+            log.info("call ended right after the capture; keeping the words for the drop report")
+            return
+        raise
 
 def _speak_sync(text: str) -> tuple[float, str]:
     audio_lock.acquire("speak")
@@ -937,21 +988,34 @@ def _converse_sync(text: str, max_seconds: float, silence_seconds: float, start_
             audio_lock.release()
 
 
-def _call_sync(override_quiet_hours: bool) -> str:
-    global _call_expected
-    if not CALL_NUMBER:
-        raise RuntimeError("SPEAK_CALL_NUMBER is not set; add it to the speak server's env block in ~/.claude.json")
+def _synthesize(text: str) -> np.ndarray:
+    """Kokoro audio for `text` at TTS_RATE, all at once (the call's opening greeting)."""
+    engines.wait()
+    text = _plain(text)
+    if not text:
+        raise ValueError("call() needs a non-empty greeting")
+    return np.concatenate([np.asarray(r.audio, dtype=np.float32).reshape(-1)
+                           for r in engines.kokoro.generate(text=text, voice=VOICE, speed=SPEED, lang_code="a",
+                                                            split_pattern=SENTENCE_SPLIT)])
+
+
+def _call_sync(greeting: str, override_quiet_hours: bool) -> str:
+    global _call_expected, _call_generation
     audio_lock.acquire("call")
     try:
         # Checked under the lock: a call queued behind a long converse is judged when it would dial.
-        if not override_quiet_hours and speak_facetime.in_quiet_hours(
-            speak_facetime.parse_quiet_hours(QUIET_HOURS), datetime.datetime.now().time()
-        ):
+        if not override_quiet_hours and _in_quiet_hours(_parse_quiet_hours(QUIET_HOURS), datetime.datetime.now().time()):
             return f"not called: quiet hours ({QUIET_HOURS})"
-        outcome = facetime.place_call(CALL_NUMBER, CALL_OUTPUT_DEVICE, CALL_INPUT_DEVICE)
-        _call_expected = outcome in (speak_facetime.ANSWERED, speak_facetime.ALREADY_CONNECTED)
+        info = telegram.info()
+        if info["state"] == NOT_RUNNING:
+            raise RuntimeError("the speak-telegram daemon is not running (see CLAUDE.md, \"Telegram calls\")")
+        if info["state"] == tg.CONNECTED:
+            _call_expected, _call_generation = True, info["generation"]
+            return tg.ALREADY_CONNECTED
+        outcome = telegram.call(_synthesize(greeting), TTS_RATE)
+        _call_expected = outcome in (tg.ANSWERED, tg.ALREADY_CONNECTED)
         if _call_expected:
-            keep_awake.start()  # a lock or sleep would end the call; released when the call is gone
+            _call_generation = telegram.info()["generation"]
         return outcome
     finally:
         audio_lock.release()
@@ -961,20 +1025,17 @@ def _hang_up_sync() -> str:
     global _call_expected
     audio_lock.acquire("hang_up")
     try:
-        outcome = facetime.hang_up()
-        _call_expected = False
-        keep_awake.stop()
-        return outcome
+        if telegram.state() == NOT_RUNNING:
+            return tg.NO_ACTIVE_CALL
+        return telegram.hang_up()
     finally:
+        _call_expected = False   # the owner asked to hang up: never a call-back, even if this raised
         audio_lock.release()
 
 
 def _check_call_config() -> None:
-    """Fail at startup, not on the first call (docs/DESIGN_FACETIME_CALL.md section 10)."""
-    facetime.check_binary()
-    speak_facetime.parse_quiet_hours(QUIET_HOURS)
-    if CALL_NUMBER:
-        speak_facetime.validate_number(CALL_NUMBER)
+    """Fail at startup, not on the first call."""
+    _parse_quiet_hours(QUIET_HOURS)
 
 # ---------------------------------------------------------------- MCP surface
 
@@ -1011,9 +1072,9 @@ async def speak(text: str) -> str:
     proceeds; it is never rejected. Use `status()` to see what is currently
     running (including in another process) and how many calls are waiting.
 
-    FaceTime: while a call placed by `call()` is connected, this runs over
+    Telegram: while a call placed by `call()` is connected, this runs over
     the call instead of the Mac's speaker and mic (the result ends with
-    `(audio: facetime)`). If the call ends mid-way this raises "FaceTime call
+    `(audio: telegram)`). If the call ends mid-way this raises "Telegram call
     ended during ..."; the rule of engagement is to call back with `call()`.
     """
     seconds, route = await _run(_speak_sync, text)
@@ -1037,9 +1098,9 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 2.0, start
     proceeds; it is never rejected. Use `status()` to see what is currently
     running (including in another process) and how many calls are waiting.
 
-    FaceTime: while a call placed by `call()` is connected, this runs over
+    Telegram: while a call placed by `call()` is connected, this runs over
     the call instead of the Mac's speaker and mic (the result ends with
-    `(audio: facetime)`). If the call ends mid-way this raises "FaceTime call
+    `(audio: telegram)`). If the call ends mid-way this raises "Telegram call
     ended during ..."; the rule of engagement is to call back with `call()`.
     """
     text, route = await _run(_listen_sync, max_seconds, silence_seconds, start_timeout_seconds)
@@ -1058,9 +1119,9 @@ async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float
     proceeds; it is never rejected. Use `status()` to see what is currently
     running (including in another process) and how many calls are waiting.
 
-    FaceTime: while a call placed by `call()` is connected, this runs over
+    Telegram: while a call placed by `call()` is connected, this runs over
     the call instead of the Mac's speaker and mic (the result ends with
-    `(audio: facetime)`). If the call ends mid-way this raises "FaceTime call
+    `(audio: telegram)`). If the call ends mid-way this raises "Telegram call
     ended during ..."; the rule of engagement is to call back with `call()`.
     """
     reply, route = await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)
@@ -1068,35 +1129,35 @@ async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float
 
 
 @mcp.tool()
-async def call(override_quiet_hours: bool = False) -> str:
-    """Place a FaceTime Audio call from the Mac to the owner's iPhone and wait for the answer.
+async def call(greeting: str, override_quiet_hours: bool = False) -> str:
+    """Phone the owner on Telegram (from the algolearn.ai account) and wait for the answer.
 
-    Once answered, speak/listen/converse run over the call until it ends, so the
-    owner can talk wherever they are. Returns one of:
-      "answered"                              -- the owner picked up; start talking (converse)
-      "already connected"                     -- a call is already up; just talk
+    `greeting` is your opening line, spoken the moment they pick up, so say why
+    you are calling: "Hi Frank, the backtest finished. Got a minute?". Works
+    wherever their phone has signal, with the Mac locked or unlocked. Once
+    answered, speak/listen/converse run over the call until it ends. Returns one of:
+      "answered"                              -- they picked up and heard the greeting;
+                                                 continue with listen or converse
+      "already connected"                     -- a call is already up (greeting not
+                                                 spoken); just talk
       "not answered (declined or no answer)"  -- what you have can wait; do not
                                                  call again for at least one hour
       "not called: quiet hours (22:00-07:00)" -- nothing was dialed; no calls in
                                                  that window
-      "not called: the Mac is locked ..."     -- nothing was dialed; FaceTime can
-                                                 only call while the Mac is unlocked
-    While a call is up the Mac is kept awake and unlocked (a lock ends the
-    call); that stops by itself when the call ends.
     Quiet hours are a hard rule. Pass `override_quiet_hours=True` ONLY when the
     owner has said in this conversation that they are up and want calls.
 
-    Rule of engagement: if speak/listen/converse raises "FaceTime call ended
+    Rule of engagement: if speak/listen/converse raises "Telegram call ended
     during ...", the call dropped mid-conversation -- call back with this tool.
     Hang up with `hang_up()` only when the owner asks; they can also hang up
     themselves.
     """
-    return await _run(_call_sync, override_quiet_hours)
+    return await _run(_call_sync, greeting, override_quiet_hours)
 
 
 @mcp.tool()
 async def hang_up() -> str:
-    """End the FaceTime call placed by `call()`. Use only when the owner asks you to.
+    """End the Telegram call placed by `call()`. Use only when the owner asks you to.
 
     Returns "hung up" or "no active call".
     """
@@ -1109,14 +1170,12 @@ async def status() -> dict:
     process or in another one (e.g. a second Claude Code session's own
     speak_server.py).
 
-    Returns `{"busy": bool, "current_tool": str | None, "waiting": int, "audio": "facetime" | "mac" | "error", "call": str}`.
-    `audio` is the device the NEXT call will use: "facetime" while a FaceTime
+    Returns `{"busy": bool, "current_tool": str | None, "waiting": int, "audio": "telegram" | "mac" | "error", "call": str}`.
+    `audio` is the device the NEXT call will use: "telegram" while a Telegram
     call is connected, otherwise "mac"; "error" when the next call would
-    raise (call state unreadable, a half-set-up banner, or a dropped call).
-    `call` is the FaceTime call state ("locked", "none", "loading",
-    "click_to_call", "ringing", "connected", "unknown"), or "error: <reason>"
-    if it could not be read. "locked" means the screen is locked, when no
-    call is possible.
+    raise (call state unreadable, a call still ringing, or a dropped call).
+    `call` is the daemon's call state ("none", "ringing", "connected"),
+    "daemon not running", or "error: <reason>" if it could not be read.
     `current_tool` is the name of the tool currently holding the lock, or
     `"<tool> (pid <n>, other process)"` when a different process holds it,
     or null if idle. `waiting` counts only callers queued in THIS process
@@ -1126,12 +1185,12 @@ async def status() -> dict:
     """
     busy, current_tool, waiting = audio_lock.snapshot()
     try:
-        call_state = facetime.state()
+        call_state = telegram.state()
     except Exception as e:  # reported in the result, never hidden: status must not raise
         call_state = f"error: {e}"
-    if call_state == "connected":
-        audio = "facetime"
-    elif call_state in ("none", "locked") and not _call_expected:
+    if call_state == tg.CONNECTED:
+        audio = "telegram"
+    elif call_state in (tg.NONE, NOT_RUNNING) and not _call_expected:
         audio = "mac"
     else:
         audio = "error"  # the next speak/listen/converse would raise (see _begin_call)

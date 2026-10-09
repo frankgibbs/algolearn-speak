@@ -13,9 +13,9 @@ Everything runs on this Mac. No audio or text leaves the machine.
 | `speak(text)` | Kokoro-82M on MLX synthesises `text`, streamed sentence by sentence to the default output device. Returns spoken duration. |
 | `listen(max_seconds=120, silence_seconds=1.2, start_timeout_seconds=45)` | High beep, then records the default input until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech). Low beep, then Whisper large-v3-turbo on MLX transcribes. Once text is in hand, a rising two-note chime and the spoken word "Processing" tell the user their words were captured. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. |
 | `converse(text, ...)` | `speak` then `listen` under one lock. Returns the user's words. |
-| `call(override_quiet_hours=False)` | FaceTime Audio call from the Mac to the owner's iPhone; returns `answered`, `already connected`, `not answered (declined or no answer)` or `not called: quiet hours (...)`. While connected, `speak`/`listen`/`converse` run over the call. See "FaceTime calls". |
+| `call(greeting, override_quiet_hours=False)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is spoken the moment they answer. Returns `answered`, `already connected`, `not answered (declined or no answer)` or `not called: quiet hours (...)`. While connected, `speak`/`listen`/`converse` run over the call. Works with the Mac locked. See "Telegram calls". |
 | `hang_up()` | End that call (only when the owner asks). |
-| `status()` | `{busy, current_tool, waiting, audio: "facetime"\|"mac"\|"error", call}`: what holds the lock, where the next call's audio goes, and the FaceTime call state. Never blocks. Every `speak`/`listen`/`converse` result ends with `(audio: mac)` or `(audio: facetime)` on its own line. |
+| `status()` | `{busy, current_tool, waiting, audio: "telegram"\|"mac"\|"error", call}`: what holds the lock, where the next call's audio goes, and the daemon's call state (`none`/`ringing`/`connected`/`daemon not running`). Never blocks. Every `speak`/`listen`/`converse` result ends with `(audio: mac)` or `(audio: telegram)` on its own line. |
 
 `speak` and `listen` never overlap (a process-wide lock). Tool functions are
 async and run the audio work in a worker thread so the MCP event loop stays
@@ -33,38 +33,53 @@ responsive during a long `listen`.
   speak_audio_worker <play|play-stream|record> ...`) for every single audio
   operation and exits when that operation finishes. See "Audio process
   isolation" below for why.
-- `speak_facetime.py` — `FaceTime`: dial / answer detection / hang-up through the `ftcall` helper, plus the quiet-hours rule. Never touches audio devices.
-- `ftcall/main.swift` — the `ftcall` helper: reads and presses the FaceTime call banner (Notification Center) and reads FaceTime's Video-menu device choice via the Accessibility API. Build with `ftcall/build.sh` (the binary is git-ignored; the server refuses to start without it).
+- `speak_telegram.py` — `TelegramLink`: the Telegram call itself (Telethon + py-tgcalls + ntgcalls): dial, opener file, 10 ms raw-frame pump, Silero VAD on the owner's audio, `caffeinate` during a call. Instantiated only by the daemon.
+- `speak_telegram_daemon.py` — the `speak-telegram` daemon (one per Mac, launchd: `launchd/com.algolearn.speak-telegram.plist`; holds the Telegram login and the call) and `TelegramClient`, which `speak_server` uses over a Unix socket. `speak_server` never imports Telethon.
 - `pyproject.toml` — uv project, Python 3.12 (mlx-whisper pulls torch; Kokoro
   needs `misaki[en]`; Silero adds only torchaudio on top of that).
 
-## FaceTime calls
+## Telegram calls
 
-Design and verified facts: `docs/DESIGN_FACETIME_CALL.md`. The Mac calls the
-owner's iPhone over FaceTime Audio (works anywhere, no app/relay/port).
+Design and verified facts: `docs/DESIGN_TELEGRAM_CALL.md`. `call` phones the
+owner on Telegram from their second account (algolearn.ai); works wherever the
+phone has signal, with the Mac locked or unlocked, outbound-only networking.
 
-- **Caller:** FaceTime on the Mac is signed into the developer Apple ID; the
-  same Apple ID as the phone only offers Handoff and never rings.
-- **Audio:** FaceTime Microphone = `BlackHole 2ch` (we play into it), Output =
-  `BlackHole 16ch` (we record it). `call` checks FaceTime's Video menu and
-  cancels with an error if they are wrong. Read the menu, not `defaults`.
-- **Routing:** at the start of each `speak`/`listen`/`converse`, a connected
-  FaceTime call wins (route `facetime`, result ends `(audio: facetime)`),
-  otherwise the Mac. A call that ends mid-operation raises
-  `FaceTime call ended during ...`; the rule of engagement is to call back.
-  No voice-clone archiving on the facetime route.
-- **Unlocked only (verified):** a screen lock ends a call, and nothing can be
-  dialed while locked. `call` returns `not called: the Mac is locked ...`.
-  While a call is up the server holds `caffeinate -d -i -w <pid>` and pulses
-  user activity every 60 s (the screensaver also locks), released when the
-  call ends. `ftcall state` reports `locked` without touching Accessibility.
+- **One daemon:** `speak-telegram` (launchd) owns the Telegram login (one
+  connection per login) and the call; it holds `~/.algolearn-speak/telegram.sock.lock`
+  so a second daemon refuses to start. Speak servers are clients over
+  `~/.algolearn-speak/telegram.sock` (0600). **Daemon not running = no call =
+  Mac**, unless a call is expected (then it raises). `call` raises if the daemon
+  is down.
+- **Credentials:** `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION`
+  (a Telethon StringSession: a login, treat as a password), `TELEGRAM_CALL_TARGET`
+  in the repo's git-ignored `.env`. Only the daemon reads them.
+- **Install:** `uv sync`, then `cp launchd/com.algolearn.speak-telegram.plist
+  ~/Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u)
+  ~/Library/LaunchAgents/com.algolearn.speak-telegram.plist`. Logs:
+  `~/Library/Logs/speak-telegram.log`. Uninstall: `launchctl bootout
+  gui/$(id -u)/com.algolearn.speak-telegram && rm
+  ~/Library/LaunchAgents/com.algolearn.speak-telegram.plist`. The plist sets
+  `PATH` to include `/opt/homebrew/bin` (py-tgcalls plays the opener via ffmpeg).
+- **Verified quirks (2026-10-09), all handled in `speak_telegram.py`:** the call
+  must open on an audio FILE of at least 6 s (the greeting, padded with
+  silence; 2 s gave all-zero audio both ways), then switch to raw frames; the
+  outgoing stream is fed every 10 ms (silence when idle) and never bursts
+  (bursts sped audio up); ntgcalls aborts in its C++ destructors at exit, so
+  the daemon always leaves via `os._exit`.
+- **Routing:** a connected call wins (route `telegram`, result ends
+  `(audio: telegram)`), otherwise the Mac. A call that ends mid-operation
+  raises `Telegram call ended during ...`; the rule of engagement is to call
+  back. No voice-clone archiving on the telegram route. The call is shared by
+  every session (they take turns through the audio lock).
 - **Quiet hours:** `call` refuses 22:00-07:00 local (`SPEAK_QUIET_HOURS`)
   unless `override_quiet_hours=True`, used only when the owner said they are
   up. After `not answered`, wait an hour before calling again.
-- **Permission:** Accessibility for the app that launched Claude Code
-  (Terminal is granted). `ftcall` exits 2 without it.
-- Tests: `tests/test_speak_facetime.py` against `tests/fake_ftcall`
-  (`SPEAK_FTCALL_BIN`, test-only); no test ever dials.
+- **Pins:** `telethon==1.45.0`, `py-tgcalls==3.0.0`, `ntgcalls==3.0.2`; the
+  private-call API is undocumented, so upgrade only deliberately, with a re-test.
+- Tests: `tests/test_speak_telegram.py` (link vs fake py-tgcalls),
+  `tests/test_speak_telegram_daemon.py` (daemon + client over a temp socket),
+  `tests/test_speak_server_telegram.py` (routing and tools vs a fake client).
+  No test contacts Telegram.
 
 ## Audio process isolation
 
@@ -115,9 +130,6 @@ there is nothing left to go stale between calls.
 | `SPEAK_INPUT_DEVICE` | unset | Substring of an input device's name (e.g. `Logi USB Headset`). When set, the record worker resolves it via `sd.query_devices(name, kind="input")` -- `kind="input"` so a device that exposes both an input and output entry under the same name (a USB headset) resolves to its input side without an ambiguous-match error. No fallback: zero or multiple matches raises rather than silently using the default device. When unset, recording uses the current default-device behaviour, unchanged. |
 | `SPEAK_SAVE_DIR` | unset | Absolute path to an existing, writable directory. When set, every successful `listen`/`converse` capture that produced a non-empty transcript is saved as `<dir>/<UTC timestamp>_<n>.wav` (mono int16) plus a sibling `<same name>.txt` with the Whisper transcript -- a ready-made voice-clone reference set. The directory must already exist and be writable; it is never created automatically, and the server fails at startup if it isn't. |
 | `SPEAK_OUTPUT_DEVICE` | unset | Substring of an output device's name (e.g. `Logi USB Headset`). Resolved via `sd.query_devices(name, kind="output")` -- `kind="output"` so a device with both input and output entries under the same name resolves to its output side. No fallback: zero or multiple matches raises. Applies to every playback path: `speak`'s streamed TTS (`play-stream`), the server's tone cues (`play`, used for the ear-closed/timeout beeps and the "Processing" ack), and the in-worker ear-open cue played by the `record` worker itself. When unset, playback uses the current default-device behaviour, unchanged. |
-| `SPEAK_CALL_NUMBER` | unset | E.164 number `call` dials (e.g. `+1...`). Validated at startup if set; `call` raises if unset. Keep it in `~/.claude.json`, not the repo. |
-| `SPEAK_CALL_OUTPUT_DEVICE` | `BlackHole 2ch` | Device played into during a FaceTime call; must be FaceTime's Microphone. |
-| `SPEAK_CALL_INPUT_DEVICE` | `BlackHole 16ch` | Device recorded during a FaceTime call; must be FaceTime's Output. |
 | `SPEAK_QUIET_HOURS` | `22:00-07:00` | No-call window, local time, may wrap midnight. Validated at startup. |
 
 Models are cached under `~/.cache/huggingface`. Audio devices are whatever

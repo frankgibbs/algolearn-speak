@@ -15,10 +15,16 @@ dependencies = [
     "scipy>=1.11",  # resample_poly, used only for optional native-rate input-device capture
     # spaCy model misaki (Kokoro G2P) needs; pinned here so `uv sync` never removes it
     "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    # Telegram calls (speak-telegram daemon). Pinned exactly: py-tgcalls' private-call API is
+    # undocumented and has broken between releases (docs/DESIGN_TELEGRAM_CALL.md section 9).
+    "telethon==1.45.0",
+    "py-tgcalls==3.0.0",
+    "ntgcalls==3.0.2",
 ]
 
 [project.scripts]
 algolearn-speak = "speak_server:main"
+speak-telegram = "speak_telegram_daemon:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -26,7 +32,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["speak_server.py", "speak_audio_worker.py", "speak_facetime.py", "speak_tone.py"]
+only-include = ["speak_server.py", "speak_audio_worker.py", "speak_telegram.py", "speak_telegram_daemon.py", "speak_tone.py"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

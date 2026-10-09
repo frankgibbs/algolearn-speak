@@ -18,7 +18,7 @@ import unittest
 from unittest import mock
 
 os.environ["SPEAK_AUDIO_DRY_RUN"] = "1"
-os.environ["SPEAK_FTCALL_BIN"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_ftcall")  # never the real FaceTime banner
+os.environ["SPEAK_TELEGRAM_SOCKET"] = "/nonexistent-speak-telegram-test/telegram.sock"  # never the live daemon
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
@@ -985,7 +985,7 @@ class TestSerializingLock(unittest.TestCase):
         finally:
             s.audio_lock = orig_audio_lock
             _rmtree(tmpdir)
-        self.assertEqual(result, {"busy": False, "current_tool": None, "waiting": 0, "audio": "mac", "call": "none"})
+        self.assertEqual(result, {"busy": False, "current_tool": None, "waiting": 0, "audio": "mac", "call": "daemon not running"})
 
     def test_status_tool_reports_busy_snapshot_without_blocking(self):
         import asyncio
@@ -1000,7 +1000,7 @@ class TestSerializingLock(unittest.TestCase):
             test_lock.release()
             s.audio_lock = orig_audio_lock
             _rmtree(tmpdir)
-        self.assertEqual(result, {"busy": True, "current_tool": "speak", "waiting": 0, "audio": "mac", "call": "none"})
+        self.assertEqual(result, {"busy": True, "current_tool": "speak", "waiting": 0, "audio": "mac", "call": "daemon not running"})
 
 
 def _rmtree(path: str) -> None:

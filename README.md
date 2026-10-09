@@ -82,9 +82,9 @@ Say something after the beep. Your words should be printed.
 | `speak(text)` | Says `text` through the default output. Streams sentence by sentence. Returns the spoken duration. |
 | `listen(max_seconds=120, silence_seconds=1.2, start_timeout_seconds=45)` | High beep, records the default input until you have been quiet for `silence_seconds` (or spoke for `max_seconds`). Low beep, transcribes, then a rising chime and "Processing". Raises if nobody speaks within `start_timeout_seconds`. |
 | `converse(text, ...)` | `speak` then `listen`. Returns your words. |
-| `call(override_quiet_hours=False)` | FaceTime Audio call from the Mac to your iPhone. While it is connected, `speak`/`listen`/`converse` run over the call. Only works while the Mac is unlocked; no calls 22:00-07:00. See [FaceTime calls](#facetime-calls). |
+| `call(greeting, override_quiet_hours=False)` | Telegram voice call to you (from a second Telegram account). `greeting` is spoken when you answer. While connected, `speak`/`listen`/`converse` run over the call. Works with the Mac locked; no calls 22:00-07:00. See [Telegram calls](#telegram-calls). |
 | `hang_up()` | Ends that call. |
-| `status()` | Returns `{"busy": bool, "current_tool": str \| None, "waiting": int, "audio": "facetime" \| "mac" \| "error", "call": str}` -- what's running now, how many calls are queued behind it, and where audio goes next. Never blocks. |
+| `status()` | Returns `{"busy": bool, "current_tool": str \| None, "waiting": int, "audio": "telegram" \| "mac" \| "error", "call": str}` -- what's running now, how many calls are queued behind it, and where audio goes next. Never blocks. |
 
 `speak`, `listen`, and `converse` are serialized through one lock that is both
 process-wide (a `threading.Lock`, for two calls in the same server process)
@@ -96,18 +96,15 @@ then proceeds -- it is never rejected or allowed to talk over the first.
 `status()` reports the queue depth and which tool currently holds the lock,
 including `"<tool> (pid <n>, other process)"` when another process holds it.
 
-## FaceTime calls
+## Telegram calls
 
-`call` lets a session talk to you wherever you are: the Mac places a FaceTime
-Audio call to your iPhone, detects the answer, and routes the voice tools
-through the call until it ends. Full design, verified behaviour and the
-one-time setup (BlackHole 2ch + 16ch, a second Apple ID for FaceTime on the
-Mac, Accessibility permission, `ftcall/build.sh`, `SPEAK_CALL_NUMBER`):
-[docs/DESIGN_FACETIME_CALL.md](docs/DESIGN_FACETIME_CALL.md).
-
-A screen lock ends a FaceTime call and nothing can be dialed while the Mac is
-locked, so `call` refuses while locked and keeps the Mac awake and unlocked for
-the length of a call.
+`call` lets a session talk to you wherever you are: an always-on
+`speak-telegram` daemon places a Telegram voice call from a second account to
+yours, and the voice tools run through the call until it ends. It works with
+the Mac locked, and the network traffic is outbound only. Design, verified
+behaviour and setup (a second Telegram account, its API keys and session in
+`.env`, the launchd daemon): [docs/DESIGN_TELEGRAM_CALL.md](docs/DESIGN_TELEGRAM_CALL.md)
+and the "Telegram calls" section of CLAUDE.md.
 
 ## Audio cues
 
