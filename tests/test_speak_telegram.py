@@ -241,14 +241,34 @@ class TestCallAnswered(LinkCase):
 
 class TestReviewFindings(LinkCase):
     def test_a_dead_pump_ends_the_call(self):
-        from pytgcalls.exceptions import NotInCallError
         self.link.call(np.zeros(100, dtype=np.float32), 24000)
-        self.calls.fail_send = NotInCallError()
+        self.calls.fail_send = RuntimeError("ntgcalls exploded")
         self.wait_until(lambda: self.link.state() == tg.NONE)
         self.assertEqual(self.link.info()["end_reason"], tg.END_FAILED)
         self.wait_until(lambda: self.calls.left >= 1)
         with self.assertRaisesRegex(tg.CallEnded, "no connected"):
             self.link.play(np.zeros(100, dtype=np.float32), 24000)
+
+    def test_library_dropping_the_call_is_a_remote_end(self):
+        from pytgcalls.exceptions import NotInCallError
+        self.link.call(np.zeros(100, dtype=np.float32), 24000)
+        self.calls.fail_send = NotInCallError()   # the owner hung up; the pump notices first
+        self.wait_until(lambda: self.link.state() == tg.NONE)
+        self.assertEqual(self.link.info()["end_reason"], tg.END_REMOTE)
+
+    def test_our_hang_up_is_recorded_even_when_the_pump_notices_first(self):
+        from pytgcalls.exceptions import NotInCallError
+        self.link.call(np.zeros(100, dtype=np.float32), 24000)
+        calls = self.calls
+
+        async def leave(chat_id):   # like the library: leaving makes send_frame fail
+            calls.fail_send = NotInCallError()
+            await asyncio.sleep(0.05)
+            calls.left += 1
+        calls.leave_call = leave
+        self.assertEqual(self.link.hang_up(), tg.HUNG_UP)
+        time.sleep(0.1)
+        self.assertEqual(self.link.info()["end_reason"], tg.END_HUNG_UP)
 
     def test_failure_after_answer_tears_the_call_down(self):
         self.calls.fail_record = RuntimeError("TelegramServerError")

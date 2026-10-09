@@ -317,8 +317,11 @@ class TelegramLink:
             await asyncio.wait({ring}, timeout=HANG_UP_TIMEOUT)
             self._end_reason = END_HUNG_UP   # ended on request, not by a failure
             return HUNG_UP
-        await self._leave()
+        # End first, then leave: leaving stops the library's side, and the pump's next
+        # send_frame would otherwise record the end as a drop before we record the hang-up
+        # (seen live 2026-10-09).
         self._end_call(END_HUNG_UP)
+        await self._leave()
         return HUNG_UP
 
     # ------------------------------------------------------------ audio out
@@ -343,10 +346,19 @@ class TelegramLink:
             await asyncio.sleep(max(0.0, start + n * 0.01 - time.monotonic()))
 
     def _pump_done(self, task: asyncio.Task) -> None:
-        """A pump that stops by itself (not cancelled by _end_call) means the call is broken."""
+        """A pump that stops by itself (not cancelled by _end_call) means the call is over.
+        NotInCallError is the library saying the call is gone (the owner hung up, usually
+        noticed here before the ChatUpdate arrives, seen live 2026-10-09): a remote end.
+        Anything else is a failure."""
+        from pytgcalls.exceptions import NotInCallError
+
         if task.cancelled() or self._state == NONE:
             return
         error = task.exception()
+        if isinstance(error, NotInCallError):
+            log.info("call ended by the other side (the library dropped the call)")
+            self._end_call(END_REMOTE)
+            return
         log.error("raw-frame pump stopped (%s: %s); ending the call", type(error).__name__, error)
         self._end_call(END_FAILED)
         asyncio.ensure_future(self._leave())
