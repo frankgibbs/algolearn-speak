@@ -64,6 +64,14 @@ class FakeTelegram:
         self.ops.append(("hang_up",))
         return tg.HUNG_UP
 
+    def debug(self, lines):
+        self.ops.append(("debug", lines))
+        return {"daemon": "running", "events": [], "log": [], "debug": False}
+
+    def set_debug(self, enabled):
+        self.ops.append(("set_debug", enabled))
+        return {"daemon": "running", "debug": enabled}
+
 
 class ServerCase(unittest.TestCase):
     def setUp(self):
@@ -340,6 +348,58 @@ class TestStatus(ServerCase):
         self.use(FakeTelegram([RuntimeError("socket timed out")]))
         r = asyncio.run(s.status())
         self.assertEqual((r["call"], r["audio"]), ("error: socket timed out", "error"))
+
+
+class TestCallDebugTools(ServerCase):
+    def test_call_debug_passes_lines_and_never_takes_the_audio_lock(self):
+        fake = self.use(FakeTelegram([tg.CONNECTED]))
+        s.audio_lock.acquire("converse")   # a call in progress holds the lock
+        try:
+            r = asyncio.run(s.call_debug(7))
+            r2 = asyncio.run(s.set_call_debug(True))
+        finally:
+            s.audio_lock.release()
+        self.assertEqual(r["daemon"], "running")
+        self.assertEqual(r2, {"daemon": "running", "debug": True})
+        self.assertEqual(fake.ops, [("debug", 7), ("set_debug", True)])
+
+    def test_daemon_down_is_reported_not_faked(self):
+        class Down(FakeTelegram):
+            def debug(self, lines):
+                return {"daemon": NOT_RUNNING}
+
+            def set_debug(self, enabled):
+                return {"daemon": NOT_RUNNING}
+        self.use(Down([NOT_RUNNING]))
+        self.assertEqual(asyncio.run(s.call_debug()), {"daemon": NOT_RUNNING})
+        self.assertEqual(asyncio.run(s.set_call_debug(False)), {"daemon": NOT_RUNNING})
+
+    def test_bad_arguments_raise(self):
+        self.use(FakeTelegram([tg.NONE]))
+        for bad in (0, 1001, True, "5"):
+            with self.assertRaises(s.ToolError):
+                asyncio.run(s.call_debug(bad))
+        with self.assertRaises(s.ToolError):
+            asyncio.run(s.set_call_debug("yes"))
+
+    def test_default_is_50_lines(self):
+        fake = self.use(FakeTelegram([tg.NONE]))
+        asyncio.run(s.call_debug())
+        self.assertEqual(fake.ops, [("debug", 50)])
+
+
+class TestAudioFailedResult(ServerCase):
+    def test_passes_through_and_does_not_expect_a_call(self):
+        out = tg.AUDIO_FAILED_PREFIX + "TelegramServerError"
+        fake = self.use(FakeTelegram([tg.NONE], outcome=out))
+        with self.at(12, 0):
+            self.assertEqual(s._call_sync("Hi", False), out)
+        self.assertFalse(s._call_expected)
+        self.assertEqual(fake.ops[0][0], "call")
+
+    def test_docstring_documents_it(self):
+        self.assertIn("answered but audio failed to connect", s.call.__doc__)
+        self.assertIn("call_debug", s.call.__doc__)
 
 
 class TestQuietHours(unittest.TestCase):

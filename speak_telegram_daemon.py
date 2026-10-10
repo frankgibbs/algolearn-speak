@@ -11,7 +11,14 @@ commit b719b7a): 4-byte big-endian header length, a UTF-8 JSON header, then
 `header["payload_len"]` raw bytes (float32 little-endian PCM). One request per
 connection, one reply: `{"ok": true, ...}` or `{"ok": false, "error": "..."}`;
 the client re-raises the message as RuntimeError. Requests: `ping`, `state`,
-`call`, `play`, `record`, `hang_up`.
+`call`, `play`, `record`, `hang_up`, `debug` (recent call events, log tail, call
+state, pid, uptime), `set_debug` (raise/restore library logging at runtime).
+`state`, `debug` and `set_debug` never touch the audio lock or the call loop,
+so they answer while a call is ringing or connected.
+
+A call that was answered but whose media connection failed makes the daemon
+exit non-zero right after the caller has its reply, so launchd (KeepAlive)
+restarts it with fresh ntgcalls state.
 
 No fallbacks: a daemon that is not running means no call (`state()` returns
 NOT_RUNNING, which speak_server routes to the Mac unless a call is expected);
@@ -31,6 +38,9 @@ import socketserver
 import struct
 import sys
 import threading
+import time
+from collections import deque
+from typing import Callable
 
 import numpy as np
 
@@ -43,6 +53,10 @@ QUICK_REPLY_TIMEOUT_SECONDS = 20.0
 MAX_HEADER_BYTES = 1 << 20
 MAX_PAYLOAD_BYTES = 1 << 28   # 256 MB: far above any utterance
 NOT_RUNNING = "daemon not running"
+LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
+LOG_RING_SIZE = 2000
+MAX_DEBUG_LINES = 1000
+DEBUG_LOGGERS = ("speak", "pytgcalls", "ntgcalls", "telethon")   # ntgcalls' native C++ log has no Python hook
 ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 REQUIRED_ENV = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_CALL_TARGET")
 
@@ -82,18 +96,69 @@ def _f32(payload: bytes) -> np.ndarray:
     return np.frombuffer(payload, dtype="<f4").copy()
 
 
+# ------------------------------------------------------------------ debug support
+
+class LogRing(logging.Handler):
+    """Keeps the last LOG_RING_SIZE formatted log lines in memory for the `debug` op."""
+
+    def __init__(self, size: int = LOG_RING_SIZE) -> None:
+        super().__init__()
+        self.setFormatter(logging.Formatter(LOG_FORMAT))
+        self._lines: deque[str] = deque(maxlen=size)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._lines.append(self.format(record))
+
+    def tail(self, n: int) -> list[str]:
+        return list(self._lines)[-n:]
+
+
+class DebugControl:
+    """Runtime switch for DEBUG logging of this daemon and the call libraries, plus the log ring.
+    Setting a named logger's level (NOTSET to undo) is all it takes: the handlers on the root
+    logger have no level of their own, so no restart is needed."""
+
+    def __init__(self) -> None:
+        self.ring = LogRing()
+        self.enabled = False
+        self._previous: dict[str, int] = {}
+
+    def install(self) -> None:
+        logging.getLogger().addHandler(self.ring)
+
+    def set(self, enabled: bool) -> None:
+        for name in DEBUG_LOGGERS:
+            lg = logging.getLogger(name)
+            if enabled:
+                if not self.enabled:
+                    self._previous[name] = lg.level
+                lg.setLevel(logging.DEBUG)
+            elif name in self._previous:
+                lg.setLevel(self._previous.pop(name))
+        self.enabled = enabled
+        log.warning("debug logging %s", "ON" if enabled else "OFF")
+
+
+def _debug_lines(req: dict) -> int:
+    lines = req.get("lines")
+    if not isinstance(lines, int) or isinstance(lines, bool) or not 1 <= lines <= MAX_DEBUG_LINES:
+        raise ValueError(f"lines must be an integer from 1 to {MAX_DEBUG_LINES}, got {lines!r}")
+    return lines
+
+
 # ------------------------------------------------------------------ daemon side
 
 class _Handler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         link = self.server.link  # type: ignore[attr-defined]
+        daemon = self.server.daemon  # type: ignore[attr-defined]
         try:
             req, payload = recv_msg(self.request)
         except (ConnectionError, OSError, ValueError) as e:
             log.warning("IPC request could not be read: %s", e)
             return
         try:
-            reply, out = self._dispatch(link, req, payload)
+            reply, out = self._dispatch(daemon, link, req, payload)
         except (RuntimeError, ValueError, TimeoutError) as e:
             reply, out = {"ok": False, "error": str(e) or type(e).__name__}, b""
         except Exception as e:  # reported to the caller with its type, never swallowed
@@ -103,14 +168,27 @@ class _Handler(socketserver.BaseRequestHandler):
             send_msg(self.request, reply, out)
         except OSError as e:
             log.warning("could not send IPC reply: %s", e)
+        if req.get("op") == "call" and reply.get("ok") and tg.is_audio_failure(reply["outcome"]):
+            daemon.request_restart(reply["outcome"])   # after the reply: the caller already has its answer
 
     @staticmethod
-    def _dispatch(link, req: dict, payload: bytes) -> tuple[dict, bytes]:
+    def _dispatch(daemon, link, req: dict, payload: bytes) -> tuple[dict, bytes]:
         op = req.get("op")
         if op == "ping":
             return {"ok": True}, b""
         if op == "state":
             return {"ok": True, **link.info()}, b""
+        if op == "debug":
+            n = _debug_lines(req)
+            return {"ok": True, "daemon": "running", "pid": os.getpid(),
+                    "uptime_seconds": round(time.monotonic() - daemon.started_at, 1),
+                    "debug": daemon.debug.enabled, "call": link.info(),
+                    "events": link.events.recent(n), "log": daemon.debug.ring.tail(n)}, b""
+        if op == "set_debug":
+            if not isinstance(req.get("enabled"), bool):
+                raise ValueError(f"enabled must be a boolean, got {req.get('enabled')!r}")
+            daemon.debug.set(req["enabled"])
+            return {"ok": True, "daemon": "running", "debug": daemon.debug.enabled}, b""
         if op == "call":
             return {"ok": True, "outcome": link.call(_f32(payload), req["rate"])}, b""
         if op == "play":
@@ -134,9 +212,12 @@ class _IPCServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
 class TelegramDaemon:
     """Owns the link, the single-instance lock and the control socket."""
 
-    def __init__(self, link, socket_path: str) -> None:
+    def __init__(self, link, socket_path: str, on_restart: Callable[[str], None] | None = None) -> None:
         self.link = link
         self.socket_path = socket_path
+        self.on_restart = on_restart   # main(): exit non-zero so launchd restarts the daemon
+        self.debug = DebugControl()
+        self.started_at = time.monotonic()
         self._lock_file = None
         self._ipc: _IPCServer | None = None
         self._thread: threading.Thread | None = None
@@ -156,9 +237,16 @@ class TelegramDaemon:
         self._ipc = _IPCServer(self.socket_path, _Handler)
         os.chmod(self.socket_path, 0o600)
         self._ipc.link = self.link  # type: ignore[attr-defined]
+        self._ipc.daemon = self  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._ipc.serve_forever, name="telegram-ipc", daemon=True)
         self._thread.start()
         log.info("speak-telegram: control socket %s", self.socket_path)
+
+    def request_restart(self, reason: str) -> None:
+        if self.on_restart is None:
+            raise RuntimeError(f"daemon restart requested ({reason}) but no on_restart handler is set")
+        log.error("restarting the daemon (exit 1, launchd KeepAlive restarts it): %s", reason)
+        self.on_restart(reason)
 
     def stop(self) -> None:
         if self._ipc is not None:
@@ -237,6 +325,21 @@ class TelegramClient:
             return tg.TIMEOUT
         return np.frombuffer(data, dtype="<f4").copy()
 
+    def debug(self, lines: int) -> dict:
+        """The daemon's recent events/log/state, or `{"daemon": NOT_RUNNING}` when no daemon answers."""
+        try:
+            reply, _ = self._request({"op": "debug", "lines": lines}, reply_timeout=QUICK_REPLY_TIMEOUT_SECONDS)
+        except (FileNotFoundError, ConnectionRefusedError):
+            return {"daemon": NOT_RUNNING}
+        return {k: v for k, v in reply.items() if k not in ("ok", "payload_len")}
+
+    def set_debug(self, enabled: bool) -> dict:
+        try:
+            reply, _ = self._request({"op": "set_debug", "enabled": enabled}, reply_timeout=QUICK_REPLY_TIMEOUT_SECONDS)
+        except (FileNotFoundError, ConnectionRefusedError):
+            return {"daemon": NOT_RUNNING}
+        return {k: v for k, v in reply.items() if k not in ("ok", "payload_len")}
+
     def hang_up(self) -> str:
         reply, _ = self._request({"op": "hang_up"}, reply_timeout=QUICK_REPLY_TIMEOUT_SECONDS)
         return reply["outcome"]
@@ -268,16 +371,24 @@ def build_link(env: dict[str, str]) -> tg.TelegramLink:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format=LOG_FORMAT)
     code = 0
     try:
-        daemon = TelegramDaemon(build_link(load_env()), default_socket_path())
-        daemon.start()
         stop = threading.Event()
+        exit_code = [0]
+
+        def restart(_reason: str) -> None:
+            exit_code[0] = 1
+            stop.set()
+
+        daemon = TelegramDaemon(build_link(load_env()), default_socket_path(), on_restart=restart)
+        daemon.debug.install()
+        daemon.start()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         signal.signal(signal.SIGINT, lambda *_: stop.set())
         stop.wait()
         daemon.stop()
+        code = exit_code[0]
     except BaseException:
         log.exception("speak-telegram failed")
         code = 1

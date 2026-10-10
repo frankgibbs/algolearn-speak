@@ -23,9 +23,10 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
+import ntgcalls
 import numpy as np
 from pytgcalls.exceptions import CallBusy, CallDeclined, CallDiscarded, TimedOutAnswer
-from pytgcalls.types import ChatUpdate, Device, Direction, Frame, StreamFrames
+from pytgcalls.types import ChatUpdate, Device, Direction, Frame, RawCallUpdate, StreamFrames
 
 import speak_telegram as tg
 
@@ -57,6 +58,8 @@ class FakeCalls:
         self.ring_forever = False
         self.fail_record: BaseException | None = None
         self.fail_send: BaseException | None = None
+        self.accept_before_ring_error = False   # emit the callee's ACCEPTED update before play() raises
+        self.mtproto_handler = None
         self.handler = None
         self.plays: list = []
         self.records: list = []
@@ -69,8 +72,11 @@ class FakeCalls:
             return fn
         return deco
 
-    async def start(self):
+    async def _handle_mtproto_updates(self, update):
         pass
+
+    async def start(self):
+        self.mtproto_handler = self._handle_mtproto_updates   # as py-tgcalls' start() registers it
 
     async def play(self, chat_id, stream, config=None):
         self.plays.append((chat_id, stream, config))
@@ -79,6 +85,8 @@ class FakeCalls:
             while self.ring_forever:
                 await asyncio.sleep(0.01)
             if isinstance(self.ring, BaseException):
+                if self.accept_before_ring_error:
+                    await self.mtproto_handler(RawCallUpdate(chat_id, RawCallUpdate.Type.ACCEPTED))
                 raise self.ring
 
     async def record(self, chat_id, stream):
@@ -433,3 +441,129 @@ class TestPcmHelpers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AcceptedCase(LinkCase):
+    """The fake callee accepts (a RawCallUpdate reaches the link), then play() raises `ring`."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls.accept_before_ring_error = True
+
+
+def _call(link):
+    return link.call(np.zeros(100, dtype=np.float32), 24000)
+
+
+class TestAudioFailure(AcceptedCase):
+    ring = ntgcalls.TelegramServerError()   # empty message, as seen live
+
+    def test_distinct_result_and_clean_teardown(self):
+        out = _call(self.link)
+        self.assertEqual(out, tg.AUDIO_FAILED_PREFIX + "TelegramServerError")
+        self.assertTrue(tg.is_audio_failure(out))
+        self.assertEqual(self.link.state(), tg.NONE)
+        self.assertEqual(self.link.info()["end_reason"], tg.END_FAILED)
+        self.assertEqual(self.calls.left, 1)
+        self.assertEqual(self.caffeinate_lines(), [])
+
+    def test_events_tell_the_story(self):
+        _call(self.link)
+        events = self.link.events.recent(50)
+        self.assertEqual([e["event"] for e in events], ["requested", "ringing", "accepted", "audio_failed", "ended"])
+        self.assertEqual(len({e["call_id"] for e in events}), 1)
+        self.assertEqual(events[3]["error"], "TelegramServerError")
+        self.assertEqual(events[4]["reason"], tg.END_FAILED)
+        self.assertIn("duration_s", events[4])
+
+
+class TestServerErrorWithoutAcceptance(LinkCase):
+    ring = ntgcalls.TelegramServerError()   # clear_call during ring: the callee never accepted
+
+    def test_is_a_decline_not_an_audio_failure(self):
+        out = _call(self.link)
+        self.assertEqual(out, tg.NOT_ANSWERED)
+        self.assertFalse(tg.is_audio_failure(out))
+        self.assertEqual(self.link.state(), tg.NONE)
+        self.assertEqual(self.link.info()["end_reason"], tg.END_NOT_ANSWERED)
+        self.assertIn("discarded_before_accept", [e["event"] for e in self.link.events.recent(50)])
+
+
+class TestOtherNtgcallsErrorsRaise(AcceptedCase):
+    ring = ntgcalls.FFmpegError("ffprobe not installed")
+
+    def test_raises_loudly_even_after_acceptance(self):
+        with self.assertRaises(ntgcalls.FFmpegError):
+            _call(self.link)
+        self.assertEqual(self.link.state(), tg.NONE)
+        self.assertEqual(self.link.info()["end_reason"], tg.END_FAILED)
+        self.assertEqual(self.calls.left, 1)
+        self.assertNotIn("audio_failed", [e["event"] for e in self.link.events.recent(50)])
+
+
+class TestOtherNtgcallsErrorWithoutAcceptance(LinkCase):
+    ring = ntgcalls.FileError("no such file")
+
+    def test_raises(self):
+        with self.assertRaises(ntgcalls.FileError):
+            _call(self.link)
+        self.assertEqual(self.link.state(), tg.NONE)
+
+
+class TestAudioFailureOnRawSwitch(LinkCase):
+    def _failing_switch(self, error):
+        async def failing_play(chat_id, stream, config=None):
+            if config is None:
+                raise error
+        self.calls.play = failing_play
+
+    def test_server_error_after_answer_is_reported(self):
+        self._failing_switch(ntgcalls.TelegramServerError())
+        out = _call(self.link)
+        self.assertEqual(out, tg.AUDIO_FAILED_PREFIX + "TelegramServerError")
+        self.assertEqual(self.link.state(), tg.NONE)
+        self.assertEqual(self.calls.left, 1)
+
+    def test_other_ntgcalls_error_after_answer_raises(self):
+        self._failing_switch(ntgcalls.ConnectionError("rtc down"))
+        with self.assertRaises(ntgcalls.ConnectionError):
+            _call(self.link)
+        self.assertEqual(self.link.state(), tg.NONE)
+        self.assertEqual(self.calls.left, 1)
+
+
+class TestBusyEvent(LinkCase):
+    ring = CallBusy(USER_ID)
+
+    def test_busy_is_an_event(self):
+        self.assertEqual(_call(self.link), tg.NOT_ANSWERED)
+        self.assertIn("busy", [e["event"] for e in self.link.events.recent(50)])
+
+
+class TestEventLog(unittest.TestCase):
+    def test_ring_buffer_keeps_the_newest(self):
+        log = tg.CallEventLog(size=3)
+        for i in range(5):
+            log.record("c", "e", i=i)
+        self.assertEqual([e["i"] for e in log.recent(10)], [2, 3, 4])
+        self.assertEqual([e["i"] for e in log.recent(2)], [3, 4])
+
+    def test_describe(self):
+        self.assertEqual(tg.describe(ntgcalls.TelegramServerError()), "TelegramServerError")
+        self.assertEqual(tg.describe(ValueError("x")), "ValueError: x")
+
+
+class TestAnsweredEvents(LinkCase):
+    def test_success_path_events(self):
+        self.link.call(np.zeros(100, dtype=np.float32), 24000)
+        names = [e["event"] for e in self.link.events.recent(50)]
+        self.assertEqual(names[:6], ["requested", "ringing", "answered_media_connected", "recording", "raw_frames", "connected"])
+
+    def test_playback_timeline_events(self):
+        self.link.call(np.zeros(100, dtype=np.float32), 24000)
+        self.link.play(np.zeros(2400, dtype=np.float32), 24000)
+        names = [e["event"] for e in self.link.events.recent(100)]
+        for n in ("first_frame_sent", "playback_queued", "audio_out_start", "playback_done"):
+            self.assertIn(n, names)
+        self.assertLess(names.index("connected"), names.index("playback_queued"))
+        self.assertLess(names.index("audio_out_start"), names.index("playback_done"))

@@ -1,6 +1,6 @@
 """algolearn-speak: a local ear and voice for Claude Code.
 
-MCP server (stdio) exposing six tools:
+MCP server (stdio) exposing eight tools:
 
   speak(text)     -> synthesise with Kokoro (MLX) and play through the default output
   listen(...)     -> record from the default input until you stop talking (Silero VAD),
@@ -12,6 +12,8 @@ MCP server (stdio) exposing six tools:
   hang_up()       -> end that call
   status()        -> report whether speak/listen/converse are busy and how many
                      calls are queued behind the current one
+  call_debug()    -> the speak-telegram daemon's recent call events and log tail
+  set_call_debug()-> toggle the daemon's DEBUG logging at runtime
 
 speak/listen/converse are serialized through one lock that is BOTH
 process-wide and cross-process (see _SerializingLock below): a second
@@ -1144,6 +1146,19 @@ async def call(greeting: str, override_quiet_hours: bool = False) -> str:
                                                  call again for at least one hour
       "not called: quiet hours (22:00-07:00)" -- nothing was dialed; no calls in
                                                  that window
+      "answered but audio failed to connect: <error type/message>"
+                                              -- the owner picked up but the media
+                                                 connection failed (they hear beeping,
+                                                 then the call drops). This is NOT
+                                                 "not answered": do not wait an hour.
+                                                 The call was torn down and the daemon
+                                                 restarts itself (launchd) a few
+                                                 seconds later with fresh state. Call
+                                                 `call_debug()` to see why; once it
+                                                 shows the daemon back up (small
+                                                 uptime_seconds, call state "none"),
+                                                 you may place ONE new call. Do not
+                                                 loop.
     Quiet hours are a hard rule. Pass `override_quiet_hours=True` ONLY when the
     owner has said in this conversation that they are up and want calls.
 
@@ -1153,6 +1168,51 @@ async def call(greeting: str, override_quiet_hours: bool = False) -> str:
     themselves.
     """
     return await _run(_call_sync, greeting, override_quiet_hours)
+
+
+_MAX_DEBUG_LINES = 1000
+
+
+def _call_debug_sync(lines: int) -> dict:
+    if isinstance(lines, bool) or not isinstance(lines, int) or not 1 <= lines <= _MAX_DEBUG_LINES:
+        raise ValueError(f"lines must be an integer from 1 to {_MAX_DEBUG_LINES}, got {lines!r}")
+    return telegram.debug(lines)   # never takes the audio lock: answers during a ringing or connected call
+
+
+def _set_call_debug_sync(enabled: bool) -> dict:
+    if not isinstance(enabled, bool):
+        raise ValueError(f"enabled must be a boolean, got {enabled!r}")
+    return telegram.set_debug(enabled)
+
+
+@mcp.tool()
+async def call_debug(lines: int = 50) -> dict:
+    """Diagnose Telegram calls in real time: what the speak-telegram daemon just did.
+
+    Use it during a call, or right after `call()` returned "answered but audio
+    failed to connect: ..." or an unexpected "not answered". Returns
+    `{"daemon": "running", "pid", "uptime_seconds", "debug": bool, "call":
+    {"state", "generation", "end_reason"}, "events": [...], "log": [...]}`:
+    `events` are the last `lines` structured call events (call_id, ts, event
+    such as requested/ringing/busy/audio_failed/ended, elapsed_s, error),
+    `log` the last `lines` daemon log lines (set_call_debug(True) adds
+    py-tgcalls/Telethon DEBUG output). A small uptime_seconds right after a
+    failed call is the daemon's self-restart. When no daemon answers it
+    returns `{"daemon": "daemon not running"}` and nothing else. Never blocks
+    on the audio lock. `lines` is 1 to 1000.
+    """
+    return await _run(_call_debug_sync, lines)
+
+
+@mcp.tool()
+async def set_call_debug(enabled: bool) -> dict:
+    """Turn the daemon's DEBUG logging (speak, py-tgcalls, Telethon) on or off at
+    runtime, no restart. Turn it on before a call you expect to fail, read the
+    result with `call_debug()`, turn it off after (it is noisy). Resets when the
+    daemon restarts. Returns `{"daemon": "running", "debug": bool}` or
+    `{"daemon": "daemon not running"}`. Never blocks on the audio lock.
+    """
+    return await _run(_set_call_debug_sync, enabled)
 
 
 @mcp.tool()

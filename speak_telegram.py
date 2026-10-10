@@ -26,6 +26,8 @@ whether a call they were using dropped (call back) or was hung up on request.
 from __future__ import annotations
 
 import asyncio
+import collections
+import datetime
 import logging
 import os
 import queue
@@ -33,9 +35,11 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 import wave
 from typing import Callable
 
+import ntgcalls
 import numpy as np
 from scipy.signal import resample_poly
 
@@ -53,10 +57,13 @@ PUMP_MAX_LAG = 0.05        # behind by more than this -> reset the clock instead
 PRE_ROLL_SECONDS = 0.5     # same pre-roll as speak_audio_worker.cmd_record
 HANG_UP_TIMEOUT = 8.0      # leave_call; with disconnect, stays inside launchd's stop window
 DISCONNECT_TIMEOUT = 5.0
+EVENT_BUFFER_SIZE = 500
+MAX_LAG_EVENTS = 20   # pump_stall events per call, so a stalled call cannot flood the buffer
 
 ANSWERED = "answered"
 ALREADY_CONNECTED = "already connected"
 NOT_ANSWERED = "not answered (declined or no answer)"
+AUDIO_FAILED_PREFIX = "answered but audio failed to connect: "
 HUNG_UP = "hung up"
 NO_ACTIVE_CALL = "no active call"
 TIMEOUT = object()   # record(): nobody spoke within start_timeout_seconds
@@ -67,6 +74,38 @@ END_REMOTE, END_HUNG_UP, END_FAILED, END_NOT_ANSWERED = "remote", "hung_up", "fa
 
 class CallEnded(RuntimeError):
     pass
+
+
+def is_audio_failure(outcome: str) -> bool:
+    return outcome.startswith(AUDIO_FAILED_PREFIX)
+
+
+def describe(error: BaseException) -> str:
+    """`Type: message`, or just `Type` when the message is empty (ntgcalls.TelegramServerError has none)."""
+    return f"{type(error).__name__}: {error}" if str(error) else type(error).__name__
+
+
+class CallEventLog:
+    """Thread-safe in-memory ring buffer of structured call events (newest last).
+
+    Every event also goes to the daemon log at INFO, so launchd's log file carries the
+    same record. Fields: ts (local ISO), call_id, event, plus event-specific extras."""
+
+    def __init__(self, size: int = EVENT_BUFFER_SIZE) -> None:
+        self._events: collections.deque[dict] = collections.deque(maxlen=size)
+        self._lock = threading.Lock()
+
+    def record(self, call_id: str | None, event: str, **fields) -> dict:
+        entry = {"ts": datetime.datetime.now().isoformat(timespec="milliseconds"), "call_id": call_id,
+                 "event": event, **fields}
+        with self._lock:
+            self._events.append(entry)
+        log.info("call-event %s", entry)
+        return entry
+
+    def recent(self, n: int) -> list[dict]:
+        with self._lock:
+            return list(self._events)[-n:]
 
 
 def to_call_pcm(audio: np.ndarray, rate: int) -> bytes:
@@ -140,6 +179,17 @@ class TelegramLink:
         self._caffeinate: subprocess.Popen | None = None
         self._incoming: queue.Queue[bytes] = queue.Queue()
         self._listening = False
+        self.events = CallEventLog()
+        self._incoming_seen = False
+        self._call_id: str | None = None
+        self._call_t0 = 0.0
+        self._accepted = False   # Telegram confirmed the callee accepted this call (see _start)
+
+    def _event(self, event: str, **fields) -> None:
+        """Record a call event for the current call (elapsed seconds since it was requested)."""
+        if self._call_id is not None:
+            fields["elapsed_s"] = round(time.monotonic() - self._call_t0, 3)
+        self.events.record(self._call_id, event, **fields)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -160,14 +210,33 @@ class TelegramLink:
             if isinstance(update, StreamFrames):
                 if update.chat_id == self._user_id and update.direction & Direction.INCOMING \
                         and update.device & Device.MICROPHONE and self._listening:
+                    if not self._incoming_seen:
+                        self._incoming_seen = True
+                        self._event("first_incoming_frame")
                     for f in update.frames:
                         self._incoming.put(f.frame)
-            elif isinstance(update, ChatUpdate) and update.chat_id == self._user_id and update.status & (
-                    ChatUpdate.Status.DISCARDED_CALL | ChatUpdate.Status.LEFT_CALL | ChatUpdate.Status.BUSY_CALL):
-                if self._state == NONE:
-                    return   # a late update for a call already torn down; never end the next one
-                log.info("call ended by the other side (%s)", update.status)
-                self._end_call(END_REMOTE)
+            elif isinstance(update, ChatUpdate) and update.chat_id == self._user_id:
+                self._event("chat_update", status=str(update.status))
+                if update.status & (ChatUpdate.Status.DISCARDED_CALL | ChatUpdate.Status.LEFT_CALL | ChatUpdate.Status.BUSY_CALL):
+                    if self._state == NONE:
+                        return   # a late update for a call already torn down; never end the next one
+                    log.info("call ended by the other side (%s)", update.status)
+                    self._end_call(END_REMOTE)
+
+        # RawCallUpdate (the callee accepting) is consumed inside py-tgcalls and never reaches
+        # on_update, so observe it by wrapping the handler py-tgcalls registers in start().
+        # Private API: fail at startup if it is not there.
+        from pytgcalls.types import RawCallUpdate
+        mtproto_handler = self._calls._handle_mtproto_updates
+
+        async def observe_mtproto(update):
+            if isinstance(update, RawCallUpdate) and update.chat_id == self._user_id \
+                    and update.status & RawCallUpdate.Type.UPDATED_CALL and self._state != NONE:
+                self._accepted = True
+                self._event("accepted", status=str(update.status))
+            await mtproto_handler(update)
+
+        self._calls._handle_mtproto_updates = observe_mtproto
 
         # connect() + is_user_authorized(), not start(): start() would prompt on stdin for a
         # phone number if the session were revoked, which under launchd loops forever.
@@ -216,6 +285,7 @@ class TelegramLink:
             return
         self._state = NONE
         self._end_reason = reason
+        self._event("ended", reason=reason, duration_s=round(time.monotonic() - self._call_t0, 3))
         self._ended.set()
         self._listening = False
         self._outgoing.clear()
@@ -262,20 +332,38 @@ class TelegramLink:
             self._generation += 1
             self._end_reason = None
             self._ended.clear()
+            self._incoming_seen = False
+            self._accepted = False
+            self._call_id, self._call_t0 = uuid.uuid4().hex[:8], time.monotonic()
+            self._event("requested", generation=self._generation, target=self.target)
             self._state = RINGING
+            self._event("ringing", ring_timeout_s=RING_TIMEOUT_SECONDS)
             self._ring_task = asyncio.current_task()
             try:
                 await self._calls.play(self._user_id, MediaStream(opener, params), CallConfig(timeout=RING_TIMEOUT_SECONDS))
             except (CallDeclined, CallBusy, TimedOutAnswer, CallDiscarded) as e:
                 log.info("call not answered: %s", type(e).__name__)
+                self._event({CallDeclined: "declined", CallBusy: "busy", TimedOutAnswer: "timeout",
+                             CallDiscarded: "discarded"}[type(e)], error=describe(e))
                 self._end_call(END_NOT_ANSWERED)
                 return NOT_ANSWERED
-            except BaseException:   # includes cancellation (timeout, hang_up, daemon stop): never leave it ringing
+            except ntgcalls.TelegramServerError as e:
+                if self._accepted:
+                    return await self._audio_failed(e)
+                # No accepted/confirmed update for this call: py-tgcalls' clear_call raised this
+                # because the call was cleared before the callee took it (declined/discarded).
+                log.info("call not answered: TelegramServerError before the callee accepted")
+                self._event("discarded_before_accept", error=describe(e))
+                self._end_call(END_NOT_ANSWERED)
+                return NOT_ANSWERED
+            except BaseException as e:   # includes cancellation (timeout, hang_up, daemon stop): never leave it ringing
+                self._event("error", error=describe(e))
                 await self._leave()
                 self._end_call(END_FAILED)
                 raise
             finally:
                 self._ring_task = None
+            self._event("answered_media_connected", opener_s=round(opener_seconds, 3))  # the greeting file starts playing now
             # Answered. Anything that fails from here tears the call down: never a live,
             # half-built call with no pump.
             try:
@@ -283,25 +371,42 @@ class TelegramLink:
                 self._caffeinate = subprocess.Popen([self._caffeinate_cmd, "-i", "-w", str(os.getpid())],
                                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 await self._calls.record(self._user_id, RecordStream(audio=True, audio_parameters=params))
+                self._event("recording", opener_s=round(opener_seconds, 3))
                 await asyncio.sleep(opener_seconds + OPENER_TAIL_SECONDS)
                 if self._ended.is_set():
                     # Hung up during the greeting: treat it as a decline (the session then waits an hour).
                     return NOT_ANSWERED
                 await self._calls.play(self._user_id, MediaStream(ExternalMedia.AUDIO, params))
+                self._event("raw_frames")
                 if self._ended.is_set():
                     # Ended while switching; py-tgcalls may have re-dialed, so make sure nothing is left up.
                     await self._leave()
                     return NOT_ANSWERED
                 self._pump_task = asyncio.create_task(self._pump())
                 self._pump_task.add_done_callback(self._pump_done)
-            except BaseException:
+            except ntgcalls.TelegramServerError as e:   # the callee accepted (play() returned): a media-connect failure
+                return await self._audio_failed(e)
+            except BaseException as e:
+                self._event("error", error=describe(e))
                 await self._leave()
                 self._end_call(END_FAILED)
                 raise
         finally:
             os.unlink(opener)
+        self._event("connected")
         log.info("call %d connected; raw-frame pump running", self._generation)
         return ANSWERED
+
+    async def _audio_failed(self, error: BaseException) -> str:
+        """The owner answered but the media connection failed (ntgcalls.TelegramServerError etc.):
+        discard the call and report it distinctly from "not answered". The daemon then exits so
+        launchd restarts it with fresh ntgcalls state (see TelegramDaemon)."""
+        message = describe(error)
+        log.error("call %d: answered but audio failed to connect: %s", self._generation, message)
+        self._event("audio_failed", error=message)
+        await self._leave()
+        self._end_call(END_FAILED)
+        return AUDIO_FAILED_PREFIX + message
 
     def hang_up(self) -> str:
         return self._run(self._hang_up(), HANG_UP_TIMEOUT + 2.0, "hanging up")
@@ -331,17 +436,31 @@ class TelegramLink:
 
         silence = bytes(FRAME_BYTES)
         start, n = time.monotonic(), 0
+        first_sent, lag_events, was_sending = False, 0, False
         while True:
             if self._outgoing:
+                if not was_sending:
+                    self._event("audio_out_start", queued_ms=len(self._outgoing) // FRAME_BYTES * 10)
+                was_sending = True
                 frame = bytes(self._outgoing[:FRAME_BYTES]).ljust(FRAME_BYTES, b"\0")
                 del self._outgoing[:FRAME_BYTES]
                 if not self._outgoing:
                     self._drained.set()
             else:
+                if was_sending:
+                    self._event("audio_out_end")
+                was_sending = False
                 frame = silence
             await self._calls.send_frame(self._user_id, Device.MICROPHONE, frame)
+            if not first_sent:
+                first_sent = True
+                self._event("first_frame_sent")
             n += 1
-            if time.monotonic() - (start + n * 0.01) > PUMP_MAX_LAG:
+            lag = time.monotonic() - (start + n * 0.01)
+            if lag > PUMP_MAX_LAG:
+                if lag_events < MAX_LAG_EVENTS:   # an underrun/gap: the outgoing stream stalled this long
+                    lag_events += 1
+                    self._event("pump_stall", lag_ms=round(lag * 1000), sending_audio=was_sending)
                 start, n = time.monotonic(), 0
             await asyncio.sleep(max(0.0, start + n * 0.01 - time.monotonic()))
 
@@ -359,7 +478,8 @@ class TelegramLink:
             log.info("call ended by the other side (the library dropped the call)")
             self._end_call(END_REMOTE)
             return
-        log.error("raw-frame pump stopped (%s: %s); ending the call", type(error).__name__, error)
+        log.error("raw-frame pump stopped (%s); ending the call", describe(error))
+        self._event("pump_failed", error=describe(error))
         self._end_call(END_FAILED)
         asyncio.ensure_future(self._leave())
 
@@ -373,6 +493,7 @@ class TelegramLink:
             raise CallEnded("no connected Telegram call")
         self._drained.clear()
         self._outgoing.extend(pcm)
+        self._event("playback_queued", audio_ms=len(pcm) // FRAME_BYTES * 10)
         try:
             while not self._drained.is_set():
                 try:
@@ -384,6 +505,7 @@ class TelegramLink:
             raise
         if self._ended.is_set():
             raise CallEnded("the Telegram call ended during playback")
+        self._event("playback_done")
 
     # ------------------------------------------------------------ audio in
 

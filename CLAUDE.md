@@ -71,6 +71,14 @@ phone has signal, with the Mac locked or unlocked, outbound-only networking.
   raises `Telegram call ended during ...`; the rule of engagement is to call
   back. No voice-clone archiving on the telegram route. The call is shared by
   every session (they take turns through the audio lock).
+- **Audio failure and diagnostics:** if the owner answers but the media connect
+  fails (`ntgcalls.BaseRTCException`, e.g. `TelegramServerError`), `call` returns
+  `answered but audio failed to connect: <error>`, the call is discarded, and the
+  daemon exits 1 right after replying so launchd restarts it with fresh ntgcalls
+  state (no automatic retry). Every call writes structured events (call id,
+  timestamps, state transitions, errors, duration) to a 500-entry ring buffer and
+  the log; `call_debug` / `set_call_debug` read it and toggle DEBUG logging over
+  the daemon socket (ops `debug`, `set_debug`), without the audio lock.
 - **Quiet hours:** `call` refuses 22:00-07:00 local (`SPEAK_QUIET_HOURS`)
   unless `override_quiet_hours=True`, used only when the owner said they are
   up. After `not answered`, wait an hour before calling again.

@@ -84,6 +84,8 @@ Say something after the beep. Your words should be printed.
 | `converse(text, ...)` | `speak` then `listen`. Returns your words. |
 | `call(greeting, override_quiet_hours=False)` | Telegram voice call to you (from a second Telegram account). `greeting` is spoken when you answer. While connected, `speak`/`listen`/`converse` run over the call. Works with the Mac locked; no calls 22:00-07:00. See [Telegram calls](#telegram-calls). |
 | `hang_up()` | Ends that call. |
+| `call_debug(lines=50)` | The daemon's recent structured call events, log tail, call state, pid, uptime, debug flag. Never takes the audio lock; `{"daemon": "daemon not running"}` if down. |
+| `set_call_debug(enabled)` | Raises/restores the daemon's DEBUG logging (speak, py-tgcalls, Telethon) at runtime. |
 | `status()` | Returns `{"busy": bool, "current_tool": str \| None, "waiting": int, "audio": "telegram" \| "mac" \| "error", "call": str}` -- what's running now, how many calls are queued behind it, and where audio goes next. Never blocks. |
 
 `speak`, `listen`, and `converse` are serialized through one lock that is both
