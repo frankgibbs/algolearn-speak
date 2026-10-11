@@ -1135,7 +1135,10 @@ async def call(greeting: str, override_quiet_hours: bool = False) -> str:
     """Phone the owner on Telegram (from the algolearn.ai account) and wait for the answer.
 
     `greeting` is your opening line, spoken the moment they pick up, so say why
-    you are calling: "Hi Frank, the backtest finished. Got a minute?". Works
+    you are calling: "Hi Frank, the backtest finished.". The greeting must be a
+    statement, never a question: call() does not listen afterwards, so there is
+    no beep and no reply is captured. Put your first question in the first
+    `converse`, which speaks, beeps, then listens. Works
     wherever their phone has signal, with the Mac locked or unlocked. Once
     answered, speak/listen/converse run over the call until it ends. Returns one of:
       "answered"                              -- they picked up and heard the greeting;

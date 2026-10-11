@@ -82,7 +82,7 @@ Say something after the beep. Your words should be printed.
 | `speak(text)` | Says `text` through the default output. Streams sentence by sentence. Returns the spoken duration. |
 | `listen(max_seconds=120, silence_seconds=1.2, start_timeout_seconds=45)` | High beep, records the default input until you have been quiet for `silence_seconds` (or spoke for `max_seconds`). Low beep, transcribes, then a rising chime and "Processing". Raises if nobody speaks within `start_timeout_seconds`. |
 | `converse(text, ...)` | `speak` then `listen`. Returns your words. |
-| `call(greeting, override_quiet_hours=False)` | Telegram voice call to you (from a second Telegram account). `greeting` is spoken when you answer. While connected, `speak`/`listen`/`converse` run over the call. Works with the Mac locked; no calls 22:00-07:00. See [Telegram calls](#telegram-calls). |
+| `call(greeting, override_quiet_hours=False)` | Telegram voice call to you (from a second Telegram account). `greeting` is spoken when you answer; it is a statement, not a question, because call() does not listen or beep afterwards (the first `converse` asks). While connected, `speak`/`listen`/`converse` run over the call. Works with the Mac locked; no calls 22:00-07:00. See [Telegram calls](#telegram-calls). |
 | `hang_up()` | Ends that call. |
 | `call_debug(lines=50)` | The daemon's recent structured call events, log tail, call state, pid, uptime, debug flag. Never takes the audio lock; `{"daemon": "daemon not running"}` if down. |
 | `set_call_debug(enabled)` | Raises/restores the daemon's DEBUG logging (speak, py-tgcalls, Telethon) at runtime. |
