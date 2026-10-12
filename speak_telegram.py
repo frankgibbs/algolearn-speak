@@ -49,7 +49,7 @@ CALL_RATE, CALL_CHANNELS = 48_000, 2
 FRAME_BYTES = CALL_RATE // 100 * 2 * CALL_CHANNELS   # 10 ms of s16le stereo
 VAD_RATE, VAD_BLOCK = 16_000, 512                    # Silero contract (32 ms)
 NATIVE_BLOCK = VAD_BLOCK * CALL_RATE // VAD_RATE     # 1536 samples at 48 kHz
-OPENER_MIN_SECONDS = 6.0   # 2 s failed, 6 s worked (2026-10-09); shorter greetings are padded with silence
+OPENER_MIN_SECONDS = 6.0   # 2 s failed, 6 s worked (2026-10-09). The one definition: speak_server rejects shorter greetings before dialing, write_opener raises on them
 OPENER_TAIL_SECONDS = 1.0  # wait after the opener file before switching to raw frames
 RING_TIMEOUT_SECONDS = 60
 CONNECT_GRACE_SECONDS = 30  # py-tgcalls waits for the media connection with no timeout of its own
@@ -117,11 +117,14 @@ def to_call_pcm(audio: np.ndarray, rate: int) -> bytes:
 
 
 def write_opener(path: str, audio: np.ndarray, rate: int) -> float:
-    """The greeting as a 48 kHz mono WAV, padded with silence to OPENER_MIN_SECONDS. Returns its length."""
+    """The greeting as a 48 kHz mono WAV. Returns its length. Raises ValueError if it is shorter than
+    OPENER_MIN_SECONDS: a short opener gives a dead call, and padding it would leave dead air after the
+    greeting's question. speak_server rejects short greetings before dialing, so this is a backstop."""
     audio = np.asarray(audio, dtype=np.float32).reshape(-1)
     up = resample_poly(audio, CALL_RATE, rate) if rate != CALL_RATE else audio
     s16 = (np.clip(up, -1.0, 1.0) * 32767).astype(np.int16)
-    s16 = np.concatenate([s16, np.zeros(max(0, int(OPENER_MIN_SECONDS * CALL_RATE) - len(s16)), dtype=np.int16)])
+    if len(s16) < int(OPENER_MIN_SECONDS * CALL_RATE):
+        raise ValueError(f"greeting is {len(s16) / CALL_RATE:.1f}s; the call opener must be at least {OPENER_MIN_SECONDS:g}s")
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
@@ -133,14 +136,22 @@ def write_opener(path: str, audio: np.ndarray, rate: int) -> float:
 _silero_model = None
 
 
-def silero_vad_factory(silence_seconds: float):
-    """A Silero VADIterator with speak_audio_worker.cmd_record's settings (model loaded once)."""
+def preload_silero_vad() -> None:
+    """Load the Silero model (and torch) now. Run at link start so no load blocks the loop mid-call."""
     global _silero_model
-    import torch
-    from silero_vad import VADIterator, load_silero_vad
+    from silero_vad import load_silero_vad
 
     if _silero_model is None:
         _silero_model = load_silero_vad()
+
+
+def silero_vad_factory(silence_seconds: float):
+    """A Silero VADIterator with speak_audio_worker.cmd_record's settings (model from preload_silero_vad)."""
+    import torch
+    from silero_vad import VADIterator
+
+    if _silero_model is None:
+        raise RuntimeError("Silero model not loaded: preload_silero_vad() runs in TelegramLink.start()")
     vad = VADIterator(_silero_model, threshold=0.5, sampling_rate=VAD_RATE,
                       min_silence_duration_ms=int(silence_seconds * 1000), speech_pad_ms=300)
     return lambda block: vad(torch.from_numpy(block.copy()), return_seconds=False)
@@ -156,12 +167,14 @@ class TelegramLink:
         client_factory: Callable,
         calls_factory: Callable,
         vad_factory: Callable = silero_vad_factory,
+        vad_preload: Callable = preload_silero_vad,
         caffeinate: str = "caffeinate",
     ) -> None:
         self.target = target
         self._client_factory = client_factory
         self._calls_factory = calls_factory
         self._vad_factory = vad_factory
+        self._vad_preload = vad_preload
         self._caffeinate_cmd = caffeinate
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, name="telegram-loop", daemon=True)
@@ -194,6 +207,7 @@ class TelegramLink:
     # ------------------------------------------------------------ lifecycle
 
     def start(self) -> None:
+        self._vad_preload()   # a load failure fails start; never load a model during a call
         self._thread.start()
         self._run(self._start(), 60.0, "connecting to Telegram")
         log.info("telegram link ready (target %s, user id %s)", self.target, self._user_id)
@@ -312,7 +326,7 @@ class TelegramLink:
     # ------------------------------------------------------------ call / hang up
 
     def call(self, greeting: np.ndarray, rate: int) -> str:
-        budget = RING_TIMEOUT_SECONDS + CONNECT_GRACE_SECONDS + max(OPENER_MIN_SECONDS, len(greeting) / rate) + 15.0
+        budget = RING_TIMEOUT_SECONDS + CONNECT_GRACE_SECONDS + len(greeting) / rate + 15.0
         return self._run(self._call(greeting, rate), budget, "placing the call")
 
     async def _call(self, greeting: np.ndarray, rate: int) -> str:

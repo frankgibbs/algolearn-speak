@@ -146,7 +146,7 @@ class LinkCase(unittest.TestCase):
         p = mock.patch.dict(os.environ, {"FAKE_CAFFEINATE_LOG": self.caffeinate_log})
         p.start()
         self.addCleanup(p.stop)
-        for name, value in (("OPENER_MIN_SECONDS", 0.05), ("OPENER_TAIL_SECONDS", 0.02)):
+        for name, value in (("OPENER_MIN_SECONDS", 0.004), ("OPENER_TAIL_SECONDS", 0.02)):
             p = mock.patch.object(tg, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -156,7 +156,8 @@ class LinkCase(unittest.TestCase):
             self.calls = FakeCalls(client, self.ring)
             return self.calls
 
-        self.link = tg.TelegramLink("owner", FakeTelethon, calls_factory, vad_factory=StubVAD, caffeinate=FAKE_CAFFEINATE)
+        self.link = tg.TelegramLink("owner", FakeTelethon, calls_factory, vad_factory=StubVAD, vad_preload=lambda: None,
+                                 caffeinate=FAKE_CAFFEINATE)
         self.link.start()
         self.addCleanup(self.link.stop)
 
@@ -349,11 +350,45 @@ class TestReviewFindings(LinkCase):
         self.assertEqual(self.link.info(), {"state": tg.NONE, "generation": 1, "end_reason": tg.END_REMOTE})
 
 
+class TestVadPreload(unittest.TestCase):
+    def link(self, preload):
+        return tg.TelegramLink("owner", FakeTelethon, lambda c: FakeCalls(c), vad_factory=StubVAD,
+                               vad_preload=preload, caffeinate=FAKE_CAFFEINATE)
+
+    def test_start_loads_the_model_before_connecting(self):
+        order = []
+
+        class Client(FakeTelethon):
+            async def connect(self):
+                order.append("connect")
+                await super().connect()
+
+        link = tg.TelegramLink("owner", Client, lambda c: FakeCalls(c), vad_factory=StubVAD,
+                               vad_preload=lambda: order.append("preload"), caffeinate=FAKE_CAFFEINATE)
+        link.start()
+        self.addCleanup(link.stop)
+        self.assertEqual(order[0], "preload")
+
+    def test_load_failure_fails_start(self):
+        def boom():
+            raise RuntimeError("silero load failed")
+        link = self.link(boom)
+        with self.assertRaisesRegex(RuntimeError, "silero load failed"):
+            link.start()
+        self.assertFalse(link._thread.is_alive())
+
+    def test_factory_refuses_when_model_not_preloaded(self):
+        with mock.patch.object(tg, "_silero_model", None):
+            with self.assertRaisesRegex(RuntimeError, "not loaded"):
+                tg.silero_vad_factory(1.0)
+
+
 class TestRevokedSession(unittest.TestCase):
     def test_refuses_to_start_instead_of_prompting(self):
         class Revoked(FakeTelethon):
             authorized = False
-        link = tg.TelegramLink("owner", Revoked, lambda c: FakeCalls(c), vad_factory=StubVAD)
+        link = tg.TelegramLink("owner", Revoked, lambda c: FakeCalls(c), vad_factory=StubVAD,
+                               vad_preload=lambda: None)
         with self.assertRaisesRegex(RuntimeError, "not authorized"):
             link.start()
         link._loop.call_soon_threadsafe(link._loop.stop)
@@ -424,14 +459,20 @@ class TestPcmHelpers(unittest.TestCase):
         pcm = tg.to_call_pcm(np.zeros(24000, dtype=np.float32), 24000)   # 1 s at 24 kHz
         self.assertEqual(len(pcm), 48000 * 2 * 2)
 
-    def test_opener_is_padded_to_the_minimum(self):
+    def test_short_opener_raises_instead_of_padding(self):
         path = os.path.join(tempfile.mkdtemp(prefix="opener-"), "o.wav")
         self.addCleanup(shutil.rmtree, os.path.dirname(path), True)
-        seconds = tg.write_opener(path, np.zeros(12000, dtype=np.float32), 24000)   # 0.5 s of speech
+        with self.assertRaisesRegex(ValueError, "at least 6s"):
+            tg.write_opener(path, np.zeros(12000, dtype=np.float32), 24000)   # 0.5 s of speech
+        self.assertFalse(os.path.exists(path))
+
+    def test_opener_at_the_minimum_is_written_as_48k_mono(self):
+        path = os.path.join(tempfile.mkdtemp(prefix="opener-"), "o.wav")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), True)
+        seconds = tg.write_opener(path, np.zeros(int(tg.OPENER_MIN_SECONDS * 24000), dtype=np.float32), 24000)
         self.assertEqual(seconds, tg.OPENER_MIN_SECONDS)
         with wave.open(path) as w:
             self.assertEqual((w.getframerate(), w.getnchannels()), (48000, 1))
-            self.assertAlmostEqual(w.getnframes() / 48000, 6.0, places=3)
 
     def test_long_greeting_is_not_cut(self):
         path = os.path.join(tempfile.mkdtemp(prefix="opener-"), "o.wav")
