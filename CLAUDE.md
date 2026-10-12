@@ -11,9 +11,9 @@ Everything runs on this Mac. No audio or text leaves the machine.
 | Tool | What it does |
 |---|---|
 | `speak(text)` | Kokoro-82M on MLX synthesises `text`, streamed sentence by sentence to the default output device. Returns spoken duration. |
-| `listen(max_seconds=120, silence_seconds=1.2, start_timeout_seconds=45)` | High beep, then records the default input until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech). Low beep, then Whisper large-v3-turbo on MLX transcribes. Once text is in hand, a rising two-note chime and the spoken word "Processing" tell the user their words were captured. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. |
+| `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep, then records the default input until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech). Low beep, then Whisper large-v3-turbo on MLX transcribes. Once text is in hand, a rising two-note chime and the spoken word "Processing" tell the user their words were captured. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. |
 | `converse(text, ...)` | `speak` then `listen` under one lock. Returns the user's words. |
-| `call(greeting, override_quiet_hours=False)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is spoken the moment they answer; it must be a statement, never a question (call() does not listen or beep afterwards; ask in the first `converse`). Returns `answered`, `already connected`, `not answered (declined or no answer)` or `not called: quiet hours (...)`. While connected, `speak`/`listen`/`converse` run over the call. Works with the Mac locked. See "Telegram calls". |
+| `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is the whole opening, spoken the moment they answer: who is calling, why, and the context, ending with a question or invitation. It must be at least 6 s when spoken (measured on the synthesized audio); a shorter one raises `ValueError` BEFORE dialing (phone never rings; owner decision 2026-10-12) telling the model to add the context of why it is calling, or, on a fresh conversation with nothing to report, to open with something playful (a joke, something funny or flirty). Never padded. Once answered, `call` immediately does the `listen` (ear-open beep, VAD, Whisper, chime + ack) under the same lock hold and returns the owner's words; listen parameters and defaults match `converse`, and a listen timeout or a drop raises as in `listen` (the call stays connected on a timeout). Returns `answered\n<their words>\n(audio: telegram)`, `already connected` (greeting not spoken, no listen), `not answered (declined or no answer)`, `answered but audio failed to connect: <error>` (the owner picked up but media failed; daemon restarts itself) or `not called: quiet hours (...)`. Check order: quiet hours, daemon state / already connected, then the greeting length, then the dial. While connected, `speak`/`listen`/`converse` run over the call. Works with the Mac locked. See "Telegram calls". |
 | `hang_up()` | End that call (only when the owner asks). |
 | `status()` | `{busy, current_tool, waiting, audio: "telegram"\|"mac"\|"error", call}`: what holds the lock, where the next call's audio goes, and the daemon's call state (`none`/`ringing`/`connected`/`daemon not running`). Never blocks. Every `speak`/`listen`/`converse` result ends with `(audio: mac)` or `(audio: telegram)` on its own line. |
 
@@ -61,8 +61,10 @@ phone has signal, with the Mac locked or unlocked, outbound-only networking.
   ~/Library/LaunchAgents/com.algolearn.speak-telegram.plist`. The plist sets
   `PATH` to include `/opt/homebrew/bin` (py-tgcalls plays the opener via ffmpeg).
 - **Verified quirks (2026-10-09), all handled in `speak_telegram.py`:** the call
-  must open on an audio FILE of at least 6 s (the greeting, padded with
-  silence; 2 s gave all-zero audio both ways), then switch to raw frames; the
+  must open on an audio FILE of at least 6 s (the greeting itself; 2 s gave
+  all-zero audio both ways). **Owner decision (2026-10-12):** no padding;
+  `call` rejects a greeting under 6 s before dialing and the daemon's
+  `write_opener` raises on one (`OPENER_MIN_SECONDS`, the single definition), then switch to raw frames; the
   outgoing stream is fed every 10 ms (silence when idle) and never bursts
   (bursts sped audio up); ntgcalls aborts in its C++ destructors at exit, so
   the daemon always leaves via `os._exit`.

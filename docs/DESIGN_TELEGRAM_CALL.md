@@ -145,18 +145,39 @@ py-tgcalls' per-chat lock.
 session waits an hour instead of calling straight back.
 
 **Decision: `call` takes the opening sentence.** The model passes what it is
-calling about, for example "Hi Frank, the backtest finished. Got a minute?".
+calling about, for example "Hi Frank, it's Angie, the backtest finished. Got a minute?".
 That sentence becomes the greeting file (quirk 1), so the owner hears why
 they were called the moment they answer. The spike's greeting was about 6 s.
-Whether a shorter one also works is the first build check (section 12). If
-it doesn't, the daemon pads the greeting file with trailing silence up to
-the length that works.
+
+**Owner decision (2026-10-12): short greetings are rejected, never padded.**
+Verified fact (spike, 2026-10-09): an opener of 2 s gave all-zero audio, one
+of about 6 s worked. Padding a short greeting with silence was the first
+design, but it leaves 5-6 s of dead air after a greeting that ends in a
+question, and anything the owner says there is lost. The decision: the
+greeting is the whole opening (intro, reason for calling, context, ending in a
+question), so it runs 6 s or longer. `call` measures the synthesized speech
+and, if it is under `OPENER_MIN_SECONDS` (6 s, defined once in
+`speak_telegram.py`), raises `ValueError` before dialing, so the phone never
+rings. The message tells the model to lengthen the greeting with the context of
+why it is calling, or, on a fresh conversation with nothing to report, to open
+with something playful (a joke, something funny or flirty). Check order in
+`call`: quiet hours, daemon state and already-connected (both keep their
+outcomes, the greeting is irrelevant to them), then the length check, then the
+dial. The daemon's `write_opener` raises on a short opener as a backstop;
+no padding path exists.
 
 ## 5. The tools
 
-- `call(greeting: str, override_quiet_hours: bool = False) -> str`, under the
-  audio lock. It returns one of:
-  - `answered`
+- `call(greeting: str, override_quiet_hours: bool = False, max_seconds: float = 120.0, silence_seconds: float = 2.0, start_timeout_seconds: float = 45.0) -> str`,
+  under the audio lock. **Owner decision (2026-10-12):** when the call is
+  answered, `call` does not return after the greeting; in the same lock hold
+  it performs the same listen as `listen()` on the telegram route (ear-open
+  beep, VAD, Whisper, chime and ack) and returns the owner's words, so the
+  greeting should end with a question or invitation. The listen parameters
+  and defaults are `converse`'s. A listen timeout or a drop raises as in
+  `listen` (the call stays connected on a timeout). `already connected`
+  neither speaks the greeting nor listens. It returns one of:
+  - `answered\n<their words>\n(audio: telegram)`
   - `already connected`
   - `not answered (declined or no answer)`
   - `not called: quiet hours (22:00-07:00)`
@@ -269,9 +290,9 @@ descriptions' rule of engagement carry over.
 
 ## 12. Build plan and checks
 
-1. **Short-greeting check (first, before other code):** with the spike
-   scripts, open calls on 2 s and 4 s spoken greetings. Record the shortest
-   that carries audio both ways; that sets the padding in section 4.
+1. **Short-greeting check (done, superseded):** the spike showed 2 s fails and
+   about 6 s works; the 2026-10-12 owner decision (section 4) sets 6 s as a
+   rejection threshold, not a padding target.
 2. **Decline and no-answer check:** decline one call, and let one ring out.
    Record what py-tgcalls reports for each, then map both to
    `not answered`.

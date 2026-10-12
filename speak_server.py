@@ -1001,7 +1001,8 @@ def _synthesize(text: str) -> np.ndarray:
                                                             split_pattern=SENTENCE_SPLIT)])
 
 
-def _call_sync(greeting: str, override_quiet_hours: bool) -> str:
+def _call_sync(greeting: str, override_quiet_hours: bool, max_seconds: float, silence_seconds: float,
+               start_timeout_seconds: float) -> str:
     global _call_expected, _call_generation
     audio_lock.acquire("call")
     try:
@@ -1014,11 +1015,33 @@ def _call_sync(greeting: str, override_quiet_hours: bool) -> str:
         if info["state"] == tg.CONNECTED:
             _call_expected, _call_generation = True, info["generation"]
             return tg.ALREADY_CONNECTED
-        outcome = telegram.call(_synthesize(greeting), TTS_RATE)
+        # Last of the pre-dial checks, so quiet hours / daemon down / already connected keep
+        # their outcomes. Measured on the synthesized audio, not guessed from word count.
+        audio = _synthesize(greeting)
+        seconds = len(audio) / TTS_RATE
+        if seconds < tg.OPENER_MIN_SECONDS:
+            raise ValueError(
+                f"call() greeting is only {seconds:.1f}s when spoken; it must be at least {tg.OPENER_MIN_SECONDS:g}s. "
+                "Nothing was dialed. The greeting is the whole opening: say who is calling, why, and the context, "
+                "and end with a question. Lengthen it with the context of why you are calling. If this is a fresh "
+                "conversation with nothing to report, open with something playful instead: a joke, something "
+                "funny or flirty.")
+        outcome = telegram.call(audio, TTS_RATE)
         _call_expected = outcome in (tg.ANSWERED, tg.ALREADY_CONNECTED)
         if _call_expected:
             _call_generation = telegram.info()["generation"]
-        return outcome
+        if outcome != tg.ANSWERED:
+            return outcome
+        # Answered: the greeting has played; listen for the owner's reply under the
+        # same lock hold (as converse does) so no other session slips in between.
+        # A listen timeout or a drop raises, exactly as in listen(); on a timeout
+        # the call stays connected.
+        try:
+            route = _begin_call("call")
+            text = _guard_call(route, "call", lambda: _listen_impl(max_seconds, silence_seconds, start_timeout_seconds))
+        finally:
+            _end_call()
+        return f"{tg.ANSWERED}\n{text}{_audio_note(route)}"
     finally:
         audio_lock.release()
 
@@ -1131,18 +1154,29 @@ async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float
 
 
 @mcp.tool()
-async def call(greeting: str, override_quiet_hours: bool = False) -> str:
-    """Phone the owner on Telegram (from the algolearn.ai account) and wait for the answer.
+async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: float = 120.0,
+               silence_seconds: float = 2.0, start_timeout_seconds: float = 45.0) -> str:
+    """Phone the owner on Telegram (from the algolearn.ai account), speak the greeting
+    once they answer, then listen for their reply.
 
-    `greeting` is your opening line, spoken the moment they pick up, so say why
-    you are calling: "Hi Frank, the backtest finished.". The greeting must be a
-    statement, never a question: call() does not listen afterwards, so there is
-    no beep and no reply is captured. Put your first question in the first
-    `converse`, which speaks, beeps, then listens. Works
-    wherever their phone has signal, with the Mac locked or unlocked. Once
-    answered, speak/listen/converse run over the call until it ends. Returns one of:
-      "answered"                              -- they picked up and heard the greeting;
-                                                 continue with listen or converse
+    `greeting` is your whole opening, spoken the moment they pick up: who is
+    calling, why, and the context, ending with a question or invitation,
+    because call() listens right after it (ear-open beep, then the same capture as `listen`; the listen
+    parameters and defaults are converse's). It must be at least 6 s when
+    spoken (the call needs a 6 s opener); a shorter one raises ValueError
+    BEFORE dialing, so the phone never rings. Lengthen it with the context of
+    why you are calling; with nothing to report on a fresh conversation, open
+    with something playful (a joke, something funny or flirty). Example:
+    "Hi Frank, it's Angie. The backtest finished a few minutes ago and the
+    holdout came back clean, but there is one result I want your read on
+    before I do anything else. Do you have a minute?". Works wherever their phone has signal,
+    with the Mac locked or unlocked. Once answered, speak/listen/converse run
+    over the call until it ends. Returns one of:
+      "answered\n<their words>\n(audio: telegram)"
+                                              -- they picked up, heard the greeting and
+                                                 replied; continue with listen or converse.
+                                                 A listen timeout or a drop raises as in
+                                                 listen (a timeout leaves the call connected)
       "already connected"                     -- a call is already up (greeting not
                                                  spoken); just talk
       "not answered (declined or no answer)"  -- what you have can wait; do not
@@ -1170,7 +1204,7 @@ async def call(greeting: str, override_quiet_hours: bool = False) -> str:
     Hang up with `hang_up()` only when the owner asks; they can also hang up
     themselves.
     """
-    return await _run(_call_sync, greeting, override_quiet_hours)
+    return await _run(_call_sync, greeting, override_quiet_hours, max_seconds, silence_seconds, start_timeout_seconds)
 
 
 _MAX_DEBUG_LINES = 1000

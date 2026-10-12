@@ -73,6 +73,9 @@ class FakeTelegram:
         return {"daemon": "running", "debug": enabled}
 
 
+GREETING_SAMPLES = int(tg.OPENER_MIN_SECONDS * s.TTS_RATE)
+
+
 class ServerCase(unittest.TestCase):
     def setUp(self):
         self._orig = (s.engines.kokoro, s.engines.ready.is_set(), s.engines.error)
@@ -80,7 +83,7 @@ class ServerCase(unittest.TestCase):
         s.engines.error = None
 
         class Result:
-            audio = np.zeros(2400, dtype=np.float32)
+            audio = np.zeros(GREETING_SAMPLES, dtype=np.float32)   # exactly the opener minimum
 
         class FakeKokoro:
             def generate(self, **kwargs):
@@ -250,36 +253,127 @@ class TestCallExpected(ServerCase):
             s._speak_sync("hi")
 
 
+LISTEN = (5, 1.2, 3)   # max_seconds, silence_seconds, start_timeout_seconds
+
+
+def answered_fake(**kw) -> FakeTelegram:
+    """Daemon that is idle at dial time and connected once the owner answers."""
+    return FakeTelegram([tg.NONE, tg.CONNECTED], **kw)
+
+
+def whisper_says(text):
+    whisper = mock.Mock()
+    whisper.transcribe.return_value = {"text": text}
+    return mock.patch.dict(sys.modules, {"mlx_whisper": whisper})
+
+
 class TestCallTool(ServerCase):
+    def test_answered_speaks_the_greeting_then_listens_and_returns_the_words(self):
+        fake = self.use(answered_fake())
+        with self.at(12, 0), whisper_says("yes, go ahead"):
+            result = s._call_sync("Hey Frank, it's Angie, what's up?", False, *LISTEN)
+        self.assertEqual(result, "answered\nyes, go ahead\n(audio: telegram)")
+        self.assertEqual(fake.ops[0], ("call", GREETING_SAMPLES, s.TTS_RATE))
+        self.assertEqual(fake.ops[1], ("record", 5, 1.2, 3, True, s.TTS_RATE))   # with the ear-open beep
+        # exact sequence: dial, record, then ear-closed cue, rising chime, spoken "Processing"
+        self.assertEqual([op[0] for op in fake.ops], ["call", "record", "play", "play", "play"])
+        self.assertTrue(s._call_expected)
+        self.assertEqual(s._route, "mac")
+
+    def test_greeting_and_listen_hold_the_lock_as_one_unit(self):
+        fake = self.use(answered_fake())
+        seen = []
+        real_call, real_record = fake.call, fake.record
+        fake.call = lambda g, r: seen.append(s.audio_lock.snapshot()[1]) or real_call(g, r)
+        fake.record = lambda *a: seen.append(s.audio_lock.snapshot()[1]) or real_record(*a)
+        with self.at(12, 0), whisper_says("hi"):
+            s._call_sync("Hi, what's up?", False, *LISTEN)
+        self.assertEqual(seen, ["call", "call"])
+        self.assertEqual(s.audio_lock.snapshot()[0], False)
+
+    def test_listen_timeout_raises_and_the_call_stays_connected(self):
+        fake = self.use(answered_fake())
+        fake.record = mock.Mock(side_effect=TimeoutError("nobody spoke"))
+        with self.at(12, 0), whisper_says("x"):
+            with self.assertRaisesRegex(TimeoutError, "nobody spoke"):
+                s._call_sync("Hi, what's up?", False, *LISTEN)
+        # the low timeout cue went into the call as a play op (after the dial), not to the Mac
+        self.assertEqual([op[0] for op in fake.ops], ["call", "play"])
+        self.assertEqual(fake.ops[1][2], s.TTS_RATE)
+        self.assertTrue(s._call_expected)
+        self.assertEqual(s._route, "mac")
+
+    def test_drop_during_the_listen_raises_call_ended(self):
+        fake = FakeTelegram([tg.NONE, tg.CONNECTED, tg.CONNECTED, tg.NONE])
+        self.use(fake)
+        fake.record = mock.Mock(side_effect=RuntimeError("the Telegram call ended during recording"))
+        with self.at(12, 0), whisper_says("x"):
+            with self.assertRaisesRegex(RuntimeError, "Telegram call ended during call; call back"):
+                s._call_sync("Hi, what's up?", False, *LISTEN)
+        self.assertFalse(s._call_expected)
+
+    def test_drop_between_answered_and_the_listen_raises_call_ended(self):
+        fake = self.use(FakeTelegram([tg.NONE, tg.CONNECTED, tg.NONE], end_reason=tg.END_REMOTE))
+        with self.at(12, 0):
+            with self.assertRaisesRegex(RuntimeError, "Telegram call ended during call"):
+                s._call_sync("Hi, what's up?", False, *LISTEN)
+        self.assertEqual([op[0] for op in fake.ops], ["call"])   # never reached the listen
+        self.assertFalse(s._call_expected)
+
+    def test_short_greeting_raises_before_any_dial_op(self):
+        fake = self.use(FakeTelegram([tg.NONE]))
+        short = np.zeros(GREETING_SAMPLES - 1, dtype=np.float32)   # one sample under the minimum
+        with mock.patch.object(s, "_synthesize", return_value=short), self.at(12, 0):
+            with self.assertRaisesRegex(ValueError, r"only 6\.0s.*at least 6s.*Nothing was dialed.*context.*joke"):
+                s._call_sync("Hi.", False, *LISTEN)
+        self.assertEqual(fake.ops, [])
+        self.assertFalse(s._call_expected)
+
+    def test_greeting_at_the_minimum_dials(self):
+        fake = self.use(answered_fake())
+        exact = np.zeros(GREETING_SAMPLES, dtype=np.float32)
+        with mock.patch.object(s, "_synthesize", return_value=exact), self.at(12, 0), whisper_says("hi"):
+            s._call_sync("Hi.", False, *LISTEN)
+        self.assertEqual(fake.ops[0], ("call", GREETING_SAMPLES, s.TTS_RATE))
+
+    def test_quiet_hours_and_already_connected_win_over_a_short_greeting(self):
+        short = np.zeros(10, dtype=np.float32)
+        with mock.patch.object(s, "_synthesize", return_value=short):
+            self.use(FakeTelegram([tg.NONE]))
+            with self.at(23, 30):
+                self.assertEqual(s._call_sync("Hi.", False, *LISTEN), "not called: quiet hours (22:00-07:00)")
+            self.use(FakeTelegram([tg.CONNECTED]))
+            with self.at(12, 0):
+                self.assertEqual(s._call_sync("Hi.", False, *LISTEN), tg.ALREADY_CONNECTED)
+
+    def test_tool_passes_converse_defaults_to_the_listen(self):
+        with mock.patch.object(s, "_call_sync", return_value="answered\nhi\n(audio: telegram)") as m:
+            self.assertEqual(asyncio.run(s.call("Hi, what's up?")), "answered\nhi\n(audio: telegram)")
+        m.assert_called_once_with("Hi, what's up?", False, 120.0, 2.0, 45.0)
+
     def test_quiet_hours_refuse_without_dialing(self):
         fake = self.use(FakeTelegram([tg.NONE]))
         with self.at(23, 30):
-            self.assertEqual(s._call_sync("Hi Frank", False), "not called: quiet hours (22:00-07:00)")
+            self.assertEqual(s._call_sync("Hi Frank", False, *LISTEN), "not called: quiet hours (22:00-07:00)")
         self.assertEqual(fake.ops, [])
 
-    def test_daytime_call_speaks_the_greeting_and_expects_the_call(self):
-        fake = self.use(FakeTelegram([tg.NONE]))
-        with self.at(12, 0):
-            self.assertEqual(s._call_sync("Hi Frank, the backtest finished.", False), tg.ANSWERED)
-        self.assertEqual(fake.ops, [("call", 2400, s.TTS_RATE)])
-        self.assertTrue(s._call_expected)
-
     def test_override_dials_inside_quiet_hours(self):
-        fake = self.use(FakeTelegram([tg.NONE]))
-        with self.at(5, 0):
-            self.assertEqual(s._call_sync("Morning, Frank", True), tg.ANSWERED)
+        fake = self.use(answered_fake())
+        with self.at(5, 0), whisper_says("morning"):
+            self.assertEqual(s._call_sync("Morning, Frank, what's up?", True, *LISTEN), "answered\nmorning\n(audio: telegram)")
         self.assertEqual(fake.ops[0][0], "call")
 
     def test_not_answered_does_not_expect_a_call(self):
-        self.use(FakeTelegram([tg.NONE], outcome=tg.NOT_ANSWERED))
+        fake = self.use(FakeTelegram([tg.NONE], outcome=tg.NOT_ANSWERED))
         with self.at(12, 0):
-            self.assertEqual(s._call_sync("Hi", False), tg.NOT_ANSWERED)
+            self.assertEqual(s._call_sync("Hi", False, *LISTEN), tg.NOT_ANSWERED)
         self.assertFalse(s._call_expected)
+        self.assertNotIn("record", [op[0] for op in fake.ops])   # no listen
 
     def test_already_connected_joins_without_dialing(self):
         fake = self.use(FakeTelegram([tg.CONNECTED]))
         with self.at(12, 0):
-            self.assertEqual(s._call_sync("Hi", False), tg.ALREADY_CONNECTED)
+            self.assertEqual(s._call_sync("Hi", False, *LISTEN), tg.ALREADY_CONNECTED)
         self.assertEqual(fake.ops, [])
         self.assertTrue(s._call_expected)
 
@@ -287,13 +381,13 @@ class TestCallTool(ServerCase):
         self.use(FakeTelegram([NOT_RUNNING]))
         with self.at(12, 0):
             with self.assertRaisesRegex(RuntimeError, "speak-telegram daemon is not running"):
-                s._call_sync("Hi", False)
+                s._call_sync("Hi", False, *LISTEN)
 
     def test_empty_greeting_raises(self):
         self.use(FakeTelegram([tg.NONE]))
         with self.at(12, 0):
             with self.assertRaisesRegex(ValueError, "non-empty greeting"):
-                s._call_sync("   ", False)
+                s._call_sync("   ", False, *LISTEN)
 
     def test_hang_up_clears_the_expectation(self):
         fake = self.use(FakeTelegram([tg.CONNECTED]))
@@ -307,12 +401,12 @@ class TestCallTool(ServerCase):
         self.assertEqual(s._hang_up_sync(), tg.NO_ACTIVE_CALL)
 
     def test_call_and_hang_up_hold_the_audio_lock(self):
-        fake = self.use(FakeTelegram([tg.NONE]))
+        fake = self.use(answered_fake())
         seen = []
         fake.call = lambda g, r: seen.append(s.audio_lock.snapshot()[1]) or tg.ANSWERED
         fake.hang_up = lambda: seen.append(s.audio_lock.snapshot()[1]) or tg.HUNG_UP
-        with self.at(12, 0):
-            s._call_sync("Hi", False)
+        with self.at(12, 0), whisper_says("hi"):
+            s._call_sync("Hi", False, *LISTEN)
         s._hang_up_sync()
         self.assertEqual(seen, ["call", "hang_up"])
 
@@ -324,7 +418,7 @@ class TestCallTool(ServerCase):
         fake_dt.now.side_effect = lambda: order.append("clock") or datetime.datetime(2026, 10, 9, 23, 0)
         with mock.patch.object(s.datetime, "datetime", fake_dt), \
                 mock.patch.object(s.audio_lock, "acquire", side_effect=lambda t: order.append("lock") or real_acquire(t)):
-            s._call_sync("Hi", False)
+            s._call_sync("Hi", False, *LISTEN)
         self.assertEqual(order, ["lock", "clock"])
 
 
@@ -393,7 +487,7 @@ class TestAudioFailedResult(ServerCase):
         out = tg.AUDIO_FAILED_PREFIX + "TelegramServerError"
         fake = self.use(FakeTelegram([tg.NONE], outcome=out))
         with self.at(12, 0):
-            self.assertEqual(s._call_sync("Hi", False), out)
+            self.assertEqual(s._call_sync("Hi", False, *LISTEN), out)
         self.assertFalse(s._call_expected)
         self.assertEqual(fake.ops[0][0], "call")
 
