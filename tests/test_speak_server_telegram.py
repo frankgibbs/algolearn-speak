@@ -370,6 +370,13 @@ class TestCallTool(ServerCase):
         self.assertFalse(s._call_expected)
         self.assertNotIn("record", [op[0] for op in fake.ops])   # no listen
 
+    def test_hung_up_during_greeting_does_not_expect_a_call(self):
+        fake = self.use(FakeTelegram([tg.NONE], outcome=tg.HUNG_UP_DURING_GREETING))
+        with self.at(12, 0):
+            self.assertEqual(s._call_sync("Hi", False, *LISTEN), tg.HUNG_UP_DURING_GREETING)
+        self.assertFalse(s._call_expected)
+        self.assertNotIn("record", [op[0] for op in fake.ops])   # no listen
+
     def test_already_connected_joins_without_dialing(self):
         fake = self.use(FakeTelegram([tg.CONNECTED]))
         with self.at(12, 0):

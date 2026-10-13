@@ -287,11 +287,20 @@ class TestReviewFindings(LinkCase):
         self.assertEqual(self.calls.left, 1)
         self.assertIsNone(self.link._caffeinate)
 
-    def test_hang_up_during_the_greeting_counts_as_not_answered(self):
+    def test_hang_up_during_the_greeting_is_its_own_outcome(self):
         with mock.patch.object(tg, "OPENER_TAIL_SECONDS", 0.5):
             threading.Timer(0.2, self.remote_hang_up).start()
-            self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000), tg.NOT_ANSWERED)
+            self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000), tg.HUNG_UP_DURING_GREETING)
         self.assertEqual(len(self.calls.plays), 1)   # never switched to raw frames
+        self.assertEqual(self.link.state(), tg.NONE)
+        self.assertIn("hung_up_during_greeting", [e["event"] for e in self.link.events.recent(50)])
+
+    def test_hang_up_from_another_session_during_the_greeting_is_hung_up(self):
+        with mock.patch.object(tg, "OPENER_TAIL_SECONDS", 0.5):
+            threading.Timer(0.2, self.link.hang_up).start()
+            self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000), tg.HUNG_UP)
+        self.assertEqual(self.link.state(), tg.NONE)
+        self.assertEqual(self.link.info()["end_reason"], tg.END_HUNG_UP)
 
     def test_hang_up_when_the_library_already_dropped_it(self):
         from pytgcalls.exceptions import NotInCallError
@@ -511,11 +520,12 @@ class TestAudioFailure(AcceptedCase):
     def test_events_tell_the_story(self):
         _call(self.link)
         events = self.link.events.recent(50)
-        self.assertEqual([e["event"] for e in events], ["requested", "ringing", "accepted", "audio_failed", "ended"])
+        self.assertEqual([e["event"] for e in events],
+                         ["requested", "opener_written", "ringing", "accepted", "audio_failed", "ended"])
         self.assertEqual(len({e["call_id"] for e in events}), 1)
-        self.assertEqual(events[3]["error"], "TelegramServerError")
-        self.assertEqual(events[4]["reason"], tg.END_FAILED)
-        self.assertIn("duration_s", events[4])
+        self.assertEqual(events[4]["error"], "TelegramServerError")
+        self.assertEqual(events[5]["reason"], tg.END_FAILED)
+        self.assertIn("duration_s", events[5])
 
 
 class TestServerErrorWithoutAcceptance(LinkCase):
@@ -598,7 +608,9 @@ class TestAnsweredEvents(LinkCase):
     def test_success_path_events(self):
         self.link.call(np.zeros(100, dtype=np.float32), 24000)
         names = [e["event"] for e in self.link.events.recent(50)]
-        self.assertEqual(names[:6], ["requested", "ringing", "answered_media_connected", "recording", "raw_frames", "connected"])
+        names = [n for n in names if not n.startswith("audio_") and n != "opener_written"]
+        self.assertEqual(names[:5], ["requested", "ringing", "answered_media_connected", "recording", "raw_frames"])
+        self.assertEqual(names[5], "connected")
 
     def test_playback_timeline_events(self):
         self.link.call(np.zeros(100, dtype=np.float32), 24000)
@@ -608,3 +620,109 @@ class TestAnsweredEvents(LinkCase):
             self.assertIn(n, names)
         self.assertLess(names.index("connected"), names.index("playback_queued"))
         self.assertLess(names.index("audio_out_start"), names.index("playback_done"))
+
+
+def events_named(link, name):
+    return [e for e in link.events.recent(500) if e["event"] == name]
+
+
+class TestAudioStats(unittest.TestCase):
+    def test_peak_rms_and_zero_frames(self):
+        st = tg.AudioStats()
+        st.add(bytes(tg.FRAME_BYTES))                     # all zero
+        st.add(speech_frames(0.01)[0])                    # 0.3 FS sine
+        f = st.fields()
+        self.assertEqual((f["frames"], f["zero_frames"]), (2, 1))
+        self.assertAlmostEqual(f["peak"], 0.3 * 32767, delta=5)
+        # half the frames are silent, so RMS is 0.3/sqrt(2)/sqrt(2) of full scale
+        self.assertAlmostEqual(f["rms"], 0.3 * 32767 / 2, delta=60)
+        st.reset()
+        self.assertEqual(st.fields()["frames"], 0)
+        self.assertIsNone(st.fields()["peak_dbfs"])
+
+    def test_wav_stats(self):
+        path = os.path.join(tempfile.mkdtemp(prefix="wavstats-"), "o.wav")
+        self.addCleanup(shutil.rmtree, os.path.dirname(path), True)
+        tone = (0.5 * np.sin(2 * np.pi * 440 * np.arange(24000) / 24000)).astype(np.float32)
+        with mock.patch.object(tg, "OPENER_MIN_SECONDS", 0.5):
+            tg.write_opener(path, tone, 24000)
+        st = tg.wav_stats(path)
+        self.assertAlmostEqual(st["peak"], 0.5 * 32767, delta=100)
+        self.assertAlmostEqual(st["rms"], 0.5 * 32767 / 2 ** 0.5, delta=80)
+
+
+class TestAmplitudeEvents(LinkCase):
+    def setUp(self):
+        super().setUp()
+        for name, value in (("STATS_FAST_INTERVAL", 0.05), ("STATS_FAST_SECONDS", 0.2), ("STATS_SLOW_INTERVAL", 0.1)):
+            p = mock.patch.object(tg, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_opener_written_event(self):
+        tone = (0.5 * np.sin(2 * np.pi * 440 * np.arange(2400) / 24000)).astype(np.float32)
+        self.link.call(tone, 24000)
+        (e,) = events_named(self.link, "opener_written")
+        self.assertAlmostEqual(e["duration_s"], 0.1, places=3)
+        self.assertAlmostEqual(e["peak"], 0.5 * 32767, delta=100)
+        self.assertGreater(e["rms"], 1000)
+
+    def test_incoming_summary_counts_all_frames_even_when_not_listening(self):
+        self.link.call(np.zeros(100, dtype=np.float32), 24000)
+        self.push_incoming(speech_frames(0.05, loud=True) + speech_frames(0.03, loud=False))   # not listening
+        self.assertEqual(self.link._incoming.qsize(), 0)
+        self.wait_until(lambda: sum(e["frames"] for e in events_named(self.link, "audio_in")) >= 8)
+        evs = events_named(self.link, "audio_in")
+        self.assertEqual(sum(e["frames"] for e in evs), 8)
+        self.assertEqual(sum(e["zero_frames"] for e in evs), 3)
+        self.assertAlmostEqual(max(e["peak"] for e in evs), 0.3 * 32767, delta=5)
+        for key in ("phase", "window_s", "rms", "peak_dbfs", "rms_dbfs"):
+            self.assertIn(key, evs[0])
+        self.assertEqual(evs[-1]["phase"], "raw")
+
+    def test_summary_is_emitted_even_with_no_frames(self):
+        self.link.call(np.zeros(100, dtype=np.float32), 24000)
+        self.wait_until(lambda: len(events_named(self.link, "audio_in")) >= 3)
+        self.assertTrue(all(e["frames"] == 0 for e in events_named(self.link, "audio_in")))
+
+    def test_outgoing_summary_separates_audio_and_silence(self):
+        self.link.call(np.zeros(100, dtype=np.float32), 24000)
+        tone = (0.3 * np.sin(2 * np.pi * 440 * np.arange(12000) / 24000)).astype(np.float32)   # 0.5 s
+        self.link.play(tone, 24000)
+        self.wait_until(lambda: sum(e["audio_frames"] for e in events_named(self.link, "audio_out")) >= 50)
+        evs = events_named(self.link, "audio_out")
+        self.assertEqual(sum(e["audio_frames"] for e in evs), 50)
+        self.assertEqual(sum(e["frames"] for e in evs), sum(e["audio_frames"] + e["silence_frames"] for e in evs))
+        self.assertGreater(sum(e["silence_frames"] for e in evs), 0)
+        self.assertAlmostEqual(max(e["audio_peak"] for e in evs), 0.3 * 32767, delta=5)
+        self.assertGreater(max(e["audio_rms"] for e in evs), 3000)
+
+    def test_stats_stop_with_the_call_after_a_final_summary(self):
+        self.link.call(np.zeros(100, dtype=np.float32), 24000)
+        self.link.hang_up()
+        n = len(events_named(self.link, "audio_in"))
+        self.assertGreaterEqual(n, 1)
+        time.sleep(0.3)
+        self.assertEqual(len(events_named(self.link, "audio_in")), n)
+        self.assertIsNone(self.link._stats_task)
+
+    def test_opener_phase_probe_reports_not_exposed_when_no_outgoing_frames(self):
+        self.link.call(np.zeros(100, dtype=np.float32), 24000)
+        (e,) = events_named(self.link, "audio_opener_out")
+        self.assertFalse(e["exposed"])
+        self.assertEqual(e["frames"], 0)
+
+    def test_opener_phase_probe_counts_outgoing_frames_if_reported(self):
+        def during_opener():
+            time.sleep(0.005)
+            for f in speech_frames(0.03):
+                self.emit(StreamFrames(USER_ID, Direction.OUTGOING, Device.MICROPHONE, [Frame(1, f, Frame.Info())]))
+        with mock.patch.object(tg, "OPENER_TAIL_SECONDS", 0.3):
+            th = threading.Thread(target=lambda: self.wait_until(lambda: self.link.state() == tg.CONNECTED) or during_opener())
+            th.start()
+            self.link.call(np.zeros(100, dtype=np.float32), 24000)
+            th.join()
+        (e,) = events_named(self.link, "audio_opener_out")
+        self.assertTrue(e["exposed"])
+        self.assertEqual(e["frames"], 3)
+        self.assertAlmostEqual(e["peak"], 0.3 * 32767, delta=5)

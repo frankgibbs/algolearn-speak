@@ -58,11 +58,15 @@ PRE_ROLL_SECONDS = 0.5     # same pre-roll as speak_audio_worker.cmd_record
 HANG_UP_TIMEOUT = 8.0      # leave_call; with disconnect, stays inside launchd's stop window
 DISCONNECT_TIMEOUT = 5.0
 EVENT_BUFFER_SIZE = 500
+STATS_FAST_INTERVAL = 1.0    # amplitude summaries: every second ...
+STATS_FAST_SECONDS = 10.0    # ... for the first 10 s after the call is answered ...
+STATS_SLOW_INTERVAL = 10.0   # ... then every 10 s
 MAX_LAG_EVENTS = 20   # pump_stall events per call, so a stalled call cannot flood the buffer
 
 ANSWERED = "answered"
 ALREADY_CONNECTED = "already connected"
 NOT_ANSWERED = "not answered (declined or no answer)"
+HUNG_UP_DURING_GREETING = "answered, then hung up during the greeting"
 AUDIO_FAILED_PREFIX = "answered but audio failed to connect: "
 HUNG_UP = "hung up"
 NO_ACTIVE_CALL = "no active call"
@@ -106,6 +110,63 @@ class CallEventLog:
     def recent(self, n: int) -> list[dict]:
         with self._lock:
             return list(self._events)[-n:]
+
+
+def dbfs(level: float) -> float | None:
+    """int16 amplitude -> dB relative to full scale; None for exact silence."""
+    return round(20 * np.log10(level / 32768.0), 1) if level > 0 else None
+
+
+class AudioStats:
+    """Peak / RMS / frame counts over a window of s16le frames. add() runs every 10 ms, so it only
+    views the existing bytes (np.frombuffer) and makes one small float temporary."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.frames = self.zero_frames = 0
+        self.peak = 0
+        self._sumsq = 0.0
+        self._samples = 0
+
+    def add(self, data: bytes) -> None:
+        a = np.frombuffer(data, dtype=np.int16, count=len(data) // 2)
+        self.frames += 1
+        if a.size == 0:
+            self.zero_frames += 1
+            return
+        hi, lo = int(a.max()), int(a.min())
+        peak = max(hi, -lo)
+        if peak == 0:
+            self.zero_frames += 1
+            return
+        self.peak = max(self.peak, peak)
+        f = a.astype(np.float32)
+        self._sumsq += float(np.dot(f, f))
+        self._samples += a.size
+
+    @property
+    def rms(self) -> float:
+        # Zero frames contribute samples of 0 to the mean, so count them in the denominator.
+        n = self._samples + (self.zero_frames * (FRAME_BYTES // 2))
+        return float(np.sqrt(self._sumsq / n)) if n else 0.0
+
+    def fields(self, prefix: str = "") -> dict:
+        rms = self.rms
+        return {f"{prefix}frames": self.frames, f"{prefix}zero_frames": self.zero_frames,
+                f"{prefix}peak": self.peak, f"{prefix}peak_dbfs": dbfs(self.peak),
+                f"{prefix}rms": round(rms, 1), f"{prefix}rms_dbfs": dbfs(rms)}
+
+
+def wav_stats(path: str) -> dict:
+    """Peak / RMS of a 16-bit WAV file (the opener), over the whole file."""
+    with wave.open(path, "rb") as w:
+        data = w.readframes(w.getnframes())
+    a = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+    peak = int(np.abs(a).max()) if a.size else 0
+    rms = float(np.sqrt(np.mean(a * a))) if a.size else 0.0
+    return {"peak": peak, "peak_dbfs": dbfs(peak), "rms": round(rms, 1), "rms_dbfs": dbfs(rms)}
 
 
 def to_call_pcm(audio: np.ndarray, rate: int) -> bytes:
@@ -197,6 +258,15 @@ class TelegramLink:
         self._call_id: str | None = None
         self._call_t0 = 0.0
         self._accepted = False   # Telegram confirmed the callee accepted this call (see _start)
+        # Amplitude diagnostics (all touched on the loop thread only).
+        self._phase = "opener"                # "opener" until the switch to raw frames, then "raw"
+        self._in_stats = AudioStats()         # every incoming frame, listening or not
+        self._out_stats = AudioStats()        # every frame the pump sends
+        self._out_audio_stats = AudioStats()  # only the pump frames carrying queued audio
+        self._out_silence_frames = 0
+        self._opener_out_stats = AudioStats() # outgoing frames py-tgcalls reports during the opener file
+        self._stats_task: asyncio.Task | None = None
+        self._stats_t = 0.0
 
     def _event(self, event: str, **fields) -> None:
         """Record a call event for the current call (elapsed seconds since it was requested)."""
@@ -223,12 +293,21 @@ class TelegramLink:
         async def on_update(_, update):
             if isinstance(update, StreamFrames):
                 if update.chat_id == self._user_id and update.direction & Direction.INCOMING \
-                        and update.device & Device.MICROPHONE and self._listening:
-                    if not self._incoming_seen:
-                        self._incoming_seen = True
-                        self._event("first_incoming_frame")
+                        and update.device & Device.MICROPHONE:
+                    if self._state == CONNECTED:
+                        for f in update.frames:
+                            self._in_stats.add(f.frame)
+                    if self._listening:
+                        if not self._incoming_seen:
+                            self._incoming_seen = True
+                            self._event("first_incoming_frame")
+                        for f in update.frames:
+                            self._incoming.put(f.frame)
+                elif update.chat_id == self._user_id and update.direction & Direction.OUTGOING \
+                        and update.device & Device.MICROPHONE and self._state == CONNECTED and self._phase == "opener":
+                    # Probe: does ntgcalls report the frames of the opener FILE? (audio_opener_out says.)
                     for f in update.frames:
-                        self._incoming.put(f.frame)
+                        self._opener_out_stats.add(f.frame)
             elif isinstance(update, ChatUpdate) and update.chat_id == self._user_id:
                 self._event("chat_update", status=str(update.status))
                 if update.status & (ChatUpdate.Status.DISCARDED_CALL | ChatUpdate.Status.LEFT_CALL | ChatUpdate.Status.BUSY_CALL):
@@ -302,6 +381,7 @@ class TelegramLink:
         self._event("ended", reason=reason, duration_s=round(time.monotonic() - self._call_t0, 3))
         self._ended.set()
         self._listening = False
+        self._stop_stats()
         self._outgoing.clear()
         self._drained.set()
         if self._pump_task is not None:
@@ -348,8 +428,13 @@ class TelegramLink:
             self._ended.clear()
             self._incoming_seen = False
             self._accepted = False
+            self._phase = "opener"
+            for st in (self._in_stats, self._out_stats, self._out_audio_stats, self._opener_out_stats):
+                st.reset()
+            self._out_silence_frames = 0
             self._call_id, self._call_t0 = uuid.uuid4().hex[:8], time.monotonic()
             self._event("requested", generation=self._generation, target=self.target)
+            self._event("opener_written", duration_s=round(opener_seconds, 3), **wav_stats(opener))
             self._state = RINGING
             self._event("ringing", ring_timeout_s=RING_TIMEOUT_SECONDS)
             self._ring_task = asyncio.current_task()
@@ -382,20 +467,24 @@ class TelegramLink:
             # half-built call with no pump.
             try:
                 self._state = CONNECTED
+                self._start_stats()
                 self._caffeinate = subprocess.Popen([self._caffeinate_cmd, "-i", "-w", str(os.getpid())],
                                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 await self._calls.record(self._user_id, RecordStream(audio=True, audio_parameters=params))
                 self._event("recording", opener_s=round(opener_seconds, 3))
                 await asyncio.sleep(opener_seconds + OPENER_TAIL_SECONDS)
                 if self._ended.is_set():
-                    # Hung up during the greeting: treat it as a decline (the session then waits an hour).
-                    return NOT_ANSWERED
+                    return self._ended_during_greeting()
+                self._emit_audio_stats()   # closes the opener phase's window
+                self._event("audio_opener_out", exposed=self._opener_out_stats.frames > 0,
+                            **self._opener_out_stats.fields())
+                self._phase = "raw"
                 await self._calls.play(self._user_id, MediaStream(ExternalMedia.AUDIO, params))
                 self._event("raw_frames")
                 if self._ended.is_set():
                     # Ended while switching; py-tgcalls may have re-dialed, so make sure nothing is left up.
                     await self._leave()
-                    return NOT_ANSWERED
+                    return self._ended_during_greeting()
                 self._pump_task = asyncio.create_task(self._pump())
                 self._pump_task.add_done_callback(self._pump_done)
             except ntgcalls.TelegramServerError as e:   # the callee accepted (play() returned): a media-connect failure
@@ -410,6 +499,49 @@ class TelegramLink:
         self._event("connected")
         log.info("call %d connected; raw-frame pump running", self._generation)
         return ANSWERED
+
+    # ------------------------------------------------------------ amplitude diagnostics
+
+    def _start_stats(self) -> None:
+        self._stats_t = time.monotonic()
+        self._stats_task = asyncio.create_task(self._stats_loop())
+
+    def _stop_stats(self) -> None:
+        """Final summary, then stop the reporter (a no-op when it never started)."""
+        if self._stats_task is not None:
+            self._emit_audio_stats()
+            self._stats_task.cancel()
+            self._stats_task = None
+
+    async def _stats_loop(self) -> None:
+        t0 = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - t0
+            await asyncio.sleep(STATS_FAST_INTERVAL if elapsed < STATS_FAST_SECONDS else STATS_SLOW_INTERVAL)
+            self._emit_audio_stats()
+
+    def _emit_audio_stats(self) -> None:
+        """audio_in / audio_out events for the window since the last one, then reset the window."""
+        now = time.monotonic()
+        window = round(now - self._stats_t, 3)
+        self._stats_t = now
+        self._event("audio_in", phase=self._phase, window_s=window, **self._in_stats.fields())
+        self._event("audio_out", phase=self._phase, window_s=window, audio_frames=self._out_audio_stats.frames,
+                    silence_frames=self._out_silence_frames, **self._out_stats.fields(),
+                    **{"audio_" + k: v for k, v in self._out_audio_stats.fields().items() if k != "frames"})
+        for st in (self._in_stats, self._out_stats, self._out_audio_stats):
+            st.reset()
+        self._out_silence_frames = 0
+
+    def _ended_during_greeting(self):
+        """Outcome of a call that ended before the greeting finished. A hang_up from this
+        side (another session) is HUNG_UP, so nobody re-dials; only the owner ending it
+        is its own outcome, not a decline (owner decision 2026-10-12)."""
+        if self._end_reason == END_HUNG_UP:
+            self._event("hung_up_by_us_during_greeting")
+            return HUNG_UP
+        self._event("hung_up_during_greeting")
+        return HUNG_UP_DURING_GREETING
 
     async def _audio_failed(self, error: BaseException) -> str:
         """The owner answered but the media connection failed (ntgcalls.TelegramServerError etc.):
@@ -452,7 +584,8 @@ class TelegramLink:
         start, n = time.monotonic(), 0
         first_sent, lag_events, was_sending = False, 0, False
         while True:
-            if self._outgoing:
+            sending = bool(self._outgoing)
+            if sending:
                 if not was_sending:
                     self._event("audio_out_start", queued_ms=len(self._outgoing) // FRAME_BYTES * 10)
                 was_sending = True
@@ -466,6 +599,11 @@ class TelegramLink:
                 was_sending = False
                 frame = silence
             await self._calls.send_frame(self._user_id, Device.MICROPHONE, frame)
+            self._out_stats.add(frame)
+            if sending:
+                self._out_audio_stats.add(frame)
+            else:
+                self._out_silence_frames += 1
             if not first_sent:
                 first_sent = True
                 self._event("first_frame_sent")

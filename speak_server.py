@@ -1181,6 +1181,15 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
                                                  spoken); just talk
       "not answered (declined or no answer)"  -- what you have can wait; do not
                                                  call again for at least one hour
+      "answered, then hung up during the greeting"
+                                              -- they picked up but ended the call before
+                                                 the greeting finished (often because they
+                                                 heard nothing). You may place ONE new call
+                                                 right away; if that one also ends this way
+                                                 or is not answered, wait an hour.
+      "hung up"                               -- another session's hang_up ended the call
+                                                 during the greeting (the owner asked for
+                                                 it); do not call again
       "not called: quiet hours (22:00-07:00)" -- nothing was dialed; no calls in
                                                  that window
       "answered but audio failed to connect: <error type/message>"

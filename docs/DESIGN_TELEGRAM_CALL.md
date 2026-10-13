@@ -94,7 +94,7 @@ speak server (one per session)                 speak-telegram daemon (one per Ma
 |---|---|---|
 | `ping` | none | liveness |
 | `state` | none | returns the state (`none`, `ringing` or `connected`), the call's generation number, and how the last call ended (`remote`, `hung_up`, `failed` or `not_answered`) |
-| `call` | the opening greeting, 24 kHz float32 | dials, plays the greeting file, switches to raw frames; replies `answered`, `not answered` or `busy` |
+| `call` | the opening greeting, 24 kHz float32 | dials, plays the greeting file, switches to raw frames; replies `answered`, `not answered`, `answered, then hung up during the greeting` (the owner ended it), `hung up` (a `hang_up` request ended it during the greeting), `answered but audio failed to connect: <error>` or `busy` |
 | `play` | PCM at a given rate | resamples to 48 kHz stereo, queues it on the pump, replies once it has gone out |
 | `record` | an ear-open cue, plus VAD parameters | plays the cue, then runs Silero on incoming audio with the speak server's rules; replies with the 16 kHz capture, or `timeout` |
 | `hang_up` | none | ends the call |
@@ -141,8 +141,11 @@ nobody expects, and queued audio never plays after a timeout error. Hanging
 up while it rings cancels the ring first, because the ringing `play()` holds
 py-tgcalls' per-chat lock.
 
-**Decision: a hang-up during the greeting counts as `not answered`,** so the
-session waits an hour instead of calling straight back.
+**Owner decision (2026-10-12): a hang-up during the greeting is its own
+outcome,** `answered, then hung up during the greeting`, not `not answered`
+(this replaces the earlier decision that counted it as a decline). The
+session may place one new call right away; if that call also ends during the
+greeting or is not answered, it waits an hour.
 
 **Decision: `call` takes the opening sentence.** The model passes what it is
 calling about, for example "Hi Frank, it's Angie, the backtest finished. Got a minute?".
@@ -180,6 +183,7 @@ no padding path exists.
   - `answered\n<their words>\n(audio: telegram)`
   - `already connected`
   - `not answered (declined or no answer)`
+  - `answered, then hung up during the greeting`
   - `not called: quiet hours (22:00-07:00)`
 
   It raises if the daemon isn't running. No "Mac is locked" outcome is
@@ -224,6 +228,8 @@ Unchanged **Owner decisions** from 2026-10-08:
 - No calls 22:00–07:00 local, every day (`SPEAK_QUIET_HOURS`). Override only
   when the owner has said in the conversation that they are up.
 - After `not answered`, the session may retry after one hour.
+- After `answered, then hung up during the greeting`, the session may call
+  back once right away (owner decision 2026-10-12).
 - The Mac does not read Focus state. During the day the phone's Focus
   decides whether it rings.
 - A Telegram text channel for "anything waiting?" is a separate piece,
