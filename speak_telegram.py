@@ -258,7 +258,10 @@ class TelegramLink:
         self._call_id: str | None = None
         self._call_t0 = 0.0
         self._accepted = False   # Telegram confirmed the callee accepted this call (see _start)
-        # Amplitude diagnostics (all touched on the loop thread only).
+        # Amplitude diagnostics (all touched on the loop thread only). Frames are always counted;
+        # the events are recorded only while debug is on (set_debug sets audio_stats), so they can't
+        # crowd a long call's own events out of the ring (owner decision 2026-10-12: reactive debugging).
+        self.audio_stats = False
         self._phase = "opener"                # "opener" until the switch to raw frames, then "raw"
         self._in_stats = AudioStats()         # every incoming frame, listening or not
         self._out_stats = AudioStats()        # every frame the pump sends
@@ -434,7 +437,8 @@ class TelegramLink:
             self._out_silence_frames = 0
             self._call_id, self._call_t0 = uuid.uuid4().hex[:8], time.monotonic()
             self._event("requested", generation=self._generation, target=self.target)
-            self._event("opener_written", duration_s=round(opener_seconds, 3), **wav_stats(opener))
+            if self.audio_stats:
+                self._event("opener_written", duration_s=round(opener_seconds, 3), **wav_stats(opener))
             self._state = RINGING
             self._event("ringing", ring_timeout_s=RING_TIMEOUT_SECONDS)
             self._ring_task = asyncio.current_task()
@@ -476,8 +480,9 @@ class TelegramLink:
                 if self._ended.is_set():
                     return self._ended_during_greeting()
                 self._emit_audio_stats()   # closes the opener phase's window
-                self._event("audio_opener_out", exposed=self._opener_out_stats.frames > 0,
-                            **self._opener_out_stats.fields())
+                if self.audio_stats:
+                    self._event("audio_opener_out", exposed=self._opener_out_stats.frames > 0,
+                                **self._opener_out_stats.fields())
                 self._phase = "raw"
                 await self._calls.play(self._user_id, MediaStream(ExternalMedia.AUDIO, params))
                 self._event("raw_frames")
@@ -521,14 +526,16 @@ class TelegramLink:
             self._emit_audio_stats()
 
     def _emit_audio_stats(self) -> None:
-        """audio_in / audio_out events for the window since the last one, then reset the window."""
+        """audio_in / audio_out events (while audio_stats is on) for the window since the last one,
+        then reset the window."""
         now = time.monotonic()
         window = round(now - self._stats_t, 3)
         self._stats_t = now
-        self._event("audio_in", phase=self._phase, window_s=window, **self._in_stats.fields())
-        self._event("audio_out", phase=self._phase, window_s=window, audio_frames=self._out_audio_stats.frames,
-                    silence_frames=self._out_silence_frames, **self._out_stats.fields(),
-                    **{"audio_" + k: v for k, v in self._out_audio_stats.fields().items() if k != "frames"})
+        if self.audio_stats:
+            self._event("audio_in", phase=self._phase, window_s=window, **self._in_stats.fields())
+            self._event("audio_out", phase=self._phase, window_s=window, audio_frames=self._out_audio_stats.frames,
+                        silence_frames=self._out_silence_frames, **self._out_stats.fields(),
+                        **{"audio_" + k: v for k, v in self._out_audio_stats.fields().items() if k != "frames"})
         for st in (self._in_stats, self._out_stats, self._out_audio_stats):
             st.reset()
         self._out_silence_frames = 0

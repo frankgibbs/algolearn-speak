@@ -188,6 +188,7 @@ class _Handler(socketserver.BaseRequestHandler):
             if not isinstance(req.get("enabled"), bool):
                 raise ValueError(f"enabled must be a boolean, got {req.get('enabled')!r}")
             daemon.debug.set(req["enabled"])
+            link.audio_stats = req["enabled"]   # audio-level events only while debugging
             return {"ok": True, "daemon": "running", "debug": daemon.debug.enabled}, b""
         if op == "call":
             return {"ok": True, "outcome": link.call(_f32(payload), req["rate"])}, b""

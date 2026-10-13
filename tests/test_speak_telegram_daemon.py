@@ -204,7 +204,9 @@ class TestDebugOps(DaemonCase):
         for n in names:
             self.assertEqual(logging.getLogger(n).level, logging.DEBUG)
         self.assertTrue(self.client.debug(1)["debug"])
+        self.assertTrue(self.link.audio_stats)
         self.assertEqual(self.client.set_debug(False), {"daemon": "running", "debug": False})
+        self.assertFalse(self.link.audio_stats)
         for n in names:
             self.assertEqual(logging.getLogger(n).level, before[n])
 

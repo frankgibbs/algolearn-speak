@@ -521,11 +521,11 @@ class TestAudioFailure(AcceptedCase):
         _call(self.link)
         events = self.link.events.recent(50)
         self.assertEqual([e["event"] for e in events],
-                         ["requested", "opener_written", "ringing", "accepted", "audio_failed", "ended"])
+                         ["requested", "ringing", "accepted", "audio_failed", "ended"])
         self.assertEqual(len({e["call_id"] for e in events}), 1)
-        self.assertEqual(events[4]["error"], "TelegramServerError")
-        self.assertEqual(events[5]["reason"], tg.END_FAILED)
-        self.assertIn("duration_s", events[5])
+        self.assertEqual(events[3]["error"], "TelegramServerError")
+        self.assertEqual(events[4]["reason"], tg.END_FAILED)
+        self.assertIn("duration_s", events[4])
 
 
 class TestServerErrorWithoutAcceptance(LinkCase):
@@ -658,6 +658,22 @@ class TestAmplitudeEvents(LinkCase):
             p = mock.patch.object(tg, name, value)
             p.start()
             self.addCleanup(p.stop)
+        self.link.audio_stats = True
+
+    def test_no_audio_events_while_debug_is_off(self):
+        self.link.audio_stats = False
+        self.link.call(np.zeros(100, dtype=np.float32), 24000)
+        self.push_incoming(speech_frames(0.05, loud=True))
+        time.sleep(0.3)
+        self.link.hang_up()
+        names = {e["event"] for e in self.link.events.recent(500)}
+        self.assertFalse(names & {"opener_written", "audio_in", "audio_out", "audio_opener_out"})
+
+    def test_turning_it_on_mid_call_starts_the_events(self):
+        self.link.audio_stats = False
+        self.link.call(np.zeros(100, dtype=np.float32), 24000)
+        self.link.audio_stats = True
+        self.wait_until(lambda: len(events_named(self.link, "audio_in")) >= 1)
 
     def test_opener_written_event(self):
         tone = (0.5 * np.sin(2 * np.pi * 440 * np.arange(2400) / 24000)).astype(np.float32)

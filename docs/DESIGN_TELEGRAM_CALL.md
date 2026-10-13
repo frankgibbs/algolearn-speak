@@ -228,8 +228,14 @@ Unchanged **Owner decisions** from 2026-10-08:
 - No calls 22:00–07:00 local, every day (`SPEAK_QUIET_HOURS`). Override only
   when the owner has said in the conversation that they are up.
 - After `not answered`, the session may retry after one hour.
-- After `answered, then hung up during the greeting`, the session may call
-  back once right away (owner decision 2026-10-12).
+- Owner decision (2026-10-12): whenever the owner hangs up, during the
+  greeting (`answered, then hung up during the greeting`) or mid-conversation
+  (`Telegram call ended during ...`), the session calls back once right away.
+  If that call is not answered, the owner is busy and the one-hour rule applies.
+- Owner decision (2026-10-12): debugging is reactive. The audio-level events
+  (`opener_written`, `audio_in`, `audio_out`, `audio_opener_out`) are recorded
+  only while `set_debug` is on; a session that suspects a bad call turns debug
+  on, calls again, and turns it off once calls work.
 - The Mac does not read Focus state. During the day the phone's Focus
   decides whether it rings.
 - A Telegram text channel for "anything waiting?" is a separate piece,

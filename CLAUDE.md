@@ -81,9 +81,17 @@ phone has signal, with the Mac locked or unlocked, outbound-only networking.
   timestamps, state transitions, errors, duration) to a 500-entry ring buffer and
   the log; `call_debug` / `set_call_debug` read it and toggle DEBUG logging over
   the daemon socket (ops `debug`, `set_debug`), without the audio lock.
+  **Debugging is reactive (owner decision 2026-10-12):** `set_call_debug(True)`
+  also turns on the audio-level events (`opener_written`, `audio_in`,
+  `audio_out`, `audio_opener_out`: per-window peak/RMS dBFS each way); with debug
+  off they are not recorded. When a call seems off, turn debug on and call
+  again; turn it off once calls work.
 - **Quiet hours:** `call` refuses 22:00-07:00 local (`SPEAK_QUIET_HOURS`)
   unless `override_quiet_hours=True`, used only when the owner said they are
-  up. After `not answered`, wait an hour before calling again; after a hang-up during the greeting, one immediate call back is allowed.
+  up. After `not answered`, wait an hour before calling again. If the owner hangs up
+  at any point (during the greeting or mid-conversation), call back once right
+  away; if that call is not answered, they are busy: wait an hour (owner
+  decision 2026-10-12).
 - **Pins:** `telethon==1.45.0`, `py-tgcalls==3.0.0`, `ntgcalls==3.0.2`; the
   private-call API is undocumented, so upgrade only deliberately, with a re-test.
 - Tests: `tests/test_speak_telegram.py` (link vs fake py-tgcalls),
