@@ -47,7 +47,7 @@ KIND_TIMEOUT, KIND_VALUE, KIND_CALL_ENDED, KIND_RUNTIME = "timeout", "value", "c
 ANSWERED = "answered"
 ALREADY_CONNECTED = "already connected"
 NOT_ANSWERED = "not answered (declined or no answer)"
-BUSY = "busy (the owner's Telegram is on another call, or still ending the previous one)"
+BUSY = "busy (the owner's Telegram reports a call in progress)"
 HUNG_UP_DURING_GREETING = "answered, then hung up during the greeting"
 AUDIO_FAILED_PREFIX = "answered but audio failed to connect: "
 HUNG_UP = "hung up"
@@ -63,7 +63,7 @@ RING_TIMEOUT_SECONDS = 60
 # hang_up got CallBusy and then left the owner's Telegram app silently dropping every incoming
 # call (half-second ring, no discard sent) until it was force-quit; a redial 10 s after
 # hang_up rang and was answered (2026-10-15).
-REDIAL_GAP_SECONDS = 10.0
+REDIAL_SETTLE_SECONDS = 10.0
 CONNECT_GRACE_SECONDS = 30   # py-tgcalls waits for the media connection with no timeout of its own
 OPENER_MIN_SECONDS = 6.0     # 2 s failed, 6 s worked (2026-10-09). The one definition: the daemon rejects shorter greetings before dialing, write_opener raises on them
 

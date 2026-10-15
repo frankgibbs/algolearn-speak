@@ -183,12 +183,13 @@ no padding path exists.
   - `answered\n<their words>\n(audio: telegram)`
   - `already connected`
   - `not answered (declined or no answer)`
-  - `busy (the owner's Telegram is on another call, or still ending the previous one)`
+  - `busy (the owner's Telegram reports a call in progress)`
   - `answered, then hung up during the greeting`
   - `not called: quiet hours (22:00-07:00)`
 
-  The daemon never dials within 10 s (`REDIAL_GAP_SECONDS`) of the previous
-  call ending; a call placed sooner waits out the gap. Verified 2026-10-15: a
+  Owner decision 2026-10-15: the daemon never dials within 10 s
+  (`REDIAL_SETTLE_SECONDS`) of the previous call ending, whatever the reason; a
+  call placed sooner waits out the rest of those 10 s, then dials. Verified 2026-10-15: a
   redial 1.4 s after `hang_up` got `CallBusy`, and the owner's Telegram app
   then rang every new call for half a second and dropped it without sending
   a discard (the daemon saw only a 60 s ring-out) until the app was

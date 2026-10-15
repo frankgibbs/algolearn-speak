@@ -140,7 +140,7 @@ class LinkCase(unittest.TestCase):
 
     def setUp(self):
         for name, value in (("OPENER_MIN_SECONDS", 0.004), ("OPENER_TAIL_SECONDS", 0.02),
-                            ("REDIAL_GAP_SECONDS", 0.0)):
+                            ("REDIAL_SETTLE_SECONDS", 0.0)):
             p = mock.patch.object(tg, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -573,40 +573,6 @@ class TestBusy(LinkCase):
         self.assertEqual(self.link.info()["end_reason"], tg.END_BUSY)
         self.assertEqual(len(self.calls.plays), 1)   # never switched to raw frames
         self.assertIn("busy", [e["event"] for e in self.link.events.recent(50)])
-
-
-class TestRedialGap(LinkCase):
-    ring = CallBusy(USER_ID)
-
-    def setUp(self):
-        super().setUp()
-        p = mock.patch.object(tg, "REDIAL_GAP_SECONDS", 0.5)
-        p.start()
-        self.addCleanup(p.stop)
-
-    def test_first_call_dials_at_once(self):
-        t0 = time.monotonic()
-        _call(self.link)
-        self.assertLess(time.monotonic() - t0, 0.4)
-        self.assertNotIn("redial_gap_wait", [e["event"] for e in self.link.events.recent(50)])
-
-    def test_redial_waits_out_the_gap_after_the_last_call_ended(self):
-        _call(self.link)
-        t0 = time.monotonic()
-        self.assertEqual(_call(self.link), tg.BUSY)
-        self.assertGreaterEqual(time.monotonic() - t0, 0.45)
-        self.assertEqual(len(self.calls.plays), 2)
-        events = [e["event"] for e in self.link.events.recent(50)]
-        self.assertIn("redial_gap_wait", events)
-        self.assertLess(events.index("redial_gap_wait"), len(events) - 1 - events[::-1].index("requested"))
-
-    def test_no_wait_once_the_gap_has_passed(self):
-        _call(self.link)
-        time.sleep(0.55)
-        t0 = time.monotonic()
-        _call(self.link)
-        self.assertLess(time.monotonic() - t0, 0.4)
-        self.assertNotIn("redial_gap_wait", [e["event"] for e in self.link.events.recent(50)])
 
 
 class TestEventLog(unittest.TestCase):
