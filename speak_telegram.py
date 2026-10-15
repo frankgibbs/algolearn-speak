@@ -3,8 +3,8 @@ to the owner, driven by raw PCM (docs/DESIGN_TELEGRAM_CALL.md sections 2-4, 8).
 
 `TelegramLink` owns the Telethon client, py-tgcalls and at most one call, on its
 own asyncio loop in a background thread. Its public methods are synchronous and
-thread-safe (the speak-telegram daemon calls them from its socket threads).
-Instantiated only by speak_telegram_daemon.py; the speak servers never import
+thread-safe (the speak daemon calls them from its request threads).
+Instantiated only by speak_telegram_daemon.py; the thin MCP client never imports
 Telethon or ntgcalls.
 
 Built around what the 2026-10-09 spike verified:
@@ -19,8 +19,9 @@ Built around what the 2026-10-09 spike verified:
 
 Every call has a generation number and, once over, an end reason: "remote"
 (the owner hung up or the call dropped), "hung_up" (our hang_up), "failed" (an
-error tore it down) or "not_answered". Speak servers compare these to decide
-whether a call they were using dropped (call back) or was hung up on request.
+error tore it down) or "not_answered". The daemon compares these with a session's
+expected generation to decide whether a call it was using dropped (call back) or
+was hung up on request.
 """
 
 from __future__ import annotations
@@ -31,7 +32,6 @@ import datetime
 import logging
 import os
 import queue
-import subprocess
 import tempfile
 import threading
 import time
@@ -43,19 +43,22 @@ import ntgcalls
 import numpy as np
 from scipy.signal import resample_poly
 
+from speak_protocol import (  # noqa: F401  (re-exported: the daemon and tests use tg.<name>)
+    ALREADY_CONNECTED, ANSWERED, AUDIO_FAILED_PREFIX, CONNECT_GRACE_SECONDS, CONNECTED, END_FAILED,
+    END_HUNG_UP, END_NOT_ANSWERED, END_REMOTE, HUNG_UP, HUNG_UP_DURING_GREETING, NO_ACTIVE_CALL, NONE,
+    NOT_ANSWERED, OPENER_MIN_SECONDS, RING_TIMEOUT_SECONDS, RINGING, is_audio_failure,
+)
+
 log = logging.getLogger("speak.telegram")
 
 CALL_RATE, CALL_CHANNELS = 48_000, 2
 FRAME_BYTES = CALL_RATE // 100 * 2 * CALL_CHANNELS   # 10 ms of s16le stereo
 VAD_RATE, VAD_BLOCK = 16_000, 512                    # Silero contract (32 ms)
 NATIVE_BLOCK = VAD_BLOCK * CALL_RATE // VAD_RATE     # 1536 samples at 48 kHz
-OPENER_MIN_SECONDS = 6.0   # 2 s failed, 6 s worked (2026-10-09). The one definition: speak_server rejects shorter greetings before dialing, write_opener raises on them
 OPENER_TAIL_SECONDS = 1.0  # wait after the opener file before switching to raw frames
-RING_TIMEOUT_SECONDS = 60
-CONNECT_GRACE_SECONDS = 30  # py-tgcalls waits for the media connection with no timeout of its own
 PUMP_MAX_LAG = 0.05        # behind by more than this -> reset the clock instead of bursting
 PRE_ROLL_SECONDS = 0.5     # audio kept from just before speech starts
-HANG_UP_TIMEOUT = 8.0      # leave_call; with disconnect, stays inside launchd's stop window
+HANG_UP_TIMEOUT = 8.0      # leave_call; with disconnect, stays inside compose's stop_grace_period
 DISCONNECT_TIMEOUT = 5.0
 EVENT_BUFFER_SIZE = 500
 STATS_FAST_INTERVAL = 1.0    # amplitude summaries: every second ...
@@ -63,25 +66,11 @@ STATS_FAST_SECONDS = 10.0    # ... for the first 10 s after the call is answered
 STATS_SLOW_INTERVAL = 10.0   # ... then every 10 s
 MAX_LAG_EVENTS = 20   # pump_stall events per call, so a stalled call cannot flood the buffer
 
-ANSWERED = "answered"
-ALREADY_CONNECTED = "already connected"
-NOT_ANSWERED = "not answered (declined or no answer)"
-HUNG_UP_DURING_GREETING = "answered, then hung up during the greeting"
-AUDIO_FAILED_PREFIX = "answered but audio failed to connect: "
-HUNG_UP = "hung up"
-NO_ACTIVE_CALL = "no active call"
 TIMEOUT = object()   # record(): nobody spoke within start_timeout_seconds
-
-NONE, RINGING, CONNECTED = "none", "ringing", "connected"
-END_REMOTE, END_HUNG_UP, END_FAILED, END_NOT_ANSWERED = "remote", "hung_up", "failed", "not_answered"
 
 
 class CallEnded(RuntimeError):
     pass
-
-
-def is_audio_failure(outcome: str) -> bool:
-    return outcome.startswith(AUDIO_FAILED_PREFIX)
 
 
 def describe(error: BaseException) -> str:
@@ -92,7 +81,7 @@ def describe(error: BaseException) -> str:
 class CallEventLog:
     """Thread-safe in-memory ring buffer of structured call events (newest last).
 
-    Every event also goes to the daemon log at INFO, so launchd's log file carries the
+    Every event also goes to the daemon log at INFO, so the container log carries the
     same record. Fields: ts (local ISO), call_id, event, plus event-specific extras."""
 
     def __init__(self, size: int = EVENT_BUFFER_SIZE) -> None:
@@ -180,7 +169,7 @@ def to_call_pcm(audio: np.ndarray, rate: int) -> bytes:
 def write_opener(path: str, audio: np.ndarray, rate: int) -> float:
     """The greeting as a 48 kHz mono WAV. Returns its length. Raises ValueError if it is shorter than
     OPENER_MIN_SECONDS: a short opener gives a dead call, and padding it would leave dead air after the
-    greeting's question. speak_server rejects short greetings before dialing, so this is a backstop."""
+    greeting's question. The daemon's call op rejects short greetings before dialing, so this is a backstop."""
     audio = np.asarray(audio, dtype=np.float32).reshape(-1)
     up = resample_poly(audio, CALL_RATE, rate) if rate != CALL_RATE else audio
     s16 = (np.clip(up, -1.0, 1.0) * 32767).astype(np.int16)
@@ -229,14 +218,12 @@ class TelegramLink:
         calls_factory: Callable,
         vad_factory: Callable = silero_vad_factory,
         vad_preload: Callable = preload_silero_vad,
-        caffeinate: str = "caffeinate",
     ) -> None:
         self.target = target
         self._client_factory = client_factory
         self._calls_factory = calls_factory
         self._vad_factory = vad_factory
         self._vad_preload = vad_preload
-        self._caffeinate_cmd = caffeinate
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, name="telegram-loop", daemon=True)
         self._client = None
@@ -250,7 +237,6 @@ class TelegramLink:
         self._drained: asyncio.Event | None = None
         self._pump_task: asyncio.Task | None = None
         self._ring_task: asyncio.Task | None = None
-        self._caffeinate: subprocess.Popen | None = None
         self._incoming: queue.Queue[bytes] = queue.Queue()
         self._listening = False
         self.events = CallEventLog()
@@ -335,7 +321,7 @@ class TelegramLink:
         self._calls._handle_mtproto_updates = observe_mtproto
 
         # connect() + is_user_authorized(), not start(): start() would prompt on stdin for a
-        # phone number if the session were revoked, which under launchd loops forever.
+        # phone number if the session were revoked, which under a restart policy loops forever.
         await self._client.connect()
         if not await self._client.is_user_authorized():
             raise RuntimeError("TELEGRAM_SESSION is not authorized (revoked or expired); create a new session for the algolearn.ai account")
@@ -390,10 +376,6 @@ class TelegramLink:
         if self._pump_task is not None:
             self._pump_task.cancel()
             self._pump_task = None
-        if self._caffeinate is not None:
-            self._caffeinate.terminate()
-            self._caffeinate.wait(timeout=5.0)
-            self._caffeinate = None
 
     async def _leave(self) -> None:
         """Best-effort leave_call while tearing down: a failure is logged, never raised over the real error."""
@@ -472,8 +454,6 @@ class TelegramLink:
             try:
                 self._state = CONNECTED
                 self._start_stats()
-                self._caffeinate = subprocess.Popen([self._caffeinate_cmd, "-i", "-w", str(os.getpid())],
-                                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 await self._calls.record(self._user_id, RecordStream(audio=True, audio_parameters=params))
                 self._event("recording", opener_s=round(opener_seconds, 3))
                 await asyncio.sleep(opener_seconds + OPENER_TAIL_SECONDS)
@@ -553,7 +533,7 @@ class TelegramLink:
     async def _audio_failed(self, error: BaseException) -> str:
         """The owner answered but the media connection failed (ntgcalls.TelegramServerError etc.):
         discard the call and report it distinctly from "not answered". The daemon then exits so
-        launchd restarts it with fresh ntgcalls state (see TelegramDaemon)."""
+        compose's restart policy restarts it with fresh ntgcalls state (see TelegramDaemon)."""
         message = describe(error)
         log.error("call %d: answered but audio failed to connect: %s", self._generation, message)
         self._event("audio_failed", error=message)

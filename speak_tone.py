@@ -1,5 +1,6 @@
 """Tone synthesis for algolearn-speak's cues (ear open, ear closed, the
-"processing" chime), played into the Telegram call by speak_server.py.
+"processing" chime), played into the Telegram call by the speak daemon
+(speak_telegram_daemon.py).
 
 No hardware access here: this module only does numpy math.
 """

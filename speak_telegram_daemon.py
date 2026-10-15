@@ -1,41 +1,37 @@
-"""The always-on Telegram link, one per Mac (docs/DESIGN_TELEGRAM_CALL.md section 3).
+"""The speak daemon (docs/DESIGN_REMOTE_DAEMON.md): one per LAN, on patrick, in a
+container on GPU0.
 
 `speak-telegram` (this module's `main`) owns the algolearn.ai Telegram login and
-the call through speak_telegram.TelegramLink, and listens on a local Unix
-socket. Every speak server (one per Claude Code session) uses `TelegramClient`
-to talk to it. Only one daemon may run: a Telegram login must be used by one
-connection at a time, so the daemon holds an exclusive lock file for its life.
+the call (speak_telegram.TelegramLink), Kokoro and Whisper (speak_engines), the
+one audio lock, and all of the tool logic. It listens on TCP 0.0.0.0:8765. Every
+Claude Code session on every LAN computer runs the thin MCP client
+(speak_server.py), which sends one request per tool call over the framing in
+speak_protocol.py. Only text crosses the wire; audio never leaves this process.
 
-IPC framing (both directions, unchanged from the retired speak-phone daemon,
-commit b719b7a): 4-byte big-endian header length, a UTF-8 JSON header, then
-`header["payload_len"]` raw bytes (float32 little-endian PCM). One request per
-connection, one reply: `{"ok": true, ...}` or `{"ok": false, "error": "..."}`;
-the client re-raises the message as RuntimeError. Requests: `ping`, `state`,
-`call`, `play`, `record`, `hang_up`, `debug` (recent call events, log tail, call
-state, pid, uptime), `set_debug` (raise/restore library logging at runtime).
-`state`, `debug` and `set_debug` never touch the audio lock or the call loop,
-so they answer while a call is ringing or connected.
+Tool ops (`speak`, `listen`, `converse`, `call`, `hang_up`) wait in a FIFO for the
+audio lock, get `{"ok": true, "phase": "started"}` the moment they hold it, then
+their final reply. Quick ops (`ping`, `status`, `debug`, `set_debug`) never
+touch the lock, so they answer while a call is ringing or connected.
+
+Single instance: the TCP bind is the guard (a second daemon gets EADDRINUSE),
+and compose's fixed container_name refuses a second container.
 
 A call that was answered but whose media connection failed makes the daemon
-exit non-zero right after the caller has its reply, so launchd (KeepAlive)
+exit 1 right after the caller has its reply, so compose's restart policy
 restarts it with fresh ntgcalls state.
 
-No fallbacks: a daemon that is not running means no call (`state()` returns
-NOT_RUNNING, on which speak_server's speak/listen/converse raise: there is no local audio);
-every other operation against a missing daemon raises.
+No fallbacks: every setting is required, a model or login failure stops the
+daemon before the port is bound, and every failure raises.
 """
 
 from __future__ import annotations
 
-import fcntl
-import json
+import datetime
 import logging
 import os
 import re
 import signal
-import socket
 import socketserver
-import struct
 import sys
 import threading
 import time
@@ -44,56 +40,84 @@ from typing import Callable
 
 import numpy as np
 
+import speak_protocol as proto
 import speak_telegram as tg
+from speak_engines import STT_RATE, TTS_RATE, Engines
+from speak_tone import cue_pcm, tone
 
-log = logging.getLogger("speak.telegram-daemon")
+log = logging.getLogger("speak.daemon")
 
-CONNECT_TIMEOUT_SECONDS = 5.0
-QUICK_REPLY_TIMEOUT_SECONDS = 20.0
-MAX_HEADER_BYTES = 1 << 20
-MAX_PAYLOAD_BYTES = 1 << 28   # 256 MB: far above any utterance
-NOT_RUNNING = "daemon not running"
 LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
 LOG_RING_SIZE = 2000
 MAX_DEBUG_LINES = 1000
 DEBUG_LOGGERS = ("speak", "pytgcalls", "ntgcalls", "telethon")   # ntgcalls' native C++ log has no Python hook
-ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-REQUIRED_ENV = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_CALL_TARGET")
+REQUIRED_TELEGRAM_ENV = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_CALL_TARGET")
+REQUIRED_SPEAK_ENV = ("SPEAK_KOKORO_MODEL", "SPEAK_VOICE", "SPEAK_SPEED", "SPEAK_WHISPER_MODEL",
+                      "SPEAK_LANGUAGE", "SPEAK_ACK_TEXT", "SPEAK_QUIET_HOURS")
+BIND_HOST = "0.0.0.0"   # open to the LAN by design (owner decision 4); no auth, no TLS
 
 
-def default_socket_path() -> str:
-    return os.environ.get("SPEAK_TELEGRAM_SOCKET") or os.path.expanduser("~/.algolearn-speak/telegram.sock")
+# ------------------------------------------------------------------ errors
+
+class NoSpeech(TimeoutError):
+    """listen: nobody spoke within start_timeout_seconds. The only error sent as KIND_TIMEOUT,
+    so the client never mistakes any other timeout for "no speech"."""
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("telegram daemon closed the connection")
-        buf += chunk
-    return bytes(buf)
+class CallEndedError(RuntimeError):
+    """The call this session was using is no longer connected: call back. Sent as KIND_CALL_ENDED."""
 
 
-def send_msg(sock: socket.socket, header: dict, payload: bytes = b"") -> None:
-    header = {**header, "payload_len": len(payload)}
-    raw = json.dumps(header).encode()
-    sock.sendall(struct.pack(">I", len(raw)) + raw + payload)
+# ------------------------------------------------------------------ settings
+
+_QUIET_RE = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})$")
 
 
-def recv_msg(sock: socket.socket) -> tuple[dict, bytes]:
-    (hlen,) = struct.unpack(">I", _recv_exact(sock, 4))
-    if hlen > MAX_HEADER_BYTES:
-        raise ValueError(f"IPC header too large ({hlen} bytes)")
-    header = json.loads(_recv_exact(sock, hlen))
-    plen = header.get("payload_len", 0)
-    if not isinstance(plen, int) or plen < 0 or plen > MAX_PAYLOAD_BYTES:
-        raise ValueError(f"bad IPC payload_len {plen!r}")
-    return header, _recv_exact(sock, plen) if plen else b""
+def parse_quiet_hours(window: str) -> tuple[int, int]:
+    """`HH:MM-HH:MM` -> (start, end) in minutes after midnight. May wrap midnight."""
+    m = _QUIET_RE.match(window)
+    if not m:
+        raise RuntimeError(f"SPEAK_QUIET_HOURS={window!r} is not HH:MM-HH:MM")
+    sh, sm, eh, em = (int(g) for g in m.groups())
+    if sh > 23 or eh > 23 or sm > 59 or em > 59:
+        raise RuntimeError(f"SPEAK_QUIET_HOURS={window!r} has an out-of-range time")
+    start, end = sh * 60 + sm, eh * 60 + em
+    if start == end:
+        raise RuntimeError(f"SPEAK_QUIET_HOURS={window!r} is an empty window")
+    return start, end
 
 
-def _f32(payload: bytes) -> np.ndarray:
-    return np.frombuffer(payload, dtype="<f4").copy()
+def in_quiet_hours(window: tuple[int, int], now: datetime.time) -> bool:
+    start, end = window
+    t = now.hour * 60 + now.minute
+    if start < end:
+        return start <= t < end
+    return t >= start or t < end  # wraps midnight
+
+
+def _require_env(names: tuple[str, ...]) -> dict[str, str]:
+    env = {name: os.environ.get(name, "") for name in names}
+    missing = [name for name, value in env.items() if not value]
+    if missing:
+        raise RuntimeError(f"required environment variables are not set: {', '.join(missing)}")
+    return env
+
+
+def load_settings() -> dict:
+    """SPEAK_* from the compose environment block. All required, no defaults."""
+    env = _require_env(REQUIRED_SPEAK_ENV)
+    try:
+        speed = float(env["SPEAK_SPEED"])
+    except ValueError:
+        raise RuntimeError(f"SPEAK_SPEED={env['SPEAK_SPEED']!r} is not a number") from None
+    if speed <= 0:
+        raise RuntimeError(f"SPEAK_SPEED={speed} must be positive")
+    return {**env, "SPEAK_SPEED": speed, "quiet_window": parse_quiet_hours(env["SPEAK_QUIET_HOURS"])}
+
+
+def load_env() -> dict[str, str]:
+    """TELEGRAM_* from the environment (compose `env_file: .env`); a missing one stops the daemon."""
+    return _require_env(REQUIRED_TELEGRAM_ENV)
 
 
 # ------------------------------------------------------------------ debug support
@@ -139,6 +163,261 @@ class DebugControl:
         log.warning("debug logging %s", "ON" if enabled else "OFF")
 
 
+# ------------------------------------------------------------------ the audio lock
+
+class AudioLock:
+    """FIFO ticket lock (design section 4.3): every tool op from every session on every
+    computer queues here, in arrival order, and never gets rejected."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._queue: deque[object] = deque()
+        self._held = False
+        self._current: str | None = None
+
+    def acquire(self, tool: str, peer: str) -> None:
+        ticket = object()
+        with self._cond:
+            self._queue.append(ticket)
+            self._cond.wait_for(lambda: not self._held and self._queue[0] is ticket)
+            self._queue.popleft()
+            self._held = True
+            self._current = f"{tool} ({peer})"
+
+    def release(self) -> None:
+        with self._cond:
+            if not self._held:
+                raise RuntimeError("audio lock released while not held")
+            self._held = False
+            self._current = None
+            self._cond.notify_all()
+
+    def snapshot(self) -> tuple[bool, str | None, int]:
+        with self._cond:
+            return self._held, self._current, len(self._queue)
+
+
+# ------------------------------------------------------------------ the tools
+
+class Session:
+    """One request's view of the client session's call expectation (design section 4.4).
+    `generation` is the call the session expects (None: no expectation). `changed` says
+    whether the reply must carry the new value back to the client."""
+
+    def __init__(self, generation: int | None) -> None:
+        self.generation = generation
+        self.changed = False
+
+    def expect(self, generation: int | None) -> None:
+        self.generation = generation
+        self.changed = True
+
+
+class SpeakService:
+    """The tool logic moved from speak_server.py, now calling TelegramLink directly.
+    Every method runs with the audio lock held."""
+
+    def __init__(self, link, engines: Engines, settings: dict) -> None:
+        self.link = link
+        self.engines = engines
+        self.ack_text = settings["SPEAK_ACK_TEXT"]
+        self.quiet_hours = settings["SPEAK_QUIET_HOURS"]
+        self.quiet_window = settings["quiet_window"]
+
+    # -- call checks
+
+    def _call_ended(self, sess: Session, tool: str, detail: str) -> CallEndedError:
+        """Clears the expectation: the drop is reported once, then the session calls back."""
+        sess.expect(None)
+        return CallEndedError(f"Telegram call ended during {tool}; call back with the call tool ({detail})")
+
+    def require_call(self, sess: Session, tool: str) -> None:
+        """Raise unless a call is connected. Any session that talks on the call expects it
+        from then on (the call is shared), so a later drop raises "call ended ... call back"
+        in every such session. A call ended by hang_up, from any session, on the owner's
+        request, is not a drop."""
+        info = self.link.info()
+        state = info["state"]
+        if state == tg.CONNECTED:
+            sess.expect(info["generation"])
+            return
+        if (sess.generation is not None and info["end_reason"] == tg.END_HUNG_UP
+                and info["generation"] == sess.generation):
+            sess.expect(None)   # hung up on request: no call-back
+        if sess.generation is not None:
+            raise self._call_ended(sess, tool, f"call state is {state}")
+        raise RuntimeError(f"{tool} needs a connected Telegram call (call state is {state}); "
+                           "place one with the call tool")
+
+    def guard_call(self, sess: Session, tool: str, fn: Callable):
+        """A call that is no longer connected when `fn` finishes (or fails) makes the tool
+        raise. A transcript captured before the drop is included in the message."""
+        try:
+            result = fn()
+        except Exception as e:
+            if self.link.state() != tg.CONNECTED:
+                raise self._call_ended(sess, tool, str(e)) from e
+            raise
+        if self.link.state() != tg.CONNECTED:
+            partial = f"transcript before the drop: {result!r}" if isinstance(result, str) else "no transcript"
+            raise self._call_ended(sess, tool, f"call state is {self.link.state()}; {partial}")
+        return result
+
+    def _after_capture(self, play: Callable[[], None]) -> None:
+        """Cues played after the owner's words are captured. A call that has just ended (the
+        owner said their piece and hung up) makes them fail; the words must still be
+        transcribed and returned, so that failure is skipped here and guard_call then raises
+        "call ended" WITH the transcript. Any failure while the call is connected raises."""
+        try:
+            play()
+        except RuntimeError:
+            if self.link.state() != tg.CONNECTED:
+                log.info("call ended right after the capture; keeping the words for the drop report")
+                return
+            raise
+
+    # -- audio
+
+    def _cue(self, freq_hz: float, seconds: float = 0.12, volume: float = 0.2, lead_silence: float = 0.0) -> None:
+        self.link.play(cue_pcm(freq_hz, seconds, volume, lead_silence), TTS_RATE)
+
+    def _ack(self) -> None:
+        """Rising two-note chime then a spoken word: the transcript is in hand and is being
+        sent to the model. Distinct from the single ear-open/ear-closed cues."""
+        self.link.play(np.concatenate([tone(660.0, 0.10), tone(990.0, 0.14)]), TTS_RATE)
+        self._speak(self.ack_text)
+
+    @staticmethod
+    def plain(text: str) -> str:
+        """Strip the markdown that would otherwise be read aloud."""
+        text = re.sub(r"```.*?```", " code block omitted ", text, flags=re.S)
+        text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+        text = re.sub(r"[`*_#>|]", "", text)
+        return re.sub(r"[ \t]+", " ", text).strip()
+
+    def _speak(self, text: str) -> float:
+        """Synthesize all of it, then play it: inference never overlaps outgoing speech
+        (design section 4.6). Returns the spoken seconds."""
+        text = self.plain(text)
+        if not text:
+            raise ValueError("speak() called with empty text")
+        audio = self.engines.synthesize(text)
+        self.link.play(audio, TTS_RATE)
+        return len(audio) / TTS_RATE
+
+    def _listen(self, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
+        audio = self.link.record(max_seconds, silence_seconds, start_timeout_seconds,
+                                 cue_pcm(880.0, 0.5, 0.5, 0.2), TTS_RATE)
+        if audio is tg.TIMEOUT:
+            self._cue(330.0)
+            raise NoSpeech(f"no speech detected within {start_timeout_seconds:.0f}s")
+        self._after_capture(lambda: self._cue(440.0))   # ear closed; Whisper runs only after it has played
+        t0 = time.time()
+        text = self.engines.transcribe(audio)
+        log.info("listen: %.1fs of audio transcribed in %.1fs: %r", len(audio) / STT_RATE, time.time() - t0, text)
+        if not text:
+            raise RuntimeError(f"speech was detected ({len(audio) / STT_RATE:.1f}s) but Whisper returned no text")
+        self._after_capture(self._ack)
+        return text
+
+    # -- tool ops (lock held)
+
+    def speak(self, sess: Session, text: str) -> dict:
+        self.require_call(sess, "speak")
+        return {"seconds": self.guard_call(sess, "speak", lambda: self._speak(text))}
+
+    def listen(self, sess: Session, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> dict:
+        self.require_call(sess, "listen")
+        return {"text": self.guard_call(sess, "listen",
+                                        lambda: self._listen(max_seconds, silence_seconds, start_timeout_seconds))}
+
+    def converse(self, sess: Session, text: str, max_seconds: float, silence_seconds: float,
+                 start_timeout_seconds: float) -> dict:
+        self.require_call(sess, "converse")
+
+        def round_trip() -> str:
+            self._speak(text)
+            return self._listen(max_seconds, silence_seconds, start_timeout_seconds)
+
+        return {"text": self.guard_call(sess, "converse", round_trip)}
+
+    def call(self, sess: Session, greeting: str, override_quiet_hours: bool, max_seconds: float,
+             silence_seconds: float, start_timeout_seconds: float) -> dict:
+        # Checked under the lock: a call queued behind a long converse is judged when it would dial.
+        # Local time is the container's TZ (America/Los_Angeles, compose environment).
+        if not override_quiet_hours and in_quiet_hours(self.quiet_window, datetime.datetime.now().time()):
+            return {"outcome": f"not called: quiet hours ({self.quiet_hours})"}
+        info = self.link.info()
+        if info["state"] == tg.CONNECTED:
+            sess.expect(info["generation"])
+            return {"outcome": tg.ALREADY_CONNECTED}
+        # Last of the pre-dial checks, so quiet hours / already connected keep their outcomes.
+        # Measured on the synthesized audio, not guessed from word count.
+        text = self.plain(greeting)
+        if not text:
+            raise ValueError("call() needs a non-empty greeting")
+        audio = self.engines.synthesize(text)
+        seconds = len(audio) / TTS_RATE
+        if seconds < tg.OPENER_MIN_SECONDS:
+            raise ValueError(
+                f"call() greeting is only {seconds:.1f}s when spoken; it must be at least {tg.OPENER_MIN_SECONDS:g}s. "
+                "Nothing was dialed. The greeting is the whole opening: say who is calling, why, and the context, "
+                "and end with a question. Lengthen it with the context of why you are calling. If this is a fresh "
+                "conversation with nothing to report, open with something playful instead: a joke, something "
+                "funny or flirty.")
+        outcome = self.link.call(audio, TTS_RATE)
+        if outcome in (tg.ANSWERED, tg.ALREADY_CONNECTED):
+            sess.expect(self.link.info()["generation"])
+        else:
+            sess.expect(None)
+        if outcome != tg.ANSWERED:
+            return {"outcome": outcome}
+        # Answered: the greeting has played; listen for the owner's reply under the same lock
+        # hold (as converse does) so no other session slips in between. A listen timeout or a
+        # drop raises, exactly as in listen; on a timeout the call stays connected.
+        self.require_call(sess, "call")
+        text = self.guard_call(sess, "call", lambda: self._listen(max_seconds, silence_seconds, start_timeout_seconds))
+        return {"outcome": tg.ANSWERED, "text": text}
+
+    def hang_up(self, sess: Session) -> dict:
+        try:
+            return {"outcome": self.link.hang_up()}
+        finally:
+            sess.expect(None)   # the owner asked to hang up: never a call-back, even if this raised
+
+
+# ------------------------------------------------------------------ request validation
+
+def _number(req: dict, key: str) -> float:
+    value = req.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+        raise ValueError(f"{key} must be a positive number, got {value!r}")
+    return float(value)
+
+
+def _text(req: dict, key: str) -> str:
+    value = req.get(key)
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string, got {value!r}")
+    return value
+
+
+def _flag(req: dict, key: str) -> bool:
+    value = req.get(key)
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a boolean, got {value!r}")
+    return value
+
+
+def _generation(req: dict) -> int | None:
+    if "expect_generation" not in req:
+        raise ValueError("expect_generation is required (an integer or null)")
+    value = req["expect_generation"]
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+        raise ValueError(f"expect_generation must be an integer or null, got {value!r}")
+    return value
+
+
 def _debug_lines(req: dict) -> int:
     lines = req.get("lines")
     if not isinstance(lines, int) or isinstance(lines, bool) or not 1 <= lines <= MAX_DEBUG_LINES:
@@ -146,217 +425,168 @@ def _debug_lines(req: dict) -> int:
     return lines
 
 
-# ------------------------------------------------------------------ daemon side
+def _listen_args(req: dict) -> tuple[float, float, float]:
+    return _number(req, "max_seconds"), _number(req, "silence_seconds"), _number(req, "start_timeout_seconds")
+
+
+def _error_reply(e: BaseException) -> dict:
+    if isinstance(e, NoSpeech):
+        kind = proto.KIND_TIMEOUT
+    elif isinstance(e, ValueError):
+        kind = proto.KIND_VALUE
+    elif isinstance(e, CallEndedError):
+        kind = proto.KIND_CALL_ENDED
+    else:
+        kind = proto.KIND_RUNTIME
+    if isinstance(e, (RuntimeError, ValueError, TimeoutError)):
+        message = str(e) or type(e).__name__
+    else:   # reported to the caller with its type, never swallowed
+        log.error("request failed", exc_info=e)
+        message = f"{type(e).__name__}: {e}"
+    return {"ok": False, "error": message, "kind": kind}
+
+
+# ------------------------------------------------------------------ TCP server
 
 class _Handler(socketserver.BaseRequestHandler):
+    def setup(self) -> None:
+        proto.enable_keepalive(self.request)
+
     def handle(self) -> None:
-        link = self.server.link  # type: ignore[attr-defined]
-        daemon = self.server.daemon  # type: ignore[attr-defined]
+        daemon: SpeakDaemon = self.server.daemon  # type: ignore[attr-defined]
+        peer = self.client_address[0]
         try:
-            req, payload = recv_msg(self.request)
+            req, _payload = proto.recv_msg(self.request)
         except (ConnectionError, OSError, ValueError) as e:
-            log.warning("IPC request could not be read: %s", e)
+            log.warning("request from %s could not be read: %s", peer, e)
             return
+        op = req.get("op")
+        if op in proto.QUICK_OPS:
+            try:
+                reply = {"ok": True, **daemon.quick(op, req)}
+            except Exception as e:
+                reply = _error_reply(e)
+            self._send(peer, reply)
+            return
+        if op not in proto.LOCKED_OPS:
+            self._send(peer, _error_reply(ValueError(f"unknown op {op!r}")))
+            return
+        daemon.lock.acquire(op, peer)
         try:
-            reply, out = self._dispatch(daemon, link, req, payload)
-        except (RuntimeError, ValueError, TimeoutError) as e:
-            reply, out = {"ok": False, "error": str(e) or type(e).__name__}, b""
-        except Exception as e:  # reported to the caller with its type, never swallowed
-            log.exception("IPC request failed")
-            reply, out = {"ok": False, "error": f"{type(e).__name__}: {e}"}, b""
-        try:
-            send_msg(self.request, reply, out)
-        except OSError as e:
-            log.warning("could not send IPC reply: %s", e)
-        if req.get("op") == "call" and reply.get("ok") and tg.is_audio_failure(reply["outcome"]):
+            try:
+                proto.send_msg(self.request, {"ok": True, "phase": proto.PHASE_STARTED})
+            except OSError as e:
+                log.warning("%s from %s: the client left while queued (%s); skipped", op, peer, e)
+                return
+            log.info("%s from %s: started", op, peer)
+            reply = daemon.run_locked(op, req)
+        finally:
+            daemon.lock.release()
+        self._send(peer, reply)
+        if op == proto.OP_CALL and reply.get("ok") and proto.is_audio_failure(reply["outcome"]):
             daemon.request_restart(reply["outcome"])   # after the reply: the caller already has its answer
 
-    @staticmethod
-    def _dispatch(daemon, link, req: dict, payload: bytes) -> tuple[dict, bytes]:
-        op = req.get("op")
-        if op == "ping":
-            return {"ok": True}, b""
-        if op == "state":
-            return {"ok": True, **link.info()}, b""
-        if op == "debug":
-            n = _debug_lines(req)
-            return {"ok": True, "daemon": "running", "pid": os.getpid(),
-                    "uptime_seconds": round(time.monotonic() - daemon.started_at, 1),
-                    "debug": daemon.debug.enabled, "call": link.info(),
-                    "events": link.events.recent(n), "log": daemon.debug.ring.tail(n)}, b""
-        if op == "set_debug":
-            if not isinstance(req.get("enabled"), bool):
-                raise ValueError(f"enabled must be a boolean, got {req.get('enabled')!r}")
-            daemon.debug.set(req["enabled"])
-            link.audio_stats = req["enabled"]   # audio-level events only while debugging
-            return {"ok": True, "daemon": "running", "debug": daemon.debug.enabled}, b""
-        if op == "call":
-            return {"ok": True, "outcome": link.call(_f32(payload), req["rate"])}, b""
-        if op == "play":
-            link.play(_f32(payload), req["rate"])
-            return {"ok": True}, b""
-        if op == "record":
-            result = link.record(req["max_seconds"], req["silence_seconds"], req["start_timeout_seconds"],
-                                 _f32(payload) if payload else None, req["cue_rate"])
-            if result is tg.TIMEOUT:
-                return {"ok": True, "timeout": True}, b""
-            return {"ok": True, "timeout": False}, np.asarray(result, dtype="<f4").tobytes()
-        if op == "hang_up":
-            return {"ok": True, "outcome": link.hang_up()}, b""
-        raise ValueError(f"unknown IPC op {op!r}")
+    def _send(self, peer: str, reply: dict) -> None:
+        try:
+            proto.send_msg(self.request, reply)
+        except OSError as e:
+            log.warning("could not send the reply to %s: %s", peer, e)
 
 
-class _IPCServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+class _TCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
+    allow_reuse_address = True   # TIME_WAIT only; a live listener still refuses a second bind (EADDRINUSE)
 
 
-class TelegramDaemon:
-    """Owns the link, the single-instance lock and the control socket."""
+class SpeakDaemon:
+    """Owns the link, the engines, the audio lock and the TCP server."""
 
-    def __init__(self, link, socket_path: str, on_restart: Callable[[str], None] | None = None) -> None:
+    def __init__(self, link, engines: Engines, settings: dict, port: int = proto.DAEMON_PORT,
+                 on_restart: Callable[[str], None] | None = None) -> None:
         self.link = link
-        self.socket_path = socket_path
-        self.on_restart = on_restart   # main(): exit non-zero so launchd restarts the daemon
+        self.service = SpeakService(link, engines, settings)
+        self.lock = AudioLock()
+        self.port = port
+        self.on_restart = on_restart   # main(): exit 1 so compose restarts the container
         self.debug = DebugControl()
         self.started_at = time.monotonic()
-        self._lock_file = None
-        self._ipc: _IPCServer | None = None
+        self._server: _TCPServer | None = None
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        os.makedirs(os.path.dirname(self.socket_path), mode=0o700, exist_ok=True)
-        self._lock_file = open(self.socket_path + ".lock", "w")
-        try:
-            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            self._lock_file.close()
-            self._lock_file = None
-            raise RuntimeError(f"another speak-telegram daemon holds {self.socket_path}.lock; only one may use the Telegram login")
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)   # we hold the lock, so no live daemon owns it
+        """Telegram (Silero preload, login) first, then the bind: a refused connection always
+        means "not ready or not running", never "running without models or a login"."""
         self.link.start()
-        self._ipc = _IPCServer(self.socket_path, _Handler)
-        os.chmod(self.socket_path, 0o600)
-        self._ipc.link = self.link  # type: ignore[attr-defined]
-        self._ipc.daemon = self  # type: ignore[attr-defined]
-        self._thread = threading.Thread(target=self._ipc.serve_forever, name="telegram-ipc", daemon=True)
+        self._server = _TCPServer((BIND_HOST, self.port), _Handler)
+        self._server.daemon = self  # type: ignore[attr-defined]
+        self._thread = threading.Thread(target=self._server.serve_forever, name="speak-tcp", daemon=True)
         self._thread.start()
-        log.info("speak-telegram: control socket %s", self.socket_path)
+        log.info("speak daemon: listening on %s:%d", BIND_HOST, self.port)
+
+    def quick(self, op: str, req: dict) -> dict:
+        link = self.link
+        if op == proto.OP_PING:
+            return {}
+        if op == proto.OP_STATUS:
+            busy, current_tool, waiting = self.lock.snapshot()
+            return {"busy": busy, "current_tool": current_tool, "waiting": waiting, "call": link.info()}
+        if op == proto.OP_DEBUG:
+            n = _debug_lines(req)
+            return {"daemon": "running", "pid": os.getpid(),
+                    "uptime_seconds": round(time.monotonic() - self.started_at, 1),
+                    "debug": self.debug.enabled, "call": link.info(),
+                    "events": link.events.recent(n), "log": self.debug.ring.tail(n)}
+        if op == proto.OP_SET_DEBUG:
+            enabled = _flag(req, "enabled")
+            self.debug.set(enabled)
+            link.audio_stats = enabled   # audio-level events only while debugging
+            return {"daemon": "running", "debug": self.debug.enabled}
+        raise ValueError(f"unknown op {op!r}")
+
+    def run_locked(self, op: str, req: dict) -> dict:
+        """One tool op with the lock held. The reply carries "expect" when the session's
+        call expectation changed (an int, or null to clear)."""
+        svc = self.service
+        sess: Session | None = None
+        try:
+            if op == proto.OP_HANG_UP:
+                sess = Session(None)
+                result = svc.hang_up(sess)
+            else:
+                sess = Session(_generation(req))
+                if op == proto.OP_SPEAK:
+                    result = svc.speak(sess, _text(req, "text"))
+                elif op == proto.OP_LISTEN:
+                    result = svc.listen(sess, *_listen_args(req))
+                elif op == proto.OP_CONVERSE:
+                    result = svc.converse(sess, _text(req, "text"), *_listen_args(req))
+                elif op == proto.OP_CALL:
+                    result = svc.call(sess, _text(req, "greeting"), _flag(req, "override_quiet_hours"),
+                                      *_listen_args(req))
+                else:
+                    raise ValueError(f"unknown op {op!r}")
+            reply = {"ok": True, **result}
+        except Exception as e:
+            reply = _error_reply(e)
+        if sess is not None and sess.changed:
+            reply["expect"] = sess.generation
+        return reply
 
     def request_restart(self, reason: str) -> None:
         if self.on_restart is None:
             raise RuntimeError(f"daemon restart requested ({reason}) but no on_restart handler is set")
-        log.error("restarting the daemon (exit 1, launchd KeepAlive restarts it): %s", reason)
+        log.error("restarting the daemon (exit 1, compose's restart policy restarts it): %s", reason)
         self.on_restart(reason)
 
     def stop(self) -> None:
-        if self._ipc is not None:
-            self._ipc.shutdown()
-            self._ipc.server_close()
-            self._ipc = None
-        try:
-            self.link.stop()
-        finally:
-            if os.path.exists(self.socket_path):
-                os.unlink(self.socket_path)
-            if self._lock_file is not None:
-                self._lock_file.close()
-                self._lock_file = None
-
-
-# ------------------------------------------------------------------ client side
-
-class TelegramClient:
-    """What a speak server uses: synchronous calls forwarded to the daemon."""
-
-    def __init__(self, socket_path: str | None = None) -> None:
-        self.socket_path = socket_path or default_socket_path()
-
-    def _request(self, header: dict, payload: bytes = b"", reply_timeout: float | None = None) -> tuple[dict, bytes]:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            s.settimeout(CONNECT_TIMEOUT_SECONDS)
-            s.connect(self.socket_path)
-            s.settimeout(reply_timeout)
-            send_msg(s, header, payload)
-            reply, data = recv_msg(s)
-        except TimeoutError:
-            # socket.timeout is TimeoutError in 3.12; re-raised as RuntimeError so a stalled
-            # daemon is never mistaken for listen()'s "no speech detected" TimeoutError.
-            raise RuntimeError(f"telegram daemon did not reply to {header['op']!r} within "
-                               f"{s.gettimeout():.0f}s") from None
-        finally:
-            s.close()
-        if not reply.get("ok"):
-            raise RuntimeError(reply.get("error", "telegram daemon reported an error"))
-        return reply, data
-
-    def info(self) -> dict:
-        """`{"state", "generation", "end_reason"}`, or state NOT_RUNNING when no daemon answers."""
-        try:
-            reply, _ = self._request({"op": "state"}, reply_timeout=QUICK_REPLY_TIMEOUT_SECONDS)
-        except (FileNotFoundError, ConnectionRefusedError):
-            return {"state": NOT_RUNNING, "generation": None, "end_reason": None}
-        return {"state": reply["state"], "generation": reply["generation"], "end_reason": reply["end_reason"]}
-
-    def state(self) -> str:
-        """The call state, or NOT_RUNNING when no daemon answers (no socket / refused)."""
-        return self.info()["state"]
-
-    def call(self, greeting: np.ndarray, rate: int) -> str:
-        pcm = np.asarray(greeting, dtype="<f4").reshape(-1)
-        budget = tg.RING_TIMEOUT_SECONDS + tg.OPENER_MIN_SECONDS + len(pcm) / rate + 60.0
-        reply, _ = self._request({"op": "call", "rate": rate}, pcm.tobytes(), reply_timeout=budget)
-        return reply["outcome"]
-
-    def play(self, audio: np.ndarray, rate: int) -> None:
-        pcm = np.asarray(audio, dtype="<f4").reshape(-1)
-        self._request({"op": "play", "rate": rate}, pcm.tobytes(), reply_timeout=len(pcm) / rate + 60.0)
-
-    def record(self, max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
-               cue: np.ndarray | None, cue_rate: int):
-        cue_pcm = b"" if cue is None else np.asarray(cue, dtype="<f4").reshape(-1).tobytes()
-        cue_seconds = len(cue_pcm) / 4 / cue_rate
-        reply, data = self._request(
-            {"op": "record", "max_seconds": max_seconds, "silence_seconds": silence_seconds,
-             "start_timeout_seconds": start_timeout_seconds, "cue_rate": cue_rate},
-            cue_pcm, reply_timeout=cue_seconds + start_timeout_seconds + max_seconds + 60.0,
-        )
-        if reply["timeout"]:
-            return tg.TIMEOUT
-        return np.frombuffer(data, dtype="<f4").copy()
-
-    def debug(self, lines: int) -> dict:
-        """The daemon's recent events/log/state, or `{"daemon": NOT_RUNNING}` when no daemon answers."""
-        try:
-            reply, _ = self._request({"op": "debug", "lines": lines}, reply_timeout=QUICK_REPLY_TIMEOUT_SECONDS)
-        except (FileNotFoundError, ConnectionRefusedError):
-            return {"daemon": NOT_RUNNING}
-        return {k: v for k, v in reply.items() if k not in ("ok", "payload_len")}
-
-    def set_debug(self, enabled: bool) -> dict:
-        try:
-            reply, _ = self._request({"op": "set_debug", "enabled": enabled}, reply_timeout=QUICK_REPLY_TIMEOUT_SECONDS)
-        except (FileNotFoundError, ConnectionRefusedError):
-            return {"daemon": NOT_RUNNING}
-        return {k: v for k, v in reply.items() if k not in ("ok", "payload_len")}
-
-    def hang_up(self) -> str:
-        reply, _ = self._request({"op": "hang_up"}, reply_timeout=QUICK_REPLY_TIMEOUT_SECONDS)
-        return reply["outcome"]
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        self.link.stop()
 
 
 # ------------------------------------------------------------------ entry point
-
-def load_env(path: str = ENV_FILE) -> dict[str, str]:
-    """TELEGRAM_* values from the repo's git-ignored .env; a missing one stops the daemon."""
-    with open(path) as f:
-        env = {k: v.strip().strip("\r").strip("\"'") for k, v in re.findall(r"^(TELEGRAM_[A-Z_]+)=(.*)$", f.read(), re.M)}
-    missing = [k for k in REQUIRED_ENV if not env.get(k)]
-    if missing:
-        raise RuntimeError(f"{path} is missing {', '.join(missing)}")
-    return env
-
 
 def build_link(env: dict[str, str]) -> tg.TelegramLink:
     from pytgcalls import PyTgCalls
@@ -382,16 +612,24 @@ def main() -> None:
             exit_code[0] = 1
             stop.set()
 
-        daemon = TelegramDaemon(build_link(load_env()), default_socket_path(), on_restart=restart)
-        daemon.debug.install()
-        daemon.start()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         signal.signal(signal.SIGINT, lambda *_: stop.set())
+        debug = DebugControl()
+        debug.install()
+        settings = load_settings()
+        telegram_env = load_env()
+        # Startup order (design section 6.2): engines, then Silero + Telegram (link.start), then the bind.
+        engines = Engines(settings["SPEAK_KOKORO_MODEL"], settings["SPEAK_VOICE"], settings["SPEAK_SPEED"],
+                          settings["SPEAK_WHISPER_MODEL"], settings["SPEAK_LANGUAGE"])
+        engines.load()
+        daemon = SpeakDaemon(build_link(telegram_env), engines, settings, on_restart=restart)
+        daemon.debug = debug
+        daemon.start()
         stop.wait()
         daemon.stop()
         code = exit_code[0]
     except BaseException:
-        log.exception("speak-telegram failed")
+        log.exception("speak daemon failed")
         code = 1
     finally:
         # Every exit path skips the interpreter's teardown: ntgcalls' C++ global destructors

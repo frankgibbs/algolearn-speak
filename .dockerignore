@@ -1,0 +1,11 @@
+# Never in the build context: secrets (.env holds the Telegram login; compose passes it at
+# run time via env_file), local environments, history.
+.env
+.env.*
+.venv/
+.git/
+__pycache__/
+*.pyc
+*.ips
+tests/
+docs/

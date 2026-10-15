@@ -1,24 +1,33 @@
 [project]
 name = "algolearn-speak"
-version = "0.1.0"
-description = "Telegram voice MCP server for Claude Code: calls the owner on Telegram; Whisper STT and Kokoro TTS on MLX."
+version = "0.2.0"
+description = "Telegram voice MCP for Claude Code: a thin MCP client on every computer, and a speak daemon on patrick (Kokoro TTS and faster-whisper STT on CUDA, Telegram calls to the owner)."
 license = "MIT"
 requires-python = ">=3.12,<3.13"
+# The thin MCP client (speak_server.py, speak_protocol.py) needs only this.
 dependencies = [
     "mcp>=2.1,<3",
-    "mlx-whisper>=0.4.3",
-    "mlx-audio>=0.5.1",
-    "misaki[en]>=0.9",
-    "silero-vad>=5.1",
-    "numpy>=1.26",
-    "scipy>=1.11",  # resample_poly: TTS/cues up to the call's 48 kHz and the owner's audio down to 16 kHz (speak_telegram.py)
-    # spaCy model misaki (Kokoro G2P) needs; pinned here so `uv sync` never removes it
-    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
-    # Telegram calls (speak-telegram daemon). Pinned exactly: py-tgcalls' private-call API is
-    # undocumented and has broken between releases (docs/DESIGN_TELEGRAM_CALL.md section 9).
+]
+
+[project.optional-dependencies]
+# The speak daemon (speak_telegram_daemon.py), built into the patrick image: `uv sync --extra daemon`.
+daemon = [
+    # Telegram calls. Pinned exactly: py-tgcalls' private-call API is undocumented and has
+    # broken between releases (docs/DESIGN_TELEGRAM_CALL.md section 9).
     "telethon==1.45.0",
     "py-tgcalls==3.0.0",
     "ntgcalls==3.0.2",
+    # torch: CUDA 12.6 build on Linux (index below); 2.14.0 has no cu128 build. One CUDA major (12)
+    # in the process, shared with ctranslate2 (cuBLAS 12).
+    "torch==2.14.0",
+    "kokoro==0.9.4",
+    "misaki[en]==0.9.4",
+    # spaCy model misaki (Kokoro G2P) needs; pinned here so `uv sync` never removes it
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    "faster-whisper==1.2.1",
+    "silero-vad==6.2.1",
+    "numpy>=1.26",
+    "scipy>=1.11",  # resample_poly: TTS/cues up to the call's 48 kHz and the owner's audio down to 16 kHz (speak_telegram.py)
 ]
 
 [project.scripts]
@@ -31,7 +40,16 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["speak_server.py", "speak_telegram.py", "speak_telegram_daemon.py", "speak_tone.py"]
+only-include = ["speak_server.py", "speak_protocol.py", "speak_engines.py", "speak_telegram.py",
+                "speak_telegram_daemon.py", "speak_tone.py"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'linux'" }]

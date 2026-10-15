@@ -1,0 +1,34 @@
+# The speak daemon on patrick (docs/DESIGN_REMOTE_DAEMON.md section 7).
+# Start, rebuild and stop are owner actions:  docker --context patrick compose up --build -d
+# .env (TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION, TELEGRAM_CALL_TARGET) sits next to
+# this file on the deploy host; it is git-ignored and excluded from the image by .dockerignore.
+services:
+  speak-telegram:
+    build: .
+    image: algolearn-speak-telegram:latest
+    container_name: speak-telegram   # a second container is refused; the TCP bind refuses a second daemon
+    restart: unless-stopped           # also restarts it after an audio failure (the daemon exits 1)
+    network_mode: host                # WebRTC media is UDP; no second NAT in front of ICE. Port 8765 on the LAN
+    env_file: .env
+    environment:
+      TZ: America/Los_Angeles         # quiet hours are judged on this clock
+      SPEAK_KOKORO_MODEL: hexgrad/Kokoro-82M
+      SPEAK_VOICE: af_heart
+      SPEAK_SPEED: "1.0"
+      SPEAK_WHISPER_MODEL: large-v3-turbo
+      SPEAK_LANGUAGE: en
+      SPEAK_ACK_TEXT: Processing.
+      SPEAK_QUIET_HOURS: "22:00-07:00"
+    volumes:
+      - speak_models:/root/.cache/huggingface   # models download once, not on every rebuild
+    stop_grace_period: 30s            # a hang-up (<= 10 s) and the disconnect (<= 5 s) finish first
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+
+volumes:
+  speak_models:

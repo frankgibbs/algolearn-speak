@@ -31,7 +31,6 @@ from pytgcalls.types import ChatUpdate, Device, Direction, Frame, RawCallUpdate,
 import speak_telegram as tg
 
 USER_ID = 4242
-FAKE_CAFFEINATE = os.path.join(HERE, "fake_caffeinate")
 
 
 class FakeTelethon:
@@ -140,12 +139,6 @@ class LinkCase(unittest.TestCase):
     ring = "answer"
 
     def setUp(self):
-        self.log_dir = tempfile.mkdtemp(prefix="fake-caffeinate-")
-        self.addCleanup(shutil.rmtree, self.log_dir, True)
-        self.caffeinate_log = os.path.join(self.log_dir, "log")
-        p = mock.patch.dict(os.environ, {"FAKE_CAFFEINATE_LOG": self.caffeinate_log})
-        p.start()
-        self.addCleanup(p.stop)
         for name, value in (("OPENER_MIN_SECONDS", 0.004), ("OPENER_TAIL_SECONDS", 0.02)):
             p = mock.patch.object(tg, name, value)
             p.start()
@@ -156,8 +149,7 @@ class LinkCase(unittest.TestCase):
             self.calls = FakeCalls(client, self.ring)
             return self.calls
 
-        self.link = tg.TelegramLink("owner", FakeTelethon, calls_factory, vad_factory=StubVAD, vad_preload=lambda: None,
-                                 caffeinate=FAKE_CAFFEINATE)
+        self.link = tg.TelegramLink("owner", FakeTelethon, calls_factory, vad_factory=StubVAD, vad_preload=lambda: None)
         self.link.start()
         self.addCleanup(self.link.stop)
 
@@ -172,12 +164,6 @@ class LinkCase(unittest.TestCase):
             self.emit(StreamFrames(USER_ID, Direction.INCOMING, Device.MICROPHONE, [Frame(1, f, Frame.Info())]))
             if pace:
                 time.sleep(pace)
-
-    def caffeinate_lines(self) -> list[str]:
-        if not os.path.exists(self.caffeinate_log):
-            return []
-        with open(self.caffeinate_log) as f:
-            return f.read().splitlines()
 
     def wait_until(self, predicate, timeout=5.0):
         deadline = time.monotonic() + timeout
@@ -199,7 +185,6 @@ class TestCallAnswered(LinkCase):
         self.assertEqual(len(self.calls.records), 1)      # recording starts before the switch
         self.wait_until(lambda: len(self.calls.frames) >= 5)   # the pump is feeding silence
         self.assertEqual(self.calls.frames[0], bytes(tg.FRAME_BYTES))
-        self.wait_until(lambda: self.caffeinate_lines() == [f"-i -w {os.getpid()}"])
 
     def test_already_connected(self):
         self.link.call(np.zeros(100, dtype=np.float32), 24000)
@@ -219,10 +204,8 @@ class TestCallAnswered(LinkCase):
 
     def test_remote_hang_up_ends_everything(self):
         self.link.call(np.zeros(100, dtype=np.float32), 24000)
-        self.wait_until(lambda: self.caffeinate_lines() != [])
         self.remote_hang_up()
         self.assertEqual(self.link.state(), tg.NONE)
-        self.assertIsNone(self.link._caffeinate)
         n = len(self.calls.frames)
         time.sleep(0.1)
         self.assertLessEqual(len(self.calls.frames) - n, 1)   # pump stopped
@@ -285,7 +268,6 @@ class TestReviewFindings(LinkCase):
             self.link.call(np.zeros(100, dtype=np.float32), 24000)
         self.assertEqual(self.link.state(), tg.NONE)
         self.assertEqual(self.calls.left, 1)
-        self.assertIsNone(self.link._caffeinate)
 
     def test_hang_up_during_the_greeting_is_its_own_outcome(self):
         with mock.patch.object(tg, "OPENER_TAIL_SECONDS", 0.5):
@@ -362,7 +344,7 @@ class TestReviewFindings(LinkCase):
 class TestVadPreload(unittest.TestCase):
     def link(self, preload):
         return tg.TelegramLink("owner", FakeTelethon, lambda c: FakeCalls(c), vad_factory=StubVAD,
-                               vad_preload=preload, caffeinate=FAKE_CAFFEINATE)
+                               vad_preload=preload)
 
     def test_start_loads_the_model_before_connecting(self):
         order = []
@@ -373,7 +355,7 @@ class TestVadPreload(unittest.TestCase):
                 await super().connect()
 
         link = tg.TelegramLink("owner", Client, lambda c: FakeCalls(c), vad_factory=StubVAD,
-                               vad_preload=lambda: order.append("preload"), caffeinate=FAKE_CAFFEINATE)
+                               vad_preload=lambda: order.append("preload"))
         link.start()
         self.addCleanup(link.stop)
         self.assertEqual(order[0], "preload")
@@ -442,7 +424,6 @@ def _not_answered_case(exc):
         def test_maps_to_not_answered(self):
             self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000), tg.NOT_ANSWERED)
             self.assertEqual(self.link.state(), tg.NONE)
-            self.assertEqual(self.caffeinate_lines(), [])
             self.assertEqual(len(self.calls.plays), 1)   # never switched to raw frames
     Case.__name__ = f"TestNotAnswered_{type(exc).__name__}"
     return Case
@@ -515,7 +496,6 @@ class TestAudioFailure(AcceptedCase):
         self.assertEqual(self.link.state(), tg.NONE)
         self.assertEqual(self.link.info()["end_reason"], tg.END_FAILED)
         self.assertEqual(self.calls.left, 1)
-        self.assertEqual(self.caffeinate_lines(), [])
 
     def test_events_tell_the_story(self):
         _call(self.link)
