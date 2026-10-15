@@ -1,27 +1,27 @@
-"""algolearn-speak: a local ear and voice for Claude Code.
+"""algolearn-speak: a Telegram voice for Claude Code.
 
-MCP server (stdio) exposing eight tools:
+MCP server (stdio) exposing eight tools. All audio goes over a Telegram call
+placed by the speak-telegram daemon; there is no local microphone or speaker
+path (owner decision 2026-10-15: Telegram only).
 
-  speak(text)     -> synthesise with Kokoro (MLX) and play through the default output
-  listen(...)     -> record from the default input until you stop talking (Silero VAD),
-                     transcribe with Whisper (MLX), return the text
+  speak(text)     -> synthesise with Kokoro and play into the connected call
+  listen(...)     -> capture the owner's reply on the call (the daemon runs Silero
+                     VAD), transcribe with Whisper, return the text
   converse(text)  -> speak, then listen
-  call(greeting)  -> Telegram voice call to the owner; while it is up,
-                     speak/listen/converse run over the call
-                     (docs/DESIGN_TELEGRAM_CALL.md)
+  call(greeting)  -> Telegram voice call to the owner; speak/listen/converse need it
+                     connected (docs/DESIGN_TELEGRAM_CALL.md)
   hang_up()       -> end that call
   status()        -> report whether speak/listen/converse are busy and how many
                      calls are queued behind the current one
   call_debug()    -> the speak-telegram daemon's recent call events and log tail
   set_call_debug()-> toggle the daemon's DEBUG logging at runtime
 
-speak/listen/converse are serialized through one lock that is BOTH
+speak/listen/converse/call are serialized through one lock that is BOTH
 process-wide and cross-process (see _SerializingLock below): a second
 caller -- whether another thread in this process or a second
 speak_server.py process started by a second Claude Code session --
-queues and waits rather than being rejected or talking over the first.
-
-Everything runs on the Mac. No audio leaves the machine.
+queues and waits rather than being rejected or talking over the first
+on the shared call.
 """
 
 from __future__ import annotations
@@ -32,9 +32,7 @@ import logging
 import os
 import queue
 import re
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 
@@ -45,7 +43,6 @@ import numpy as np
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-import speak_audio_worker
 import speak_telegram as tg
 from speak_telegram_daemon import NOT_RUNNING, TelegramClient
 from speak_tone import cue_pcm, tone
@@ -61,35 +58,28 @@ SPEED = float(os.environ.get("SPEAK_SPEED", "1.0"))
 LANGUAGE = os.environ.get("SPEAK_LANGUAGE", "en")
 ACK_TEXT = os.environ.get("SPEAK_ACK_TEXT", "Processing.")  # spoken after each successful listen
 
-# Opt-in voice-clone archival. Both unset by default -> zero behaviour change.
-INPUT_DEVICE = os.environ.get("SPEAK_INPUT_DEVICE", "")   # substring match, resolved in the worker
-OUTPUT_DEVICE = os.environ.get("SPEAK_OUTPUT_DEVICE", "")  # substring match, resolved in the worker
-SAVE_DIR = os.environ.get("SPEAK_SAVE_DIR", "")            # if set, every successful capture is archived here
-
 # Telegram calls (docs/DESIGN_TELEGRAM_CALL.md section 7). Validated in main().
 QUIET_HOURS = os.environ.get("SPEAK_QUIET_HOURS", "22:00-07:00")  # no-call window, local time
 
-MIC_RATE = 16_000          # Whisper and Silero both want 16 kHz mono
-VAD_FRAME = 512            # Silero frame size at 16 kHz (32 ms)
+MIC_RATE = 16_000          # the daemon returns the owner's audio as 16 kHz mono (Whisper's rate)
 TTS_RATE = 24_000          # Kokoro output rate
 SENTENCE_SPLIT = r"(?<=[.!?])\s+"
 
-# ---------------------------------------------------------------- audio route
+# ---------------------------------------------------------------- the call
 #
-# The route is chosen ONCE at the start of each tool call (`_begin_call`, under
-# the audio lock) and holds for the whole call: "telegram" while the
-# speak-telegram daemon reports a connected call (docs/DESIGN_TELEGRAM_CALL.md
-# section 6), otherwise "mac". `telegram` is a client of that daemon; this
-# process never touches Telegram itself. Daemon not running = no call = Mac,
-# unless a call is expected.
+# Every speak/listen/converse needs a call that the speak-telegram daemon
+# reports as connected (docs/DESIGN_TELEGRAM_CALL.md section 6). `telegram` is
+# a client of that daemon; this process never touches Telegram itself. With no
+# connected call the tools raise: there is no local device to fall back to.
 
 telegram = TelegramClient()
-_route = "mac"  # "telegram" | "mac"; written only by _begin_call/_end_call, under audio_lock
 # True from an answered `call` until hang_up / a reported drop: while set, a call
-# that is no longer connected raises instead of routing to the Mac. Per process:
-# the session that placed (or joined) the call.
+# that is no longer connected raises "call ended ... call back" instead of
+# "no call connected". Per process: the session that placed (or joined) the call.
 _call_expected = False
 _call_generation: int | None = None   # the daemon's generation of the call this session expects
+
+AUDIO_NOTE = "\n(audio: telegram)"   # ends every speak/listen/converse result and an answered call()
 
 
 def _call_ended_error(tool: str, detail: str) -> RuntimeError:
@@ -99,45 +89,29 @@ def _call_ended_error(tool: str, detail: str) -> RuntimeError:
     return RuntimeError(f"Telegram call ended during {tool}; call back with the call tool ({detail})")
 
 
-def _begin_call(tool: str) -> str:
-    """A connected call, otherwise the Mac. Any session that talks on the call
-    expects it from then on (the call is shared), so a later drop raises in
-    every such session instead of moving to the Mac's speakers. A call ended
-    by hang_up -- from any session, on the owner's request -- is not a drop."""
-    global _route, _call_expected, _call_generation
+def _require_call(tool: str) -> None:
+    """Raise unless a call is connected. Any session that talks on the call
+    expects it from then on (the call is shared), so a later drop raises
+    "call ended ... call back" in every such session. A call ended by hang_up
+    -- from any session, on the owner's request -- is not a drop."""
+    global _call_expected, _call_generation
     info = telegram.info()
     state = info["state"]
     if state == tg.CONNECTED:
         _call_expected, _call_generation = True, info["generation"]
-        _route = "telegram"
-        return _route
+        return
     if _call_expected and info["end_reason"] == tg.END_HUNG_UP and info["generation"] == _call_generation:
-        _call_expected = False   # hung up on request: the Mac is the device again, no call-back
+        _call_expected = False   # hung up on request: no call-back
     if _call_expected:
         raise _call_ended_error(tool, f"call state is {state}")
-    if state not in (tg.NONE, NOT_RUNNING):
-        raise RuntimeError(f"a Telegram call is {state} but not connected; not routing audio anywhere")
-    _route = "mac"
-    return _route
+    raise RuntimeError(f"{tool} needs a connected Telegram call (call state is {state}); place one with the call tool")
 
 
-def _end_call() -> None:
-    global _route
-    _route = "mac"
-
-
-def _audio_note(route: str) -> str:
-    return f"\n(audio: {route})"
-
-
-def _guard_call(route: str, tool: str, fn):
-    """On the telegram route, a call that is no longer connected when `fn`
-    finishes (or fails) makes the tool raise -- never a switch to the Mac's
-    devices. A transcript captured before the drop is included in the message;
-    a failure to read the call state is reported together with the original
-    error, never instead of it."""
-    if route != "telegram":
-        return fn()
+def _guard_call(tool: str, fn):
+    """A call that is no longer connected when `fn` finishes (or fails) makes
+    the tool raise. A transcript captured before the drop is included in the
+    message; a failure to read the call state is reported together with the
+    original error, never instead of it."""
     try:
         result = fn()
     except Exception as e:
@@ -186,7 +160,7 @@ def _in_quiet_hours(window: tuple[int, int], now: datetime.time) -> bool:
 # ---------------------------------------------------------------- engines
 
 class Engines:
-    """Holds the three models. Loaded once, in a background thread at startup."""
+    """Holds Kokoro (TTS) and Whisper (STT). Loaded once, in a background thread at startup."""
 
     def __init__(self) -> None:
         self.ready = threading.Event()
@@ -200,16 +174,7 @@ class Engines:
             from mlx_audio.tts.utils import load_model
 
             self.kokoro = load_model(KOKORO_MODEL)
-            # VAD is loaded fresh inside speak_audio_worker per listen() call —
-            # the worker is a separate process that never shares state with
-            # this one, so there's nothing to warm here for it. That load
-            # (~1s) is not free, but it happens entirely before the "ear
-            # open" beep: _record_pcm launches the worker and blocks until it
-            # signals readiness (VAD loaded, mic stream open and buffering),
-            # and only then does _listen_impl play the beep -- so the ~1s
-            # cost is hidden behind the beep's own lead-in silence rather
-            # than opening the mic after the user has already started
-            # answering.
+            # Silero VAD runs in the speak-telegram daemon (speak_telegram.py), not here.
             # Warm the Kokoro pipeline (voice file, G2P, spaCy) so the first speak() is fast.
             for _ in self.kokoro.generate(text="Ready.", voice=VOICE, speed=SPEED, lang_code="a"):
                 pass
@@ -234,9 +199,9 @@ engines = Engines()
 #
 # Two Claude Code sessions each launch their OWN speak_server.py process, so
 # an in-process threading.Lock (below) only serializes calls within one
-# process -- it cannot stop two processes from opening the mic/speaker at
+# process -- it cannot stop two processes from talking on the shared call at
 # once. LOCK_DIR/LOCK_PATH are a well-known filesystem location every
-# speak_server.py instance on this Mac agrees on, so flock() on LOCK_PATH is
+# speak_server.py instance on this host agrees on, so flock() on LOCK_PATH is
 # the actual cross-process mutex; SIDECAR_PATH is written by whoever holds it
 # so a process that does NOT hold the lock can identify who does (pid, tool,
 # since) for status() without needing IPC.
@@ -324,8 +289,8 @@ class _SerializingLock:
     """Process-wide (in-process) AND cross-process FIFO-ish queue for the
     three audio tools.
 
-    `speak`, `listen`, and `converse` share one Mac microphone/speaker pair,
-    so two calls -- from two threads in this process, OR from two separate
+    `speak`, `listen`, `converse`, `call` and `hang_up` share one Telegram
+    call, so two tool calls -- from two threads in this process, OR from two separate
     speak_server.py processes started by two Claude Code sessions -- must
     never run at once. One waits for the other to finish, then proceeds (a
     queue, never a rejection). The in-process `threading.Lock` handles the
@@ -385,16 +350,17 @@ class _SerializingLock:
         return True, label, waiting
 
 
-audio_lock = _SerializingLock()   # speak, listen, and converse are serialized through this -- see class docstring
+audio_lock = _SerializingLock()   # every tool that uses the call is serialized through this -- see class docstring
 
 # ---------------------------------------------------------------- helpers
 
 def _tone(freq_hz: float, seconds: float, volume: float = 0.2) -> np.ndarray:
-    # Thin wrapper kept for existing call sites and tests -- the actual
-    # generator lives in speak_tone.py so speak_audio_worker.py's record
-    # worker can synthesize the "ear open" cue in-process without importing
-    # this module (see speak_tone.py's module docstring).
     return tone(freq_hz, seconds, volume)
+
+
+def _play_pcm(audio: np.ndarray, samplerate: int) -> None:
+    """Into the call. The daemon's pump paces it; play returns once every frame has gone out."""
+    telegram.play(audio, samplerate)
 
 
 def _cue(freq_hz: float, seconds: float = 0.12, volume: float = 0.2, lead_silence: float = 0.0) -> None:
@@ -416,393 +382,14 @@ def _plain(text: str) -> str:
     return re.sub(r"[ \t]+", " ", text).strip()
 
 
-def _worker_command(*args: str) -> list[str]:
-    return [sys.executable, "-m", "speak_audio_worker", *(str(a) for a in args)]
-
-
-def _run_worker_once(*args: str, timeout: float) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(
-            _worker_command(*args),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as e:
-        # The worker itself enforces a wall-clock cap on every command that
-        # can run long (see speak_audio_worker.py) and is expected to exit
-        # on its own well inside `timeout`. Getting here means the worker
-        # overran its own cap -- a bug in the worker, not an expected path
-        # -- so name the phase it was stuck in (from its last stderr status
-        # line) to make that bug diagnosable instead of a bare "timed out".
-        phase = _last_phase(e.stderr)
-        raise RuntimeError(
-            f"audio worker {args[0]!r} exceeded its own budget and was killed "
-            f"after {timeout:.0f}s (last phase: {phase}); this means the "
-            f"worker's internal wall-clock cap did not fire -- see "
-            f"speak_audio_worker.py's cmd_record cap logic"
-        ) from e
-
-
-def _last_phase(stderr: bytes | str | None) -> str:
-    if not stderr:
-        return "unknown (worker produced no stderr before being killed)"
-    text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else stderr
-    phases = [line.split("=", 1)[1] for line in text.splitlines() if line.startswith("phase=")]
-    return phases[-1] if phases else "unknown (no phase status line seen)"
-
-
-def _last_archive_rate(stderr_lines: list[str]) -> int:
-    """Reads the worker's `archive-rate=<hz>` stderr line (see
-    speak_audio_worker.py's cmd_record) -- the worker is the only place that
-    resolves the input device's native rate, since this process never
-    imports sounddevice. Raises if archiving audio was returned but no rate
-    line was ever seen: that would mean stale/incoherent state between this
-    process and the worker, and saving a WAV with a guessed rate is worse
-    than failing loudly."""
-    for line in stderr_lines:
-        line = line.strip()
-        if line.startswith("archive-rate="):
-            return int(line.split("=", 1)[1])
-    raise RuntimeError("worker produced archive audio but never reported archive-rate=<hz> on stderr")
-
-
-def _stderr_tail(proc: subprocess.CompletedProcess, lines: int = 20) -> str:
-    tail = "\n".join(proc.stderr.strip().splitlines()[-lines:])
-    return tail or "(worker produced no stderr)"
-
-
-def _run_worker(*args: str, timeout: float) -> subprocess.CompletedProcess:
-    """Run the audio helper subprocess and return on success. Every actual
-    PortAudio open happens in that short-lived process (see
-    speak_audio_worker.py / docs/AUDIO_LIFECYCLE_AUDIT.md) — a fresh process
-    never inherits a stale device snapshot, so retrying here just means
-    launching a second fresh process, not re-touching bad state in this one.
-    One immediate retry on a non-timeout-exit-code failure; a readable
-    ToolError-friendly RuntimeError on the second failure."""
-    proc = _run_worker_once(*args, timeout=timeout)
-    if proc.returncode == 0 or proc.returncode == speak_audio_worker.TIMEOUT_EXIT_CODE:
-        return proc
-    log.warning("audio worker %r failed (exit %d); retrying once:\n%s", args[0], proc.returncode, _stderr_tail(proc))
-    proc = _run_worker_once(*args, timeout=timeout)
-    if proc.returncode == 0 or proc.returncode == speak_audio_worker.TIMEOUT_EXIT_CODE:
-        return proc
-    raise RuntimeError(
-        f"audio worker {args[0]!r} failed twice (exit {proc.returncode}):\n{_stderr_tail(proc)}"
-    )
-
-
-def _play_pcm(audio: np.ndarray, samplerate: int) -> None:
-    if _route == "telegram":
-        telegram.play(audio, samplerate)
-        return
-    with tempfile.NamedTemporaryFile(prefix="speak-play-", suffix=".pcm", delete=False) as f:
-        path = f.name
-    try:
-        audio.astype(np.float32).tofile(path)
-        # generous fixed budget: playback itself has no fixed duration bound
-        # here since callers pass short cues and full TTS chunks alike.
-        duration = len(audio) / samplerate
-        _run_worker("play", path, str(samplerate), OUTPUT_DEVICE, timeout=duration + 30.0)
-    finally:
-        os.unlink(path)
-
-
-def _play_pcm_stream(chunks: list[np.ndarray], samplerate: int, timeout: float) -> None:
-    """Play chunks (already produced, kept in memory) through a play-stream
-    worker fed over stdin, so the worker starts playing the first chunk
-    without waiting for a temp file of the whole utterance. On failure,
-    retry the whole utterance against a fresh worker (a fresh process is the
-    fix for a stale PortAudio snapshot; replaying the same bytes is cheap).
-
-    Uses Popen.communicate(input=...) rather than writing to proc.stdin
-    directly: writing our own stdin while the worker's stdout/stderr pipes
-    can fill is a classic subprocess deadlock (each side blocked on the
-    other's pipe); communicate() feeds stdin and drains stdout/stderr
-    concurrently on our behalf.
-    """
-    if _route == "telegram":
-        # The daemon's pump paces it; play returns once every frame has gone out.
-        if chunks:
-            telegram.play(np.concatenate([chunk.reshape(-1) for chunk in chunks]), samplerate)
-        return
-    payload = b"".join(chunk.astype(np.float32).tobytes() for chunk in chunks)
-    for attempt in (1, 2):
-        proc = subprocess.Popen(
-            _worker_command("play-stream", str(samplerate), OUTPUT_DEVICE),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            _, stderr = proc.communicate(input=payload, timeout=timeout)
-            returncode = proc.returncode
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            _, stderr = proc.communicate()
-            returncode = -1
-        if returncode == 0:
-            return
-        stderr_text = stderr.decode("utf-8", "replace") if stderr else ""
-        tail = "\n".join(stderr_text.strip().splitlines()[-20:]) or "(worker produced no stderr)"
-        if attempt == 1:
-            log.warning("audio worker 'play-stream' failed (exit %s); retrying once:\n%s", returncode, tail)
-            continue
-        raise RuntimeError(f"audio worker 'play-stream' failed twice (exit {returncode}):\n{tail}")
-
-
-READY_PHASE = "cue-played"  # mic open AND the ear-open cue (if any) has finished playing
-READY_WAIT_SECONDS = 10.0  # bounded wait for the record worker's readiness line
-
-
-class _RecordHandle:
-    """A launched-but-not-yet-awaited record worker: the mic is already open
-    and buffering by the time this is returned to the caller (readiness was
-    already confirmed). Call `_finish_record_worker` to play out the rest of
-    the recording and collect its result."""
-
-    def __init__(self, proc: subprocess.Popen, path: str, stderr_lines: list[str], stderr_thread: threading.Thread) -> None:
-        self.proc = proc
-        self.path = path
-        self.stderr_lines = stderr_lines
-        self.stderr_thread = stderr_thread
-
-
-def _drain_stderr(pipe, lines: list[str], ready_event: threading.Event) -> None:
-    """Runs in a background thread for the lifetime of the record worker.
-    Reads stderr line by line (never blocking the main thread on it, so a
-    worker that writes a lot to stderr can't deadlock us on a full pipe),
-    appending each line and setting `ready_event` the moment the readiness
-    phase line appears. Keeps draining after readiness so `_last_phase` can
-    still see later phase transitions (e.g. `phase=recording`) if the
-    worker later overruns its own wall-clock cap."""
-    try:
-        for line in iter(pipe.readline, ""):
-            lines.append(line)
-            if line.strip() == f"phase={READY_PHASE}":
-                ready_event.set()
-    finally:
-        pipe.close()
-
-
-def _start_record_worker(
-    path: str, samplerate: int, blocksize: int, max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
-    cue_freq_hz: float = 0.0, cue_seconds: float = 0.3, cue_volume: float = 0.4, cue_lead_silence: float = 0.2,
-    device_name: str = "", archive_path: str = "", output_device_name: str = "",
-) -> _RecordHandle:
-    """Launch the record worker and block only until it signals readiness
-    (mic open, and the ear-open cue -- if `cue_freq_hz > 0` -- already
-    played) -- NOT until it finishes recording. See speak_audio_worker.py's
-    cmd_record docstring for the readiness contract.
-
-    The cue is played by the worker itself, in the same process that owns
-    the input stream, so passing `cue_freq_hz > 0` here is what makes the
-    "ear open" cue play at all; a caller that wants no cue passes
-    `cue_freq_hz <= 0` (the default) and readiness fires as soon as the
-    stream opens (the worker logs `phase=cue-played` immediately in that
-    case -- see cmd_record).
-
-    No silent fallback: if readiness never arrives within
-    READY_WAIT_SECONDS, the worker is killed and a clear RuntimeError is
-    raised. One retry (a fresh process) is allowed if the worker exits
-    before ever reaching readiness -- a fresh process is the documented fix
-    for a stale PortAudio device snapshot (see
-    docs/AUDIO_LIFECYCLE_AUDIT.md), so this mirrors `_run_worker`'s
-    retry-once policy rather than adding new fallback behaviour.
-    """
-    for attempt in (1, 2):
-        proc = subprocess.Popen(
-            _worker_command(
-                "record", path, str(samplerate), str(blocksize),
-                str(max_seconds), str(silence_seconds), str(start_timeout_seconds),
-                str(cue_freq_hz), str(cue_seconds), str(cue_volume), str(cue_lead_silence),
-                device_name, archive_path, output_device_name,
-            ),
-            # No stdout pipe: `record` never writes to stdout (see
-            # speak_audio_worker.py), so there's nothing to drain and no
-            # deadlock risk in leaving it inherited. stderr is piped and
-            # owned exclusively by the drain thread below -- never touched
-            # via Popen.communicate(), which would race the thread's reads
-            # against its own and raise "Bad file descriptor" on double-close.
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        stderr_lines: list[str] = []
-        ready_event = threading.Event()
-        stderr_thread = threading.Thread(
-            target=_drain_stderr, args=(proc.stderr, stderr_lines, ready_event), daemon=True,
-        )
-        stderr_thread.start()
-
-        # Poll in small increments rather than one blocking wait(timeout=...)
-        # so a worker that exits early (fast failure) is noticed and retried
-        # right away instead of waiting out the full READY_WAIT_SECONDS.
-        deadline = time.time() + READY_WAIT_SECONDS
-        while not ready_event.is_set() and proc.poll() is None and time.time() < deadline:
-            ready_event.wait(timeout=0.05)
-        if ready_event.is_set():
-            return _RecordHandle(proc, path, stderr_lines, stderr_thread)
-
-        # Not ready in time: either the worker exited early (fast failure,
-        # worth one retry with a fresh process) or it is hung past
-        # READY_WAIT_SECONDS (not worth retrying -- retrying a hang just
-        # doubles the wait for the same outcome).
-        exited_early = proc.poll() is not None
-        if exited_early and attempt == 1:
-            log.warning(
-                "record worker exited before signalling readiness (exit %s); retrying once:\n%s",
-                proc.returncode, "".join(stderr_lines[-20:]) or "(worker produced no stderr)",
-            )
-            stderr_thread.join(timeout=5.0)
-            continue
-
-        proc.kill()
-        proc.wait()
-        stderr_thread.join(timeout=5.0)
-        tail = "".join(stderr_lines[-20:]) or "(worker produced no stderr)"
-        if exited_early:
-            raise RuntimeError(f"record worker failed twice before signalling readiness (exit {proc.returncode}):\n{tail}")
-        raise RuntimeError(
-            f"record worker did not signal readiness (phase={READY_PHASE}) within "
-            f"{READY_WAIT_SECONDS:.0f}s; killed it rather than treat a mic that might "
-            f"not be listening as ready. Last stderr:\n{tail}"
-        )
-    raise AssertionError("unreachable")  # pragma: no cover
-
-
-def _finish_record_worker(handle: _RecordHandle, cap_seconds: float, start_timeout_seconds: float) -> np.ndarray:
-    """Wait for a record worker (already confirmed ready by
-    `_start_record_worker`) to finish, and return its captured audio.
-
-    Timeout budget: the worker's own wall-clock cap is
-    start_timeout_seconds + max_seconds measured from stream open (already
-    passed by the time this is called), plus a small fixed margin for
-    process start/exit overhead -- a fixed margin, not a multiple, so a
-    slow VAD model load can't silently double the wait. Readiness has
-    already been confirmed, so this wait is just "cap_seconds forward from
-    here, plus margin", not cap_seconds plus the readiness wait again.
-    """
-    timeout = cap_seconds + 15.0
-    try:
-        handle.proc.wait(timeout=timeout)
-        returncode = handle.proc.returncode
-    except subprocess.TimeoutExpired:
-        handle.proc.kill()
-        handle.proc.wait()
-        returncode = None
-    # The drain thread's own `for line in iter(pipe.readline, "")` returns
-    # (closing the pipe) once the process exits and stderr hits EOF, so this
-    # join is bounded by the wait/kill above, not an independent hang risk.
-    handle.stderr_thread.join(timeout=5.0)
-
-    if returncode is None:
-        phase = _last_phase("".join(handle.stderr_lines))
-        raise RuntimeError(
-            f"audio worker 'record' exceeded its own budget and was killed after "
-            f"{timeout:.0f}s (last phase: {phase}); this means the worker's internal "
-            f"wall-clock cap did not fire -- see speak_audio_worker.py's cmd_record cap logic"
-        )
-    if returncode == speak_audio_worker.TIMEOUT_EXIT_CODE:
+def _record(max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> np.ndarray:
+    """The owner's reply on the call: the daemon plays the ear-open cue into the
+    call, runs Silero VAD on the owner's audio, and returns 16 kHz float32."""
+    audio = telegram.record(max_seconds, silence_seconds, start_timeout_seconds,
+                            cue_pcm(880.0, 0.5, 0.5, 0.2), TTS_RATE)
+    if audio is tg.TIMEOUT:
         raise TimeoutError(f"no speech detected within {start_timeout_seconds:.0f}s")
-    if returncode != 0:
-        tail = "".join(handle.stderr_lines[-20:]) or "(worker produced no stderr)"
-        raise RuntimeError(f"audio worker 'record' failed (exit {returncode}) after signalling readiness:\n{tail}")
-    return np.fromfile(handle.path, dtype=np.float32)
-
-
-def _record_pcm(
-    samplerate: int, blocksize: int, max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
-    cue_freq_hz: float = 0.0, cue_seconds: float = 0.3, cue_volume: float = 0.4, cue_lead_silence: float = 0.2,
-    device_name: str = "", output_device_name: str = "",
-) -> np.ndarray:
-    """Record via the worker subprocess. If `cue_freq_hz > 0`, the worker
-    plays the "ear open" cue itself, in-process, right after the mic opens
-    and before it starts reading frames for real -- see
-    speak_audio_worker.py's cmd_record docstring for why the cue must be
-    played by the same process that owns the input stream (playing it via a
-    separate `play` subprocess can silently lose the cue on a Bluetooth
-    device mid-HFP-renegotiation).
-
-    `device_name`, if non-empty, is resolved in the worker (this process
-    never touches sounddevice) -- see speak_audio_worker.py's
-    `_resolve_input_device`. Always returns the 16kHz stream -- unchanged
-    contract regardless of `device_name`. Callers that also want the
-    native-rate archive copy (SPEAK_SAVE_DIR) use `_record_pcm_with_archive`
-    instead."""
-    audio, _archive_audio, _archive_rate = _record_pcm_with_archive(
-        samplerate, blocksize, max_seconds, silence_seconds, start_timeout_seconds,
-        cue_freq_hz, cue_seconds, cue_volume, cue_lead_silence,
-        device_name, want_archive=False, output_device_name=output_device_name,
-    )
     return audio
-
-
-def _record_pcm_with_archive(
-    samplerate: int, blocksize: int, max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
-    cue_freq_hz: float = 0.0, cue_seconds: float = 0.3, cue_volume: float = 0.4, cue_lead_silence: float = 0.2,
-    device_name: str = "", want_archive: bool = False, output_device_name: str = "",
-) -> tuple[np.ndarray, np.ndarray | None, int]:
-    """Same recording as `_record_pcm`, plus (when `want_archive` is True and
-    `device_name` resolves to a native rate above `samplerate`) the
-    un-resampled native-rate copy the worker captured alongside it -- see
-    speak_audio_worker.py's cmd_record `archive_pcm_path` argument.
-
-    Returns `(audio, archive_audio, archive_rate)`: `audio` is always the
-    16kHz stream (unchanged contract). `archive_audio`/`archive_rate` are
-    non-None only when `want_archive` is True AND the worker actually
-    captured at a native rate above `samplerate` -- otherwise the archive
-    would be identical to `audio` at `samplerate`, which the caller can use
-    directly instead."""
-    with tempfile.NamedTemporaryFile(prefix="speak-record-", suffix=".pcm", delete=False) as f:
-        path = f.name
-    os.unlink(path)  # the worker creates it; we just need a unique name
-    archive_path = ""
-    if want_archive and device_name:
-        with tempfile.NamedTemporaryFile(prefix="speak-record-archive-", suffix=".pcm", delete=False) as f:
-            archive_path = f.name
-        os.unlink(archive_path)
-    try:
-        handle = _start_record_worker(
-            path, samplerate, blocksize, max_seconds, silence_seconds, start_timeout_seconds,
-            cue_freq_hz, cue_seconds, cue_volume, cue_lead_silence,
-            device_name, archive_path, output_device_name,
-        )
-        cap_seconds = start_timeout_seconds + max_seconds
-        audio = _finish_record_worker(handle, cap_seconds, start_timeout_seconds)
-        archive_audio = None
-        archive_rate = samplerate
-        if archive_path and os.path.exists(archive_path):
-            archive_audio = np.fromfile(archive_path, dtype=np.float32)
-            if archive_audio.size == 0:
-                archive_audio = None
-            else:
-                archive_rate = _last_archive_rate(handle.stderr_lines)
-        return audio, archive_audio, archive_rate
-    finally:
-        if os.path.exists(path):
-            os.unlink(path)
-        if archive_path and os.path.exists(archive_path):
-            os.unlink(archive_path)
-
-
-def _record_for_route(
-    max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
-) -> tuple[np.ndarray, np.ndarray | None, int]:
-    """The listen() capture on whichever device this call was routed to.
-    Telegram: the daemon plays the ear-open cue into the call and runs VAD on
-    the owner's audio; no archive (call-codec audio is not reference material)."""
-    if _route == "telegram":
-        audio = telegram.record(max_seconds, silence_seconds, start_timeout_seconds,
-                                cue_pcm(880.0, 0.5, 0.5, 0.2), TTS_RATE)
-        if audio is tg.TIMEOUT:
-            raise TimeoutError(f"no speech detected within {start_timeout_seconds:.0f}s")
-        return audio, None, MIC_RATE
-    # ear open: a short gap so it doesn't blend into the tail of speak(), then a longer, louder beep
-    return _record_pcm_with_archive(
-        MIC_RATE, VAD_FRAME, max_seconds, silence_seconds, start_timeout_seconds,
-        cue_freq_hz=880.0, cue_seconds=0.5, cue_volume=0.5, cue_lead_silence=0.2,
-        device_name=INPUT_DEVICE, want_archive=bool(SAVE_DIR), output_device_name=OUTPUT_DEVICE,
-    )
 
 
 def _speak_impl(text: str) -> float:
@@ -832,84 +419,16 @@ def _speak_impl(text: str) -> float:
     if failure:
         raise RuntimeError(f"Kokoro synthesis failed: {failure[0]!r}") from failure[0]
     if played:
-        # A generous fixed budget for the worker's whole life: startup + the
-        # audio's own duration + margin for the retry path.
-        duration = samples / TTS_RATE
-        _play_pcm_stream(played, TTS_RATE, timeout=duration + 30.0)
+        _play_pcm(np.concatenate([chunk.reshape(-1) for chunk in played]), TTS_RATE)
     return samples / TTS_RATE
-
-
-_save_counter_lock = threading.Lock()
-_save_counter = 0
-
-
-def _check_save_dir(path: str) -> None:
-    """No fallback: SPEAK_SAVE_DIR must already exist and be writable. Never
-    created here -- an agent or a fat-fingered path silently spawning a new
-    directory on disk is worse than a clear startup failure."""
-    if not os.path.isdir(path):
-        raise RuntimeError(f"SPEAK_SAVE_DIR={path!r} does not exist or is not a directory; create it first (it is never created automatically)")
-    if not os.access(path, os.W_OK):
-        raise RuntimeError(f"SPEAK_SAVE_DIR={path!r} is not writable")
-
-
-def _save_capture(audio: np.ndarray, samplerate: int, text: str) -> None:
-    """Write `<SAVE_DIR>/<UTC timestamp>_<n>.wav` (mono int16 at `samplerate`)
-    plus a sibling `.txt` with the Whisper transcript, for use as voice-clone
-    reference material. Only called for captures that already produced a
-    non-empty transcript (see _listen_impl) -- silence/noise clips are never
-    archived. `_check_save_dir` has already validated SAVE_DIR at startup;
-    this still fails loudly (no try/except) if the write itself fails, e.g.
-    the directory was removed after startup."""
-    global _save_counter
-    with _save_counter_lock:
-        _save_counter += 1
-        n = _save_counter
-    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    base = os.path.join(SAVE_DIR, f"{stamp}_{n}")
-    pcm16 = np.clip(audio, -1.0, 1.0)
-    pcm16 = (pcm16 * 32767.0).astype(np.int16)
-    _write_wav(f"{base}.wav", pcm16, samplerate)
-    with open(f"{base}.txt", "w", encoding="utf-8") as f:
-        f.write(text)
-    log.info("saved capture to %s.wav (%.1fs at %dHz)", base, len(audio) / samplerate, samplerate)
-
-
-def _write_wav(path: str, pcm16: np.ndarray, samplerate: int) -> None:
-    """Minimal mono 16-bit PCM WAV writer -- no extra dependency for
-    something this small (44-byte header, then raw samples)."""
-    import struct
-
-    data = pcm16.tobytes()
-    with open(path, "wb") as f:
-        f.write(b"RIFF")
-        f.write(struct.pack("<I", 36 + len(data)))
-        f.write(b"WAVE")
-        f.write(b"fmt ")
-        f.write(struct.pack("<IHHIIHH", 16, 1, 1, samplerate, samplerate * 2, 2, 16))
-        f.write(b"data")
-        f.write(struct.pack("<I", len(data)))
-        f.write(data)
 
 
 def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
     engines.wait()
     import mlx_whisper
 
-    # The "ear open" cue is played by the record worker itself, from inside
-    # the same process that holds the input stream open (see
-    # speak_audio_worker.py's cmd_record and _record_pcm's docstring) --
-    # NOT by a separate `play` subprocess. On a Bluetooth device (e.g.
-    # AirPods) that splits into direction-specific CoreAudio entries, two
-    # processes each opening one half of the device at the same time can
-    # silently lose the cue during HFP profile renegotiation. Playing it
-    # in-process also lets it play to completion BEFORE the mic is opened
-    # (opening the mic first flips Bluetooth headsets to HFP and swallows the
-    # beep). Speech during the beep is therefore not captured.
-    # start_timeout_seconds is enforced by the worker from the moment the
-    # cue finishes playing (`phase=cue-played`), not from stream-open.
     try:
-        audio, archive_audio, archive_rate = _record_for_route(max_seconds, silence_seconds, start_timeout_seconds)
+        audio = _record(max_seconds, silence_seconds, start_timeout_seconds)
     except TimeoutError:
         _cue(330.0)
         raise
@@ -920,74 +439,53 @@ def _listen_impl(max_seconds: float, silence_seconds: float, start_timeout_secon
     log.info("listen: %.1fs of audio transcribed in %.1fs: %r", len(audio) / MIC_RATE, time.time() - t0, text)
     if not text:
         raise RuntimeError(f"speech was detected ({len(audio) / MIC_RATE:.1f}s) but Whisper returned no text")
-    if SAVE_DIR and _route != "telegram":
-        # Prefer the native-rate archive (better clone reference material)
-        # when one was actually captured; otherwise the 16kHz stream already
-        # in hand is the only copy that exists.
-        if archive_audio is not None:
-            _save_capture(archive_audio, archive_rate, text)
-        else:
-            _save_capture(audio, MIC_RATE, text)
     _after_capture(_ack)
     return text
 
 
 def _after_capture(play) -> None:
-    """Cues played after the owner's words are captured. On the telegram route a
-    call that has just ended (the owner said their piece and hung up) makes them
+    """Cues played after the owner's words are captured. A call that has just ended (the owner said their piece and hung up) makes them
     fail; the words must still be transcribed and returned, so that failure is
     skipped here and _guard_call then raises "call ended" WITH the transcript.
     Any failure while the call is still connected raises as usual."""
     try:
         play()
     except RuntimeError:
-        if _route == "telegram" and telegram.state() != tg.CONNECTED:
+        if telegram.state() != tg.CONNECTED:
             log.info("call ended right after the capture; keeping the words for the drop report")
             return
         raise
 
-def _speak_sync(text: str) -> tuple[float, str]:
+def _speak_sync(text: str) -> float:
     audio_lock.acquire("speak")
-    route = "mac"
     try:
-        route = _begin_call("speak")
-        return _guard_call(route, "speak", lambda: _speak_impl(text)), route
+        _require_call("speak")
+        return _guard_call("speak", lambda: _speak_impl(text))
     finally:
-        try:
-            _end_call()
-        finally:
-            audio_lock.release()
+        audio_lock.release()
 
 
-def _listen_sync(max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> tuple[str, str]:
+def _listen_sync(max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
     audio_lock.acquire("listen")
-    route = "mac"
     try:
-        route = _begin_call("listen")
-        return _guard_call(route, "listen", lambda: _listen_impl(max_seconds, silence_seconds, start_timeout_seconds)), route
+        _require_call("listen")
+        return _guard_call("listen", lambda: _listen_impl(max_seconds, silence_seconds, start_timeout_seconds))
     finally:
-        try:
-            _end_call()
-        finally:
-            audio_lock.release()
+        audio_lock.release()
 
 
-def _converse_sync(text: str, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> tuple[str, str]:
+def _converse_sync(text: str, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
     audio_lock.acquire("converse")
-    route = "mac"
     try:
-        route = _begin_call("converse")
+        _require_call("converse")
 
         def round_trip() -> str:
             _speak_impl(text)
             return _listen_impl(max_seconds, silence_seconds, start_timeout_seconds)
 
-        return _guard_call(route, "converse", round_trip), route
+        return _guard_call("converse", round_trip)
     finally:
-        try:
-            _end_call()
-        finally:
-            audio_lock.release()
+        audio_lock.release()
 
 
 def _synthesize(text: str) -> np.ndarray:
@@ -1036,12 +534,9 @@ def _call_sync(greeting: str, override_quiet_hours: bool, max_seconds: float, si
         # same lock hold (as converse does) so no other session slips in between.
         # A listen timeout or a drop raises, exactly as in listen(); on a timeout
         # the call stays connected.
-        try:
-            route = _begin_call("call")
-            text = _guard_call(route, "call", lambda: _listen_impl(max_seconds, silence_seconds, start_timeout_seconds))
-        finally:
-            _end_call()
-        return f"{tg.ANSWERED}\n{text}{_audio_note(route)}"
+        _require_call("call")
+        text = _guard_call("call", lambda: _listen_impl(max_seconds, silence_seconds, start_timeout_seconds))
+        return f"{tg.ANSWERED}\n{text}{AUDIO_NOTE}"
     finally:
         audio_lock.release()
 
@@ -1076,7 +571,7 @@ async def _run(fn, *args):
     except (TimeoutError, RuntimeError, ValueError) as e:
         raise ToolError(str(e)) from e
     except Exception as e:
-        # Anything else (a PortAudioError mid-stream, a model load failure)
+        # Anything else (a daemon socket error, a model load failure)
         # must reach the caller with its type and message, not as a bare
         # "Error executing tool" with nothing to act on.
         log.exception("%s failed", getattr(fn, "__name__", fn))
@@ -1085,72 +580,78 @@ async def _run(fn, *args):
 
 @mcp.tool()
 async def speak(text: str) -> str:
-    """Say `text` out loud through the Mac's speakers and return once playback finishes.
+    """Say `text` to the owner over the connected Telegram call and return once playback finishes.
 
     Write it as spoken prose: short sentences, no markdown, no code. Returns the spoken duration.
 
-    Status: calls to speak/listen/converse are serialized through one lock
-    that is both process-wide and cross-process (a second Claude Code
-    session running its own speak_server.py is included) -- there is only
-    one microphone and one speaker on this Mac. If another call is in
-    progress anywhere, this one queues and waits for it to finish, then
-    proceeds; it is never rejected. Use `status()` to see what is currently
-    running (including in another process) and how many calls are waiting.
+    Status: speak/listen/converse/call are serialized through one lock that is
+    both process-wide and cross-process (a second Claude Code session running
+    its own speak_server.py is included) -- there is only one Telegram call.
+    If another tool call is in progress anywhere, this one queues and waits
+    for it to finish, then proceeds; it is never rejected. Use `status()` to
+    see what is currently running (including in another process) and how
+    many calls are waiting.
 
-    Telegram: while a call placed by `call()` is connected, this runs over
-    the call instead of the Mac's speaker and mic (the result ends with
-    `(audio: telegram)`). If the call ends mid-way this raises "Telegram call
-    ended during ..."; the rule of engagement is to call back with `call()`.
+    Needs a Telegram call placed by `call()` and still connected; there is no
+    local microphone or speaker. With no connected call this raises "...
+    needs a connected Telegram call"; place one with `call()`. The result
+    ends with `(audio: telegram)`. If the call ends mid-way this raises
+    "Telegram call ended during ..."; the rule of engagement is to call back
+    with `call()`.
     """
-    seconds, route = await _run(_speak_sync, text)
-    return f"spoke for {seconds:.1f}s{_audio_note(route)}"
+    seconds = await _run(_speak_sync, text)
+    return f"spoke for {seconds:.1f}s{AUDIO_NOTE}"
 
 
 @mcp.tool()
 async def listen(max_seconds: float = 120.0, silence_seconds: float = 2.0, start_timeout_seconds: float = 45.0) -> str:
-    """Listen on the Mac's microphone until the user finishes talking and return what they said.
+    """Listen to the owner on the connected Telegram call until they finish talking and return what they said.
 
     A high beep means the ear is open, a low beep means it closed, and a rising chime plus
     the word "Processing" means the transcript was captured and is on its way to you. Recording ends after
     `silence_seconds` of quiet following speech, or at `max_seconds` of speech. Raises
-    TimeoutError if nobody speaks within `start_timeout_seconds`.
+    TimeoutError if nobody speaks within `start_timeout_seconds` (the call stays connected).
 
-    Status: calls to speak/listen/converse are serialized through one lock
-    that is both process-wide and cross-process (a second Claude Code
-    session running its own speak_server.py is included) -- there is only
-    one microphone and one speaker on this Mac. If another call is in
-    progress anywhere, this one queues and waits for it to finish, then
-    proceeds; it is never rejected. Use `status()` to see what is currently
-    running (including in another process) and how many calls are waiting.
+    Status: speak/listen/converse/call are serialized through one lock that is
+    both process-wide and cross-process (a second Claude Code session running
+    its own speak_server.py is included) -- there is only one Telegram call.
+    If another tool call is in progress anywhere, this one queues and waits
+    for it to finish, then proceeds; it is never rejected. Use `status()` to
+    see what is currently running (including in another process) and how
+    many calls are waiting.
 
-    Telegram: while a call placed by `call()` is connected, this runs over
-    the call instead of the Mac's speaker and mic (the result ends with
-    `(audio: telegram)`). If the call ends mid-way this raises "Telegram call
-    ended during ..."; the rule of engagement is to call back with `call()`.
+    Needs a Telegram call placed by `call()` and still connected; there is no
+    local microphone or speaker. With no connected call this raises "...
+    needs a connected Telegram call"; place one with `call()`. The result
+    ends with `(audio: telegram)`. If the call ends mid-way this raises
+    "Telegram call ended during ..."; the rule of engagement is to call back
+    with `call()`.
     """
-    text, route = await _run(_listen_sync, max_seconds, silence_seconds, start_timeout_seconds)
-    return text + _audio_note(route)
+    text = await _run(_listen_sync, max_seconds, silence_seconds, start_timeout_seconds)
+    return text + AUDIO_NOTE
 
 
 @mcp.tool()
 async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float = 2.0, start_timeout_seconds: float = 45.0) -> str:
-    """Say `text`, then listen for the reply. One spoken round trip; returns the user's words.
+    """Say `text` over the connected Telegram call, then listen for the reply. One spoken round trip; returns the owner's words.
 
-    Status: calls to speak/listen/converse are serialized through one lock
-    that is both process-wide and cross-process (a second Claude Code
-    session running its own speak_server.py is included) -- there is only
-    one microphone and one speaker on this Mac. If another call is in
-    progress anywhere, this one queues and waits for it to finish, then
-    proceeds; it is never rejected. Use `status()` to see what is currently
-    running (including in another process) and how many calls are waiting.
+    Status: speak/listen/converse/call are serialized through one lock that is
+    both process-wide and cross-process (a second Claude Code session running
+    its own speak_server.py is included) -- there is only one Telegram call.
+    If another tool call is in progress anywhere, this one queues and waits
+    for it to finish, then proceeds; it is never rejected. Use `status()` to
+    see what is currently running (including in another process) and how
+    many calls are waiting.
 
-    Telegram: while a call placed by `call()` is connected, this runs over
-    the call instead of the Mac's speaker and mic (the result ends with
-    `(audio: telegram)`). If the call ends mid-way this raises "Telegram call
-    ended during ..."; the rule of engagement is to call back with `call()`.
+    Needs a Telegram call placed by `call()` and still connected; there is no
+    local microphone or speaker. With no connected call this raises "...
+    needs a connected Telegram call"; place one with `call()`. The result
+    ends with `(audio: telegram)`. If the call ends mid-way this raises
+    "Telegram call ended during ..."; the rule of engagement is to call back
+    with `call()`.
     """
-    reply, route = await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)
-    return reply + _audio_note(route)
+    reply = await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)
+    return reply + AUDIO_NOTE
 
 
 @mcp.tool()
@@ -1171,7 +672,7 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
     holdout came back clean, but there is one result I want your read on
     before I do anything else. Do you have a minute?". Works wherever their phone has signal,
     with the Mac locked or unlocked. Once answered, speak/listen/converse run
-    over the call until it ends. Returns one of:
+    over the call until it ends; without a connected call they raise. Returns one of:
       "answered\n<their words>\n(audio: telegram)"
                                               -- they picked up, heard the greeting and
                                                  replied; continue with listen or converse.
@@ -1272,16 +773,14 @@ async def hang_up() -> str:
 
 @mcp.tool()
 async def status() -> dict:
-    """Report whether speak/listen/converse are busy right now, in this
+    """Report whether speak/listen/converse/call are busy right now, in this
     process or in another one (e.g. a second Claude Code session's own
-    speak_server.py).
+    speak_server.py), and the Telegram call state.
 
-    Returns `{"busy": bool, "current_tool": str | None, "waiting": int, "audio": "telegram" | "mac" | "error", "call": str}`.
-    `audio` is the device the NEXT call will use: "telegram" while a Telegram
-    call is connected, otherwise "mac"; "error" when the next call would
-    raise (call state unreadable, a call still ringing, or a dropped call).
+    Returns `{"busy": bool, "current_tool": str | None, "waiting": int, "call": str}`.
     `call` is the daemon's call state ("none", "ringing", "connected"),
-    "daemon not running", or "error: <reason>" if it could not be read.
+    "daemon not running", or "error: <reason>" if it could not be read;
+    speak/listen/converse work only while it is "connected".
     `current_tool` is the name of the tool currently holding the lock, or
     `"<tool> (pid <n>, other process)"` when a different process holds it,
     or null if idle. `waiting` counts only callers queued in THIS process
@@ -1294,19 +793,11 @@ async def status() -> dict:
         call_state = telegram.state()
     except Exception as e:  # reported in the result, never hidden: status must not raise
         call_state = f"error: {e}"
-    if call_state == tg.CONNECTED:
-        audio = "telegram"
-    elif call_state in (tg.NONE, NOT_RUNNING) and not _call_expected:
-        audio = "mac"
-    else:
-        audio = "error"  # the next speak/listen/converse would raise (see _begin_call)
-    return {"busy": busy, "current_tool": current_tool, "waiting": waiting, "audio": audio, "call": call_state}
+    return {"busy": busy, "current_tool": current_tool, "waiting": waiting, "call": call_state}
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    if SAVE_DIR:
-        _check_save_dir(SAVE_DIR)
     _check_call_config()
     threading.Thread(target=engines.load, name="engine-load", daemon=True).start()
     mcp.run()

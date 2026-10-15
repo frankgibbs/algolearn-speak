@@ -1,24 +1,32 @@
 # algolearn-speak
 
-A local ear and voice for Claude Code. An MCP server (stdio) that Claude drives
-directly, so a spoken back-and-forth happens inside one turn: Claude calls
-`speak`, then `listen`, reads the transcript as a tool result, and continues.
+An ear and voice for Claude Code over a Telegram voice call. An MCP server
+(stdio) that Claude drives directly, so a spoken back-and-forth happens inside
+one turn: Claude calls `call` (or joins a connected call), then `speak` and
+`listen`, reads the transcript as a tool result, and continues.
 
-Everything runs on this Mac. No audio or text leaves the machine.
+**Telegram only (owner decision 2026-10-15).** There is no local microphone or
+speaker path: no audio device is opened anywhere in this repo. `speak`,
+`listen` and `converse` work only while a Telegram call is connected and raise
+otherwise; there is no fallback. Speech synthesis and transcription run on
+this host; the audio travels only over the Telegram call.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `speak(text)` | Kokoro-82M on MLX synthesises `text`, streamed sentence by sentence to the default output device. Returns spoken duration. |
-| `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep, then records the default input until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech). Low beep, then Whisper large-v3-turbo on MLX transcribes. Once text is in hand, a rising two-note chime and the spoken word "Processing" tell the user their words were captured. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. |
+| `speak(text)` | Kokoro-82M on MLX synthesises `text` and plays it into the connected call. Returns spoken duration. |
+| `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep, then records the owner's call audio until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech). Low beep, then Whisper large-v3-turbo on MLX transcribes. Once text is in hand, a rising two-note chime and the spoken word "Processing" tell the user their words were captured. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. |
 | `converse(text, ...)` | `speak` then `listen` under one lock. Returns the user's words. |
 | `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is the whole opening, spoken the moment they answer: who is calling, why, and the context, ending with a question or invitation. It must be at least 6 s when spoken (measured on the synthesized audio); a shorter one raises `ValueError` BEFORE dialing (phone never rings; owner decision 2026-10-12) telling the model to add the context of why it is calling, or, on a fresh conversation with nothing to report, to open with something playful (a joke, something funny or flirty). Never padded. Once answered, `call` immediately does the `listen` (ear-open beep, VAD, Whisper, chime + ack) under the same lock hold and returns the owner's words; listen parameters and defaults match `converse`, and a listen timeout or a drop raises as in `listen` (the call stays connected on a timeout). Returns `answered\n<their words>\n(audio: telegram)`, `already connected` (greeting not spoken, no listen), `not answered (declined or no answer)`, `answered, then hung up during the greeting` (the owner picked up and ended it before the greeting finished; one call back right away is allowed, then the one-hour rule), `answered but audio failed to connect: <error>` (the owner picked up but media failed; daemon restarts itself) or `not called: quiet hours (...)`. Check order: quiet hours, daemon state / already connected, then the greeting length, then the dial. While connected, `speak`/`listen`/`converse` run over the call. Works with the Mac locked. See "Telegram calls". |
 | `hang_up()` | End that call (only when the owner asks). |
-| `status()` | `{busy, current_tool, waiting, audio: "telegram"\|"mac"\|"error", call}`: what holds the lock, where the next call's audio goes, and the daemon's call state (`none`/`ringing`/`connected`/`daemon not running`). Never blocks. Every `speak`/`listen`/`converse` result ends with `(audio: mac)` or `(audio: telegram)` on its own line. |
+| `status()` | `{busy, current_tool, waiting, call}`: what holds the lock and the daemon's call state (`none`/`ringing`/`connected`/`daemon not running`/`error: ...`). Never blocks. Every `speak`/`listen`/`converse` result ends with `(audio: telegram)` on its own line (kept for the permission rule in `~/.claude/settings.json` that keys on it). |
 
-`speak` and `listen` never overlap (a process-wide lock). Tool functions are
-async and run the audio work in a worker thread so the MCP event loop stays
+Without a connected call, `speak`/`listen`/`converse` raise `<tool> needs a
+connected Telegram call (call state is ...); place one with the call tool`.
+`speak` and `listen` never overlap (a cross-process lock at
+`~/.algolearn-speak/audio.lock`, shared by every session on this host). Tool
+functions are async and run the work in a thread so the MCP event loop stays
 responsive during a long `listen`.
 
 ## Files
@@ -26,13 +34,8 @@ responsive during a long `listen`.
 - `speak_server.py` — the MCP server. `main()` starts a background thread that
   loads Kokoro and Whisper (about 9 s on the M1 Pro), then runs the MCP stdio
   loop. Tool calls block on the loading event; a load failure is raised into
-  every tool call rather than hidden. This process never imports `sounddevice`
-  — see below.
-- `speak_audio_worker.py` — the only code in this repo that touches
-  `sounddevice`/PortAudio. Launched fresh (`sys.executable -m
-  speak_audio_worker <play|play-stream|record> ...`) for every single audio
-  operation and exits when that operation finishes. See "Audio process
-  isolation" below for why.
+  every tool call rather than hidden. It opens no audio device.
+- `speak_tone.py` — the beep/chime cue PCM (played into the call).
 - `speak_telegram.py` — `TelegramLink`: the Telegram call itself (Telethon + py-tgcalls + ntgcalls): dial, opener file, 10 ms raw-frame pump, Silero VAD on the owner's audio, `caffeinate` during a call. Instantiated only by the daemon.
 - `speak_telegram_daemon.py` — the `speak-telegram` daemon (one per Mac, launchd: `launchd/com.algolearn.speak-telegram.plist`; holds the Telegram login and the call) and `TelegramClient`, which `speak_server` uses over a Unix socket. `speak_server` never imports Telethon.
 - `pyproject.toml` — uv project, Python 3.12 (mlx-whisper pulls torch; Kokoro
@@ -47,9 +50,9 @@ phone has signal, with the Mac locked or unlocked, outbound-only networking.
 - **One daemon:** `speak-telegram` (launchd) owns the Telegram login (one
   connection per login) and the call; it holds `~/.algolearn-speak/telegram.sock.lock`
   so a second daemon refuses to start. Speak servers are clients over
-  `~/.algolearn-speak/telegram.sock` (0600). **Daemon not running = no call =
-  Mac**, unless a call is expected (then it raises). `call` raises if the daemon
-  is down.
+  `~/.algolearn-speak/telegram.sock` (0600). **Daemon not running = no call**:
+  `speak`/`listen`/`converse` raise (with "call back" if a call was expected),
+  and `call` raises.
 - **Credentials:** `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION`
   (a Telethon StringSession: a login, treat as a password), `TELEGRAM_CALL_TARGET`
   in the repo's git-ignored `.env`. Only the daemon reads them.
@@ -68,11 +71,11 @@ phone has signal, with the Mac locked or unlocked, outbound-only networking.
   outgoing stream is fed every 10 ms (silence when idle) and never bursts
   (bursts sped audio up); ntgcalls aborts in its C++ destructors at exit, so
   the daemon always leaves via `os._exit`.
-- **Routing:** a connected call wins (route `telegram`, result ends
-  `(audio: telegram)`), otherwise the Mac. A call that ends mid-operation
-  raises `Telegram call ended during ...`; the rule of engagement is to call
-  back. No voice-clone archiving on the telegram route. The call is shared by
-  every session (they take turns through the audio lock).
+- **Call required:** `speak`/`listen`/`converse` run only on a connected call
+  (results end `(audio: telegram)`). A call that ends mid-operation raises
+  `Telegram call ended during ...`; the rule of engagement is to call back.
+  Captures are not archived. The call is shared by every session (they take
+  turns through the audio lock).
 - **Audio failure and diagnostics:** if the owner answers but the media connect
   fails (`ntgcalls.BaseRTCException`, e.g. `TelegramServerError`), `call` returns
   `answered but audio failed to connect: <error>`, the call is discarded, and the
@@ -96,44 +99,8 @@ phone has signal, with the Mac locked or unlocked, outbound-only networking.
   private-call API is undocumented, so upgrade only deliberately, with a re-test.
 - Tests: `tests/test_speak_telegram.py` (link vs fake py-tgcalls),
   `tests/test_speak_telegram_daemon.py` (daemon + client over a temp socket),
-  `tests/test_speak_server_telegram.py` (routing and tools vs a fake client).
+  `tests/test_speak_server_telegram.py` (tools vs a fake client).
   No test contacts Telegram.
-
-## Audio process isolation
-
-`docs/AUDIO_LIFECYCLE_AUDIT.md` has the full investigation. Short version:
-PortAudio's cached device snapshot (default device = Frank's AirPods Pro, a
-Bluetooth device that macOS suspends after idle) goes stale after the machine
-sits for roughly 2+ hours, and the first stream opened against a stale
-snapshot fails with `PortAudioError -9986`. This is not a leak in this
-codebase — every stream was already opened via `with` and closed
-deterministically — it's process-wide PortAudio state that only a fresh
-process reliably clears. Re-exec-in-place was tried and rejected: it breaks
-the MCP stdio pipe Claude Code holds open.
-
-The fix: `speak_server.py` never calls into `sounddevice` at all. Every
-`sd.OutputStream` / `sd.InputStream` / `sd.play` open happens inside
-`speak_audio_worker.py`, run as a subprocess launched fresh per `speak`/
-`listen`/`converse` call:
-
-- **Playback** (`speak`, and the tone cues in `_cue`/`_ack`): the server
-  writes PCM to a temp file (short cues, `play`) or pipes PCM chunks over
-  stdin (TTS output, `play-stream`) to a worker process; the worker opens the
-  output stream, plays, and exits.
-- **Recording** (`listen`): the server launches a `record` worker with the
-  VAD/timing parameters; the worker owns the whole capture loop — including
-  the Silero VAD start/stop gating (it loads its own VAD model, ~1s, fresh
-  every call) — and writes the captured PCM to a temp file on success, or
-  exits with `speak_audio_worker.TIMEOUT_EXIT_CODE` if nobody spoke in time.
-  The server then transcribes with the parent's already-warm Whisper model.
-- If a worker exits non-zero (not the timeout code), the server retries once
-  with a brand-new worker process (cheap; a fresh process never inherits the
-  bad snapshot) before raising a `RuntimeError` with the worker's stderr tail.
-- `SPEAK_AUDIO_DRY_RUN=1` makes the worker synthesize silence/noise instead of
-  touching a real device — used by tests, never in normal operation.
-
-There is no long-lived PortAudio state anywhere in this repo anymore, so
-there is nothing left to go stale between calls.
 
 ## Configuration (environment variables, read at startup)
 
@@ -145,49 +112,12 @@ there is nothing left to go stale between calls.
 | `SPEAK_SPEED` | `1.0` | Speech rate multiplier |
 | `SPEAK_LANGUAGE` | `en` | Whisper language hint |
 | `SPEAK_ACK_TEXT` | `Processing.` | Spoken after every successful `listen`, right after the rising chime |
-| `SPEAK_INPUT_DEVICE` | unset | Substring of an input device's name (e.g. `Logi USB Headset`). When set, the record worker resolves it via `sd.query_devices(name, kind="input")` -- `kind="input"` so a device that exposes both an input and output entry under the same name (a USB headset) resolves to its input side without an ambiguous-match error. No fallback: zero or multiple matches raises rather than silently using the default device. When unset, recording uses the current default-device behaviour, unchanged. |
-| `SPEAK_SAVE_DIR` | unset | Absolute path to an existing, writable directory. When set, every successful `listen`/`converse` capture that produced a non-empty transcript is saved as `<dir>/<UTC timestamp>_<n>.wav` (mono int16) plus a sibling `<same name>.txt` with the Whisper transcript -- a ready-made voice-clone reference set. The directory must already exist and be writable; it is never created automatically, and the server fails at startup if it isn't. |
-| `SPEAK_OUTPUT_DEVICE` | unset | Substring of an output device's name (e.g. `Logi USB Headset`). Resolved via `sd.query_devices(name, kind="output")` -- `kind="output"` so a device with both input and output entries under the same name resolves to its output side. No fallback: zero or multiple matches raises. Applies to every playback path: `speak`'s streamed TTS (`play-stream`), the server's tone cues (`play`, used for the ear-closed/timeout beeps and the "Processing" ack), and the in-worker ear-open cue played by the `record` worker itself. When unset, playback uses the current default-device behaviour, unchanged. |
 | `SPEAK_QUIET_HOURS` | `22:00-07:00` | No-call window, local time, may wrap midnight. Validated at startup. |
 
-Models are cached under `~/.cache/huggingface`. Audio devices are whatever
-macOS has as default input and output. Set them in System Settings, Sound,
-unless `SPEAK_INPUT_DEVICE`/`SPEAK_OUTPUT_DEVICE` override them.
-
-### Native-rate capture and archiving
-
-When `SPEAK_INPUT_DEVICE` names a device whose native sample rate
-(`default_samplerate`) is above 16 kHz, the record worker opens the input
-stream at that native rate instead of 16 kHz. Every block is resampled down
-to 16 kHz (`scipy.signal.resample_poly`) before it reaches Silero VAD and
-Whisper, so the transcription path is byte-for-byte the same 16 kHz
-contract as before -- `SPEAK_INPUT_DEVICE` never changes what gets
-transcribed, only what gets archived. When `SPEAK_SAVE_DIR` is also set,
-the un-resampled native-rate audio is captured alongside the resampled
-16 kHz stream and saved to the archive -- higher-fidelity material for
-voice cloning than the 16 kHz path Whisper needs. If the device's native
-rate is at or below 16 kHz, or `SPEAK_INPUT_DEVICE` is unset, the archived
-WAV is simply the 16 kHz capture -- there is no second stream to prefer.
-
-### Configuring in `~/.claude.json`
-
-All three variables go in the `speak` MCP server's `env` block:
-
-```json
-"speak": {
-  "command": "/Users/frankg/workspace/algolearn/live/algolearn-speak/.venv/bin/algolearn-speak",
-  "env": {
-    "SPEAK_INPUT_DEVICE": "Logi USB Headset",
-    "SPEAK_OUTPUT_DEVICE": "Logi USB Headset",
-    "SPEAK_SAVE_DIR": "/absolute/path/to/an/existing/writable/directory"
-  }
-}
-```
-
-A session restart (new Claude Code session, or `/mcp` then reconnect) is
-required to pick up any of these -- this MCP server never restarts
-itself (see "Audio process isolation" above), and its env is read once at
-process start.
+Models are cached under `~/.cache/huggingface`. Environment variables go in
+the `speak` MCP server's `env` block in `~/.claude.json`; a new session (or
+`/mcp` then reconnect) picks up a change, since env is read once at process
+start.
 
 ## Registration with Claude Code
 
@@ -207,26 +137,15 @@ uv run algolearn-speak                    # run the server on stdio (for manual 
 .venv/bin/python -m unittest discover -s tests   # run all tests
 ```
 
-Smoke test without MCP: import `speak_server`, call `engines.load()`, then
-`_speak_impl("hello")` and `_listen_impl(30, 1.2, 10)`.
+Run the tests with `HOME` pointed at a scratch directory while a live call may
+be in progress: the lock is resolved under `$HOME/.algolearn-speak` at import
+time, and the tests must never contend with the live one.
+
+Smoke test without MCP: start the daemon, place a call, then import
+`speak_server`, call `engines.load()`, and `_speak_impl("hello")` /
+`_listen_impl(30, 1.2, 10)`.
 
 ## Rules
 
 - No fallback engines. One STT, one TTS, one VAD. Failures raise.
 - Log to stderr only. Stdout is the MCP transport.
-- The microphone permission belongs to the terminal app that launched Claude
-  Code. If `listen` returns silence forever, check System Settings, Privacy and
-  Security, Microphone.
-
-## Microphone notes (verified 2026-09-02)
-
-- The server records from whatever macOS has as the default input. With the
-  lid closed (clamshell mode) the built-in MacBook mic returns exact zeros.
-  The C-Media "USB Advanced Audio Device" adapter delivers only noise floor
-  unless a mic is plugged into it. AirPods Pro work as soon as they connect
-  and become the default input; first live round trip was transcribed exactly.
-- Terminal already has the microphone permission. If a different app launches
-  Claude Code (iTerm, VS Code, the desktop app), that app needs its own grant.
-- A mic that returns exact digital silence is a permission or hardware issue,
-  not a VAD threshold issue. Check levels with `sounddevice.rec` before touching
-  the server.

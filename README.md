@@ -1,11 +1,15 @@
 # algolearn-speak
 
-Talk to Claude Code out loud. This is a small MCP server that gives Claude an
-ear and a voice on your Mac: Claude calls `speak` to say something, `listen` to
-hear you, or `converse` to do both in one round trip. Nothing leaves the
-machine. Speech synthesis is Kokoro-82M, transcription is Whisper
-large-v3-turbo, and end-of-speech detection is Silero VAD, all running on Apple
-Silicon via MLX.
+Talk to Claude Code out loud over a Telegram voice call. This is a small MCP
+server that gives Claude an ear and a voice: Claude calls `call` to phone you
+on Telegram, then `speak` to say something, `listen` to hear you, or `converse`
+to do both in one round trip. Speech synthesis is Kokoro-82M, transcription is
+Whisper large-v3-turbo, and end-of-speech detection is Silero VAD, all running
+on Apple Silicon via MLX.
+
+The server is Telegram only. It never opens a local microphone or speaker:
+`speak`, `listen`, and `converse` work only while a Telegram call is connected
+and raise otherwise.
 
 If you are an agent setting this up for someone: follow "Setup" top to bottom,
 then run "Verify". The whole thing takes a few minutes, most of it model
@@ -18,8 +22,10 @@ downloads.
 - [uv](https://docs.astral.sh/uv/) installed (`brew install uv`). It will fetch
   Python 3.12 on its own if needed.
 - [Claude Code](https://claude.com/claude-code) installed.
-- A microphone and speakers. The built-in ones work when the lid is open.
-  AirPods work too. About 3 GB of disk for the models.
+- `ffmpeg` (`brew install ffmpeg`): py-tgcalls plays the call's opening
+  greeting through it.
+- A second Telegram account to call from, with its API keys and session (see
+  [Telegram calls](#telegram-calls)). About 3 GB of disk for the models.
 
 ## Setup
 
@@ -36,23 +42,18 @@ downloads.
    take a few minutes. Later starts take about 10 seconds.
 
    ```bash
-   uv run python -c "import speak_server as s; s.engines.load(); s._speak_impl('Setup complete.')"
+   uv run python -c "import speak_server as s; s.engines.load()"
    ```
 
-   You should hear "Setup complete" from your speakers. If you hear nothing,
-   check the output device in System Settings, Sound.
+3. Set up the Telegram credentials in `.env` and install the `speak-telegram`
+   daemon (see [Telegram calls](#telegram-calls)).
 
-3. Register the server with Claude Code at user scope so it is available in
+4. Register the server with Claude Code at user scope so it is available in
    every project. Use the absolute path to the venv entrypoint:
 
    ```bash
    claude mcp add --scope user speak -- "$(pwd)/.venv/bin/algolearn-speak"
    ```
-
-4. Grant microphone access. macOS asks the first time audio is recorded, and
-   the permission belongs to the app that launched Claude Code (Terminal,
-   iTerm, VS Code, or the desktop app). If nothing is ever heard, check System
-   Settings, Privacy and Security, Microphone, and enable that app.
 
 ## Verify
 
@@ -60,43 +61,42 @@ Start a new Claude Code session, or run `/mcp` in an existing one and
 reconnect. Then type:
 
 ```
-talk to me
+call me
 ```
 
-Claude will speak, you will hear a beep, and you can answer out loud. When you
-stop talking you hear a rising chime and the word "Processing", which means
-your words were transcribed and handed to Claude.
-
-To test the microphone without Claude in the loop:
-
-```bash
-uv run python -c "import speak_server as s; s.engines.load(); print(s._listen_impl(30, 1.2, 10))"
-```
-
-Say something after the beep. Your words should be printed.
+Your phone rings on Telegram. When you answer, Claude speaks its greeting, you
+hear a beep, and you can answer out loud. When you stop talking you hear a
+rising chime and the word "Processing", which means your words were
+transcribed and handed to Claude.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `speak(text)` | Says `text` through the default output. Streams sentence by sentence. Returns the spoken duration. |
-| `listen(max_seconds=120, silence_seconds=1.2, start_timeout_seconds=45)` | High beep, records the default input until you have been quiet for `silence_seconds` (or spoke for `max_seconds`). Low beep, transcribes, then a rising chime and "Processing". Raises if nobody speaks within `start_timeout_seconds`. |
+| `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call to you (from a second Telegram account). `greeting` is spoken when you answer; then `call` listens and returns your words. While connected, `speak`/`listen`/`converse` run over the call. Works with the Mac locked; no calls 22:00-07:00. See [Telegram calls](#telegram-calls). |
+| `speak(text)` | Says `text` into the connected call. Returns the spoken duration. |
+| `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep, records your call audio until you have been quiet for `silence_seconds` (or spoke for `max_seconds`). Low beep, transcribes, then a rising chime and "Processing". Raises if nobody speaks within `start_timeout_seconds`. |
 | `converse(text, ...)` | `speak` then `listen`. Returns your words. |
-| `call(greeting, override_quiet_hours=False)` | Telegram voice call to you (from a second Telegram account). `greeting` is spoken when you answer; it is a statement, not a question, because call() does not listen or beep afterwards (the first `converse` asks). While connected, `speak`/`listen`/`converse` run over the call. Works with the Mac locked; no calls 22:00-07:00. See [Telegram calls](#telegram-calls). |
-| `hang_up()` | Ends that call. |
+| `hang_up()` | Ends the call. |
 | `call_debug(lines=50)` | The daemon's recent structured call events, log tail, call state, pid, uptime, debug flag. Never takes the audio lock; `{"daemon": "daemon not running"}` if down. |
 | `set_call_debug(enabled)` | Raises/restores the daemon's DEBUG logging (speak, py-tgcalls, Telethon) at runtime. |
-| `status()` | Returns `{"busy": bool, "current_tool": str \| None, "waiting": int, "audio": "telegram" \| "mac" \| "error", "call": str}` -- what's running now, how many calls are queued behind it, and where audio goes next. Never blocks. |
+| `status()` | Returns `{"busy": bool, "current_tool": str \| None, "waiting": int, "call": str}` -- what's running now, how many calls are queued behind it, and the call state. Never blocks. |
+
+Without a connected call, `speak`, `listen`, and `converse` raise
+`<tool> needs a connected Telegram call (call state is ...); place one with the
+call tool`. Every `speak`/`listen`/`converse` result ends with
+`(audio: telegram)` on its own line.
 
 `speak`, `listen`, and `converse` are serialized through one lock that is both
 process-wide (a `threading.Lock`, for two calls in the same server process)
 and cross-process (an `fcntl.flock` on `~/.algolearn-speak/audio.lock`, for
 two separate `speak_server.py` processes -- e.g. two Claude Code sessions
-each running their own copy of this server): if two callers use the mic/
-speaker at once, the second one queues and waits for the first to finish,
-then proceeds -- it is never rejected or allowed to talk over the first.
-`status()` reports the queue depth and which tool currently holds the lock,
-including `"<tool> (pid <n>, other process)"` when another process holds it.
+each running their own copy of this server): the call is shared, so if two
+callers use it at once, the second one queues and waits for the first to
+finish, then proceeds -- it is never rejected or allowed to talk over the
+first. `status()` reports the queue depth and which tool currently holds the
+lock, including `"<tool> (pid <n>, other process)"` when another process holds
+it.
 
 ## Telegram calls
 
@@ -110,6 +110,8 @@ and the "Telegram calls" section of CLAUDE.md.
 
 ## Audio cues
 
+All cues are played into the call.
+
 | Cue | Meaning |
 |---|---|
 | Long high beep | The ear is open. Start talking. |
@@ -120,7 +122,8 @@ and the "Telegram calls" section of CLAUDE.md.
 ## Configuration
 
 All optional, read from the environment at startup. To set one for Claude
-Code, pass `-e NAME=value` to `claude mcp add`.
+Code, pass `-e NAME=value` to `claude mcp add`, or edit the `speak` entry's
+`env` block in `~/.claude.json`.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -130,38 +133,11 @@ Code, pass `-e NAME=value` to `claude mcp add`.
 | `SPEAK_SPEED` | `1.0` | Speech rate multiplier |
 | `SPEAK_LANGUAGE` | `en` | Whisper language hint |
 | `SPEAK_ACK_TEXT` | `Processing.` | Word spoken after each successful `listen` |
-| `SPEAK_INPUT_DEVICE` | unset | Substring of an input device's name, e.g. `Logi USB Headset`. Resolved via `kind="input"` so a headset with both input and output entries under the same name doesn't raise an ambiguous-match error. Unset means the current default-device behaviour. |
-| `SPEAK_SAVE_DIR` | unset | Absolute path to an existing, writable directory. When set, every successful capture with a non-empty transcript is saved there as a `.wav` + matching `.txt` transcript -- voice-clone reference material. The directory must already exist; it is never created for you. |
-| `SPEAK_OUTPUT_DEVICE` | unset | Substring of an output device's name, e.g. `Logi USB Headset`. Resolved via `kind="output"` so a headset with both input and output entries under the same name doesn't raise an ambiguous-match error. Applies to `speak`'s TTS playback, the tone/ack cues, and the ear-open cue. Unset means the current default-device behaviour. |
-
-Audio devices are whatever macOS has as default input and output. Change them
-in System Settings, Sound, unless `SPEAK_INPUT_DEVICE`/`SPEAK_OUTPUT_DEVICE`
-override them -- set both to the same device to put the mic and speakers on
-one headset.
-
-If `SPEAK_INPUT_DEVICE` names a device whose native rate is above 16 kHz, the
-worker records at that native rate and resamples down to 16 kHz for VAD and
-Whisper (transcription is unaffected); when `SPEAK_SAVE_DIR` is also set, the
-archived `.wav` keeps the un-resampled, higher-fidelity native-rate audio.
-
-To set these for Claude Code, edit the `speak` entry's `env` block in
-`~/.claude.json`:
-
-```json
-"speak": {
-  "command": "/Users/frankg/workspace/algolearn/live/algolearn-speak/.venv/bin/algolearn-speak",
-  "env": {
-    "SPEAK_INPUT_DEVICE": "Logi USB Headset",
-    "SPEAK_OUTPUT_DEVICE": "Logi USB Headset",
-    "SPEAK_SAVE_DIR": "/absolute/path/to/an/existing/writable/directory"
-  }
-}
-```
+| `SPEAK_QUIET_HOURS` | `22:00-07:00` | No-call window, local time, may wrap midnight |
 
 Then start a new Claude Code session, or run `/mcp` and reconnect `speak`, for
 the new environment to take effect -- the server reads its environment once at
-startup and, per this repo's audio-process-isolation design, is never
-restarted by its own code.
+startup.
 
 ## Troubleshooting
 
@@ -170,11 +146,9 @@ restarted by its own code.
   absolute and must point into this repo's `.venv`.
 - **First tool call hangs for 10 seconds.** Normal. The models load in the
   background at startup and the first call waits for them.
-- **`listen` times out even though you spoke.** The mic is returning silence.
-  With the lid closed the built-in MacBook mic returns exact zeros. A USB audio
-  adapter with nothing plugged in does the same. Pick a real input device in
-  System Settings, Sound, and check the microphone permission for your
-  terminal app.
+- **`speak`/`listen` raise "needs a connected Telegram call".** There is no
+  call. Place one with `call`. If `status()` shows `daemon not running`, start
+  the `speak-telegram` daemon (see CLAUDE.md, "Telegram calls").
 - **You changed `speak_server.py`.** The running server keeps the old code.
   Run `/mcp` in Claude Code and reconnect `speak`, or start a new session.
 

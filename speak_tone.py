@@ -1,11 +1,5 @@
-"""Shared tone synthesis for algolearn-speak.
-
-A single `tone()` implementation used by both speak_server.py (for the
-"processing" chime and the post-recording "ear closed" beep, played by a
-short-lived `play` worker) and speak_audio_worker.py's `cmd_record` (for the
-"ear open" cue, played in-process by the record worker itself, from inside
-the same process that holds `sd.InputStream` open on the mic -- see
-cmd_record's docstring for why that matters on Bluetooth devices).
+"""Tone synthesis for algolearn-speak's cues (ear open, ear closed, the
+"processing" chime), played into the Telegram call by speak_server.py.
 
 No hardware access here: this module only does numpy math.
 """
@@ -15,10 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 # Kokoro's output rate. Cues are synthesized at this rate too so a cue and a
-# TTS chunk can share one playback path in speak_server.py (_play_pcm /
-# _play_pcm_stream); the record worker resamples to the mic's own rate is
-# not needed since it plays the cue through a separate float32 OutputStream
-# at this same rate (see cmd_record).
+# TTS chunk share one playback path into the call.
 TONE_RATE = 24_000
 
 

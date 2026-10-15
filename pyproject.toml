@@ -1,7 +1,7 @@
 [project]
 name = "algolearn-speak"
 version = "0.1.0"
-description = "Local voice MCP server for Claude Code: an ear (Whisper on MLX) and a voice (Kokoro on MLX), no cloud."
+description = "Telegram voice MCP server for Claude Code: calls the owner on Telegram; Whisper STT and Kokoro TTS on MLX."
 license = "MIT"
 requires-python = ">=3.12,<3.13"
 dependencies = [
@@ -10,9 +10,8 @@ dependencies = [
     "mlx-audio>=0.5.1",
     "misaki[en]>=0.9",
     "silero-vad>=5.1",
-    "sounddevice>=0.5.6",
     "numpy>=1.26",
-    "scipy>=1.11",  # resample_poly, used only for optional native-rate input-device capture
+    "scipy>=1.11",  # resample_poly: TTS/cues up to the call's 48 kHz and the owner's audio down to 16 kHz (speak_telegram.py)
     # spaCy model misaki (Kokoro G2P) needs; pinned here so `uv sync` never removes it
     "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
     # Telegram calls (speak-telegram daemon). Pinned exactly: py-tgcalls' private-call API is
@@ -32,7 +31,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["speak_server.py", "speak_audio_worker.py", "speak_telegram.py", "speak_telegram_daemon.py", "speak_tone.py"]
+only-include = ["speak_server.py", "speak_telegram.py", "speak_telegram_daemon.py", "speak_tone.py"]
 
 [tool.hatch.metadata]
 allow-direct-references = true

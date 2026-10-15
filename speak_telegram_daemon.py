@@ -21,7 +21,7 @@ exit non-zero right after the caller has its reply, so launchd (KeepAlive)
 restarts it with fresh ntgcalls state.
 
 No fallbacks: a daemon that is not running means no call (`state()` returns
-NOT_RUNNING, which speak_server routes to the Mac unless a call is expected);
+NOT_RUNNING, on which speak_server's speak/listen/converse raise: there is no local audio);
 every other operation against a missing daemon raises.
 """
 

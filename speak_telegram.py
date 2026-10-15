@@ -54,7 +54,7 @@ OPENER_TAIL_SECONDS = 1.0  # wait after the opener file before switching to raw 
 RING_TIMEOUT_SECONDS = 60
 CONNECT_GRACE_SECONDS = 30  # py-tgcalls waits for the media connection with no timeout of its own
 PUMP_MAX_LAG = 0.05        # behind by more than this -> reset the clock instead of bursting
-PRE_ROLL_SECONDS = 0.5     # same pre-roll as speak_audio_worker.cmd_record
+PRE_ROLL_SECONDS = 0.5     # audio kept from just before speech starts
 HANG_UP_TIMEOUT = 8.0      # leave_call; with disconnect, stays inside launchd's stop window
 DISCONNECT_TIMEOUT = 5.0
 EVENT_BUFFER_SIZE = 500
@@ -207,7 +207,7 @@ def preload_silero_vad() -> None:
 
 
 def silero_vad_factory(silence_seconds: float):
-    """A Silero VADIterator with speak_audio_worker.cmd_record's settings (model from preload_silero_vad)."""
+    """A Silero VADIterator (threshold 0.5, 16 kHz; model from preload_silero_vad)."""
     import torch
     from silero_vad import VADIterator
 
@@ -671,7 +671,7 @@ class TelegramLink:
     def record(self, max_seconds: float, silence_seconds: float, start_timeout_seconds: float,
                cue: np.ndarray | None, cue_rate: int):
         """Play the ear-open `cue`, then capture the owner until `silence_seconds` of quiet
-        after speech (Silero, speak_audio_worker.cmd_record's rules). Returns 16 kHz float32,
+        after speech (Silero VAD). Returns 16 kHz float32,
         or TIMEOUT if nobody spoke within `start_timeout_seconds`. Raises CallEnded."""
         if cue is not None and len(cue):
             self.play(cue, cue_rate)

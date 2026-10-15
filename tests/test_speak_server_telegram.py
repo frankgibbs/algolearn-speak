@@ -1,8 +1,8 @@
-"""speak_server's Telegram route and call tools (docs/DESIGN_TELEGRAM_CALL.md sections 5-7).
+"""speak_server's Telegram-only speech tools and call tools (docs/DESIGN_TELEGRAM_CALL.md sections 5-7).
 
 `speak_server.telegram` (the daemon client) is replaced by a scripted fake, so
-no daemon or Telegram is involved; the Mac route still runs the real dry-run
-audio worker.
+no daemon or Telegram is involved. Every test uses a throwaway cross-process
+lock, never the live ~/.algolearn-speak/audio.lock.
 """
 
 from __future__ import annotations
@@ -10,13 +10,13 @@ from __future__ import annotations
 import asyncio
 import datetime
 import os
-import subprocess
+import shutil
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-os.environ["SPEAK_AUDIO_DRY_RUN"] = "1"
 os.environ["SPEAK_TELEGRAM_SOCKET"] = "/nonexistent-speak-telegram-test/telegram.sock"
 sys.path.insert(0, os.path.dirname(HERE))
 
@@ -93,6 +93,15 @@ class ServerCase(unittest.TestCase):
         p = mock.patch.object(s, "_call_expected", False)
         p.start()
         self.addCleanup(p.stop)
+        lock_dir = tempfile.mkdtemp(prefix="speak-lock-test-")
+        self.addCleanup(shutil.rmtree, lock_dir, True)
+        test_lock = s._SerializingLock(
+            lock_path=os.path.join(lock_dir, "audio.lock"),
+            sidecar_path=os.path.join(lock_dir, "audio.lock.json"),
+        )
+        p = mock.patch.object(s, "audio_lock", test_lock)
+        p.start()
+        self.addCleanup(p.stop)
 
     def tearDown(self):
         s.engines.kokoro, ready, s.engines.error = self._orig
@@ -111,38 +120,27 @@ class ServerCase(unittest.TestCase):
         return mock.patch.object(s.datetime, "datetime", fake_dt)
 
 
-class TestRouting(ServerCase):
+class TestTelegramOnly(ServerCase):
     def test_connected_call_carries_speech_cues_and_listening(self):
         fake = self.use(FakeTelegram([tg.CONNECTED]))
         whisper = mock.Mock()
         whisper.transcribe.return_value = {"text": "hello over telegram"}
-        workers = []
-        real_popen, real_run = subprocess.Popen, subprocess.run
-        with mock.patch.object(subprocess, "Popen", side_effect=lambda *a, **k: workers.append(a) or real_popen(*a, **k)), \
-                mock.patch.object(subprocess, "run", side_effect=lambda *a, **k: workers.append(a) or real_run(*a, **k)), \
-                mock.patch.dict(sys.modules, {"mlx_whisper": whisper}), \
-                mock.patch.object(s, "SAVE_DIR", "/should/never/be/written"):
-            reply, route = s._converse_sync("hi", 5, 1.2, 3)
-        self.assertEqual((reply, route), ("hello over telegram", "telegram"))
-        self.assertEqual(workers, [])   # the Mac's audio worker never ran
+        with mock.patch.dict(sys.modules, {"mlx_whisper": whisper}):
+            reply = s._converse_sync("hi", 5, 1.2, 3)
+        self.assertEqual(reply, "hello over telegram")
         kinds = [op[0] for op in fake.ops]
         self.assertEqual(kinds[0], "play")                     # the spoken text
         record = next(op for op in fake.ops if op[0] == "record")
         self.assertEqual(record, ("record", 5, 1.2, 3, True, s.TTS_RATE))   # with the ear-open cue
         self.assertGreaterEqual(kinds.count("play"), 3)        # + ear-closed cue, chime, "Processing"
-        self.assertEqual(s._route, "mac")                      # reset afterwards
 
-    def test_no_call_uses_the_mac(self):
-        for state in (tg.NONE, NOT_RUNNING):
+    def test_no_call_raises_and_touches_nothing(self):
+        for state in (tg.NONE, NOT_RUNNING, tg.RINGING):
             fake = self.use(FakeTelegram([state]))
-            _, route = s._speak_sync("hi")
-            self.assertEqual(route, "mac", state)
-            self.assertEqual(fake.ops, [])
-
-    def test_ringing_refuses_to_route(self):
-        self.use(FakeTelegram([tg.RINGING]))
-        with self.assertRaisesRegex(RuntimeError, "ringing but not connected"):
-            s._speak_sync("hi")
+            with self.assertRaisesRegex(RuntimeError, f"speak needs a connected Telegram call \\(call state is {state}\\); place one with the call tool"):
+                s._speak_sync("hi")
+            self.assertEqual(fake.ops, [], state)
+            self.assertFalse(s._call_expected)
 
     def test_drop_during_speak_raises(self):
         self.use(FakeTelegram([tg.CONNECTED, tg.NONE]))
@@ -205,7 +203,7 @@ class TestSharedCall(ServerCase):
         self.assertTrue(s._call_expected)
         self.assertEqual(s._call_generation, 7)
 
-    def test_drop_after_joining_raises_instead_of_using_the_mac(self):
+    def test_drop_after_joining_raises_call_back(self):
         fake = self.use(FakeTelegram([tg.CONNECTED, tg.CONNECTED, tg.NONE], generation=7))
         s._speak_sync("hi")
         fake.end_reason = tg.END_REMOTE
@@ -216,8 +214,8 @@ class TestSharedCall(ServerCase):
         fake = self.use(FakeTelegram([tg.CONNECTED, tg.CONNECTED, tg.NONE], generation=7))
         s._speak_sync("hi")
         fake.end_reason = tg.END_HUNG_UP
-        _, route = s._speak_sync("hi")
-        self.assertEqual(route, "mac")
+        with self.assertRaisesRegex(RuntimeError, "needs a connected Telegram call"):
+            s._speak_sync("hi")
         self.assertFalse(s._call_expected)
 
     def test_a_hang_up_of_an_older_call_does_not_excuse_a_newer_drop(self):
@@ -237,14 +235,14 @@ class TestSharedCall(ServerCase):
 
 
 class TestCallExpected(ServerCase):
-    def test_drop_between_tools_raises_once_then_mac(self):
+    def test_drop_between_tools_raises_call_back_once_then_needs_a_call(self):
         self.use(FakeTelegram([tg.NONE, tg.NONE, tg.NONE]))
         s._call_expected = True
         with self.assertRaisesRegex(RuntimeError, "Telegram call ended during speak; call back"):
             s._speak_sync("hi")
         self.assertFalse(s._call_expected)
-        _, route = s._speak_sync("hi")
-        self.assertEqual(route, "mac")
+        with self.assertRaisesRegex(RuntimeError, "needs a connected Telegram call"):
+            s._speak_sync("hi")
 
     def test_daemon_gone_while_expected_raises(self):
         self.use(FakeTelegram([NOT_RUNNING]))
@@ -278,7 +276,6 @@ class TestCallTool(ServerCase):
         # exact sequence: dial, record, then ear-closed cue, rising chime, spoken "Processing"
         self.assertEqual([op[0] for op in fake.ops], ["call", "record", "play", "play", "play"])
         self.assertTrue(s._call_expected)
-        self.assertEqual(s._route, "mac")
 
     def test_greeting_and_listen_hold_the_lock_as_one_unit(self):
         fake = self.use(answered_fake())
@@ -297,11 +294,10 @@ class TestCallTool(ServerCase):
         with self.at(12, 0), whisper_says("x"):
             with self.assertRaisesRegex(TimeoutError, "nobody spoke"):
                 s._call_sync("Hi, what's up?", False, *LISTEN)
-        # the low timeout cue went into the call as a play op (after the dial), not to the Mac
+        # the low timeout cue went into the call as a play op (after the dial)
         self.assertEqual([op[0] for op in fake.ops], ["call", "play"])
         self.assertEqual(fake.ops[1][2], s.TTS_RATE)
         self.assertTrue(s._call_expected)
-        self.assertEqual(s._route, "mac")
 
     def test_drop_during_the_listen_raises_call_ended(self):
         fake = FakeTelegram([tg.NONE, tg.CONNECTED, tg.CONNECTED, tg.NONE])
@@ -433,22 +429,15 @@ class TestStatus(ServerCase):
     def test_connected(self):
         self.use(FakeTelegram([tg.CONNECTED]))
         r = asyncio.run(s.status())
-        self.assertEqual((r["call"], r["audio"]), (tg.CONNECTED, "telegram"))
+        self.assertEqual(r, {"busy": False, "current_tool": None, "waiting": 0, "call": tg.CONNECTED})
 
     def test_no_daemon(self):
         self.use(FakeTelegram([NOT_RUNNING]))
-        r = asyncio.run(s.status())
-        self.assertEqual((r["call"], r["audio"]), (NOT_RUNNING, "mac"))
-
-    def test_expected_call_gone_is_an_error(self):
-        self.use(FakeTelegram([tg.NONE]))
-        s._call_expected = True
-        self.assertEqual(asyncio.run(s.status())["audio"], "error")
+        self.assertEqual(asyncio.run(s.status())["call"], NOT_RUNNING)
 
     def test_unreadable_state_is_reported_not_raised(self):
         self.use(FakeTelegram([RuntimeError("socket timed out")]))
-        r = asyncio.run(s.status())
-        self.assertEqual((r["call"], r["audio"]), ("error: socket timed out", "error"))
+        self.assertEqual(asyncio.run(s.status())["call"], "error: socket timed out")
 
 
 class TestCallDebugTools(ServerCase):
