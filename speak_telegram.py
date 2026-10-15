@@ -19,7 +19,7 @@ Built around what the 2026-10-09 spike verified:
 
 Every call has a generation number and, once over, an end reason: "remote"
 (the owner hung up or the call dropped), "hung_up" (our hang_up), "failed" (an
-error tore it down) or "not_answered". The daemon compares these with a session's
+error tore it down), "not_answered" or "busy". The daemon compares these with a session's
 expected generation to decide whether a call it was using dropped (call back) or
 was hung up on request.
 """
@@ -44,9 +44,9 @@ import numpy as np
 from scipy.signal import resample_poly
 
 from speak_protocol import (  # noqa: F401  (re-exported: the daemon and tests use tg.<name>)
-    ALREADY_CONNECTED, ANSWERED, AUDIO_FAILED_PREFIX, CONNECT_GRACE_SECONDS, CONNECTED, END_FAILED,
-    END_HUNG_UP, END_NOT_ANSWERED, END_REMOTE, HUNG_UP, HUNG_UP_DURING_GREETING, NO_ACTIVE_CALL, NONE,
-    NOT_ANSWERED, OPENER_MIN_SECONDS, RING_TIMEOUT_SECONDS, RINGING, is_audio_failure,
+    ALREADY_CONNECTED, ANSWERED, AUDIO_FAILED_PREFIX, BUSY, CONNECT_GRACE_SECONDS, CONNECTED, END_BUSY,
+    END_FAILED, END_HUNG_UP, END_NOT_ANSWERED, END_REMOTE, HUNG_UP, HUNG_UP_DURING_GREETING, NO_ACTIVE_CALL,
+    NONE, NOT_ANSWERED, OPENER_MIN_SECONDS, REDIAL_GAP_SECONDS, RING_TIMEOUT_SECONDS, RINGING, is_audio_failure,
 )
 
 log = logging.getLogger("speak.telegram")
@@ -233,6 +233,7 @@ class TelegramLink:
         self._generation = 0
         self._end_reason: str | None = None
         self._ended = threading.Event()     # set when the current call ends (read from VAD threads too)
+        self._ended_at: float | None = None # monotonic time the last call ended (REDIAL_GAP_SECONDS)
         self._outgoing = bytearray()
         self._drained: asyncio.Event | None = None
         self._pump_task: asyncio.Task | None = None
@@ -367,6 +368,7 @@ class TelegramLink:
             return
         self._state = NONE
         self._end_reason = reason
+        self._ended_at = time.monotonic()
         self._event("ended", reason=reason, duration_s=round(time.monotonic() - self._call_t0, 3))
         self._ended.set()
         self._listening = False
@@ -391,7 +393,7 @@ class TelegramLink:
     # ------------------------------------------------------------ call / hang up
 
     def call(self, greeting: np.ndarray, rate: int) -> str:
-        budget = RING_TIMEOUT_SECONDS + CONNECT_GRACE_SECONDS + len(greeting) / rate + 15.0
+        budget = REDIAL_GAP_SECONDS + RING_TIMEOUT_SECONDS + CONNECT_GRACE_SECONDS + len(greeting) / rate + 15.0
         return self._run(self._call(greeting, rate), budget, "placing the call")
 
     async def _call(self, greeting: np.ndarray, rate: int) -> str:
@@ -408,6 +410,7 @@ class TelegramLink:
         os.close(fd)
         try:
             opener_seconds = write_opener(opener, greeting, rate)
+            await self._redial_gap()
             self._generation += 1
             self._end_reason = None
             self._ended.clear()
@@ -426,9 +429,16 @@ class TelegramLink:
             self._ring_task = asyncio.current_task()
             try:
                 await self._calls.play(self._user_id, MediaStream(opener, params), CallConfig(timeout=RING_TIMEOUT_SECONDS))
-            except (CallDeclined, CallBusy, TimedOutAnswer, CallDiscarded) as e:
+            except CallBusy as e:
+                # Telegram discarded the call as busy: the owner is on another call, or their app
+                # is still ending the previous one. Its own outcome, never "not answered".
+                log.info("call not placed: CallBusy")
+                self._event("busy", error=describe(e))
+                self._end_call(END_BUSY)
+                return BUSY
+            except (CallDeclined, TimedOutAnswer, CallDiscarded) as e:
                 log.info("call not answered: %s", type(e).__name__)
-                self._event({CallDeclined: "declined", CallBusy: "busy", TimedOutAnswer: "timeout",
+                self._event({CallDeclined: "declined", TimedOutAnswer: "timeout",
                              CallDiscarded: "discarded"}[type(e)], error=describe(e))
                 self._end_call(END_NOT_ANSWERED)
                 return NOT_ANSWERED
@@ -484,6 +494,17 @@ class TelegramLink:
         self._event("connected")
         log.info("call %d connected; raw-frame pump running", self._generation)
         return ANSWERED
+
+    async def _redial_gap(self) -> None:
+        """Wait out the rest of REDIAL_GAP_SECONDS since the last call ended, before dialing.
+        Recorded as its own event (with the previous call's id) so a delayed ring is explained."""
+        if self._ended_at is None:
+            return
+        wait = REDIAL_GAP_SECONDS - (time.monotonic() - self._ended_at)
+        if wait > 0:
+            self._event("redial_gap_wait", wait_s=round(wait, 3), gap_s=REDIAL_GAP_SECONDS)
+            log.info("waiting %.1fs before dialing: the last call ended under %gs ago", wait, REDIAL_GAP_SECONDS)
+            await asyncio.sleep(wait)
 
     # ------------------------------------------------------------ amplitude diagnostics
 

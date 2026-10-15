@@ -155,7 +155,14 @@ the phone has signal.
 - **Quiet hours:** `call` refuses 22:00-07:00 (`SPEAK_QUIET_HOURS`, judged on
   the daemon's clock, `TZ=America/Los_Angeles`) unless
   `override_quiet_hours=True`, used only when the owner said they are up.
-  After `not answered`, wait an hour before calling again. If the owner hangs
+  After `not answered` or `busy`, wait an hour before calling again. The
+  daemon never dials within `REDIAL_GAP_SECONDS` (10 s) of the previous call
+  ending, whatever the reason; a call placed sooner waits out the gap (event
+  `redial_gap_wait`). Verified 2026-10-15: a redial 1.4 s after `hang_up` got
+  `CallBusy`, after which the owner's Telegram app rang every new call for
+  half a second and dropped it without telling Telegram (the daemon saw a
+  60 s ring-out) until the app was force-quit; a redial 10 s after
+  `hang_up` worked. If the owner hangs
   up at any point, call back once right away; if that call is not answered,
   wait an hour (owner decision 2026-10-12).
 - **Pins:** `telethon==1.45.0`, `py-tgcalls==3.0.0`, `ntgcalls==3.0.2`; the

@@ -161,7 +161,7 @@ def _converse_sync(text: str, max_seconds: float, silence_seconds: float, start_
 
 def _call_sync(greeting: str, override_quiet_hours: bool, max_seconds: float, silence_seconds: float,
                start_timeout_seconds: float) -> str:
-    budget = (proto.RING_TIMEOUT_SECONDS + proto.CONNECT_GRACE_SECONDS + len(greeting) / 5
+    budget = (proto.REDIAL_GAP_SECONDS + proto.RING_TIMEOUT_SECONDS + proto.CONNECT_GRACE_SECONDS + len(greeting) / 5
               + _listen_budget(max_seconds, start_timeout_seconds))
     reply = _request(proto.OP_CALL,
                      {"greeting": greeting, "override_quiet_hours": override_quiet_hours,
@@ -323,6 +323,13 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
                                                  spoken); just talk
       "not answered (declined or no answer)"  -- what you have can wait; do not
                                                  call again for at least one hour
+      "busy (the owner's Telegram is on another call, or still ending the previous one)"
+                                              -- Telegram reported the owner busy; the
+                                                 phone did not ring. Same rule as "not
+                                                 answered": do not call again for at
+                                                 least one hour. Never redial right away:
+                                                 a redial into a call that is still
+                                                 ending is what got this outcome.
       "answered, then hung up during the greeting"
                                               -- they picked up but ended the call before
                                                  the greeting finished (often because they
@@ -352,6 +359,10 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
 
     Rule of engagement: if speak/listen/converse raises "Telegram call ended
     during ...", the call dropped mid-conversation -- call back with this tool.
+    The daemon never dials sooner than 10 s after the previous call ended
+    (a redial 1.4 s after a hang-up left the owner's Telegram app dropping
+    every incoming call until it was force-quit); a call placed sooner waits
+    out the rest of that gap before ringing.
     Hang up with `hang_up()` only when the owner asks; they can also hang up
     themselves. If the speak daemon cannot be reached this raises "speak daemon
     at <addr> is not reachable: ...".
