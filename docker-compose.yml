@@ -1,11 +1,11 @@
 # The speak daemon on patrick (docs/DESIGN_REMOTE_DAEMON.md section 7).
-# Deploy directory: /home/frankg/algolearn-speak on patrick (an rsync of this repo without .git,
-# .venv and .env). Start, rebuild and stop are owner actions, run there:
-#   ssh frankg@192.168.86.31 'cd ~/algolearn-speak && docker compose up --build -d'
-# .env (TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION, TELEGRAM_CALL_TARGET) is copied to
-# that directory separately (chmod 600). It is git-ignored and excluded from the image by
-# .dockerignore; env_file hands it to the container at run time, so `docker inspect` shows it to
-# anyone in patrick's docker group.
+# Deployed from this repo with the patrick docker context (no deploy directory on patrick).
+# Start, rebuild and stop are owner actions:
+#   docker --context patrick compose up --build -d
+# .env (TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION, TELEGRAM_CALL_TARGET) is read from
+# this directory by compose. It is git-ignored and excluded from the image by .dockerignore;
+# env_file hands it to the container at run time, so `docker inspect` shows it to anyone in
+# patrick's docker group.
 services:
   speak-telegram:
     build: .

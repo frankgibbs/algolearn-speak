@@ -193,17 +193,16 @@ means "not ready or not running", never "running without models".
 
 ## Deployment on patrick
 
-Deploy directory: `/home/frankg/algolearn-speak` on patrick, an rsync of
-this repo without `.git`, `.venv` and `.env`, plus the `.env` copied there
-separately (`chmod 600`). The image is built there.
+Deployed from this repo with the `patrick` docker context (owner decision
+2026-10-15); there is no deploy directory on patrick. Compose runs here,
+streams the build context to patrick's Docker, and reads the git-ignored
+`.env` from this directory (`env_file`; `.dockerignore` keeps it out of the
+image).
 
 ```
-rsync -a --delete --exclude .git --exclude .venv --exclude .env --exclude __pycache__ \
-  ./ frankg@192.168.86.31:algolearn-speak/
-ssh frankg@192.168.86.31 'cd ~/algolearn-speak && docker compose up --build -d'
+docker --context patrick compose up --build -d
 ```
 
-The `--delete` keeps the `.env`: rsync never deletes an excluded path.
 Workspace rules apply: `up --build -d`, never `down` first, never copy files
 into the container, never run code inside it. Every build, start, restart
 and stop is an owner action, approved per change. Logs: `docker logs

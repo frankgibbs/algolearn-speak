@@ -537,13 +537,11 @@ Section 9 replaces every estimate here with a measurement:
 
 ## 7. Deployment on patrick
 
-The daemon is a compose service, built and started on patrick from the
-deploy directory `/home/frankg/algolearn-speak`, an rsync of this repo
-without `.git`, `.venv` and `.env`:
-`ssh frankg@192.168.86.31 'cd ~/algolearn-speak && docker compose up --build -d'`.
-The `.env` is copied into that directory separately (`chmod 600`); it sits in
-the build context, and `.dockerignore` keeps it out of the image (Owner
-instruction 2026-10-15: scp the `.env` to patrick). The
+The daemon is a compose service, built and started on patrick from this repo
+with the `patrick` docker context (owner decision 2026-10-15; no deploy
+directory on patrick): `docker --context patrick compose up --build -d`.
+Compose reads the git-ignored `.env` from the repo directory and passes it
+via `env_file`; `.dockerignore` keeps it out of the image. The
 workspace deployment rules apply: always rebuild, never copy files into a
 container, never `down` first, and never run tests or interpreters inside
 the running container. Every build, restart and stop is an owner action,
