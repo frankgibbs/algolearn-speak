@@ -28,13 +28,18 @@ from __future__ import annotations
 
 import datetime
 import logging
+import math
 import os
 import re
+import secrets
+import select
 import signal
+import socket
 import socketserver
 import sys
 import threading
 import time
+import zoneinfo
 from collections import deque
 from typing import Callable
 
@@ -53,7 +58,7 @@ MAX_DEBUG_LINES = 1000
 DEBUG_LOGGERS = ("speak", "pytgcalls", "ntgcalls", "telethon")   # ntgcalls' native C++ log has no Python hook
 REQUIRED_TELEGRAM_ENV = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_CALL_TARGET")
 REQUIRED_SPEAK_ENV = ("SPEAK_KOKORO_MODEL", "SPEAK_VOICE", "SPEAK_SPEED", "SPEAK_WHISPER_MODEL",
-                      "SPEAK_LANGUAGE", "SPEAK_ACK_TEXT", "SPEAK_QUIET_HOURS")
+                      "SPEAK_LANGUAGE", "SPEAK_ACK_TEXT", "SPEAK_QUIET_HOURS", "TZ")
 BIND_HOST = "0.0.0.0"   # open to the LAN by design (owner decision 4); no auth, no TLS
 
 
@@ -104,15 +109,21 @@ def _require_env(names: tuple[str, ...]) -> dict[str, str]:
 
 
 def load_settings() -> dict:
-    """SPEAK_* from the compose environment block. All required, no defaults."""
+    """SPEAK_* and TZ from the compose environment block. All required, no defaults. TZ must
+    name a zone in the image's tzdata: glibc would silently run a TZ it cannot find as UTC,
+    which would move quiet hours by seven or eight hours."""
     env = _require_env(REQUIRED_SPEAK_ENV)
+    try:
+        tz = zoneinfo.ZoneInfo(env["TZ"])
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError) as e:
+        raise RuntimeError(f"TZ={env['TZ']!r} is not a zone in this image's tzdata: {e}") from None
     try:
         speed = float(env["SPEAK_SPEED"])
     except ValueError:
         raise RuntimeError(f"SPEAK_SPEED={env['SPEAK_SPEED']!r} is not a number") from None
     if speed <= 0:
         raise RuntimeError(f"SPEAK_SPEED={speed} must be positive")
-    return {**env, "SPEAK_SPEED": speed, "quiet_window": parse_quiet_hours(env["SPEAK_QUIET_HOURS"])}
+    return {**env, "SPEAK_SPEED": speed, "tz": tz, "quiet_window": parse_quiet_hours(env["SPEAK_QUIET_HOURS"])}
 
 
 def load_env() -> dict[str, str]:
@@ -201,14 +212,15 @@ class AudioLock:
 
 class Session:
     """One request's view of the client session's call expectation (design section 4.4).
-    `generation` is the call the session expects (None: no expectation). `changed` says
-    whether the reply must carry the new value back to the client."""
+    `generation` is the call the session expects, as "<boot>:<link generation>" (None: no
+    expectation); the boot id makes a key from before a daemon restart never match a call
+    placed after it. `changed` says whether the reply must carry the new value back."""
 
-    def __init__(self, generation: int | None) -> None:
+    def __init__(self, generation: str | None) -> None:
         self.generation = generation
         self.changed = False
 
-    def expect(self, generation: int | None) -> None:
+    def expect(self, generation: str | None) -> None:
         self.generation = generation
         self.changed = True
 
@@ -223,6 +235,11 @@ class SpeakService:
         self.ack_text = settings["SPEAK_ACK_TEXT"]
         self.quiet_hours = settings["SPEAK_QUIET_HOURS"]
         self.quiet_window = settings["quiet_window"]
+        self.tz = settings["tz"]
+        self.boot = secrets.token_hex(4)   # per process: generations restart at 0 after a restart
+
+    def key(self, generation: int) -> str:
+        return f"{self.boot}:{generation}"
 
     # -- call checks
 
@@ -239,10 +256,10 @@ class SpeakService:
         info = self.link.info()
         state = info["state"]
         if state == tg.CONNECTED:
-            sess.expect(info["generation"])
+            sess.expect(self.key(info["generation"]))
             return
         if (sess.generation is not None and info["end_reason"] == tg.END_HUNG_UP
-                and info["generation"] == sess.generation):
+                and self.key(info["generation"]) == sess.generation):
             sess.expect(None)   # hung up on request: no call-back
         if sess.generation is not None:
             raise self._call_ended(sess, tool, f"call state is {state}")
@@ -344,12 +361,12 @@ class SpeakService:
     def call(self, sess: Session, greeting: str, override_quiet_hours: bool, max_seconds: float,
              silence_seconds: float, start_timeout_seconds: float) -> dict:
         # Checked under the lock: a call queued behind a long converse is judged when it would dial.
-        # Local time is the container's TZ (America/Los_Angeles, compose environment).
-        if not override_quiet_hours and in_quiet_hours(self.quiet_window, datetime.datetime.now().time()):
+        # Local time in the required TZ (America/Los_Angeles, compose environment).
+        if not override_quiet_hours and in_quiet_hours(self.quiet_window, datetime.datetime.now(self.tz).time()):
             return {"outcome": f"not called: quiet hours ({self.quiet_hours})"}
         info = self.link.info()
         if info["state"] == tg.CONNECTED:
-            sess.expect(info["generation"])
+            sess.expect(self.key(info["generation"]))
             return {"outcome": tg.ALREADY_CONNECTED}
         # Last of the pre-dial checks, so quiet hours / already connected keep their outcomes.
         # Measured on the synthesized audio, not guessed from word count.
@@ -367,7 +384,7 @@ class SpeakService:
                 "funny or flirty.")
         outcome = self.link.call(audio, TTS_RATE)
         if outcome in (tg.ANSWERED, tg.ALREADY_CONNECTED):
-            sess.expect(self.link.info()["generation"])
+            sess.expect(self.key(self.link.info()["generation"]))
         else:
             sess.expect(None)
         if outcome != tg.ANSWERED:
@@ -390,8 +407,9 @@ class SpeakService:
 
 def _number(req: dict, key: str) -> float:
     value = req.get(key)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
-        raise ValueError(f"{key} must be a positive number, got {value!r}")
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or not value > 0):
+        raise ValueError(f"{key} must be a finite positive number, got {value!r}")
     return float(value)
 
 
@@ -409,12 +427,12 @@ def _flag(req: dict, key: str) -> bool:
     return value
 
 
-def _generation(req: dict) -> int | None:
+def _generation(req: dict) -> str | None:
     if "expect_generation" not in req:
-        raise ValueError("expect_generation is required (an integer or null)")
+        raise ValueError("expect_generation is required (a string from an earlier reply, or null)")
     value = req["expect_generation"]
-    if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
-        raise ValueError(f"expect_generation must be an integer or null, got {value!r}")
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"expect_generation must be a string or null, got {value!r}")
     return value
 
 
@@ -471,26 +489,52 @@ class _Handler(socketserver.BaseRequestHandler):
         if op not in proto.LOCKED_OPS:
             self._send(peer, _error_reply(ValueError(f"unknown op {op!r}")))
             return
+        restart_reason: str | None = None
         daemon.lock.acquire(op, peer)
         try:
-            try:
-                proto.send_msg(self.request, {"ok": True, "phase": proto.PHASE_STARTED})
-            except OSError as e:
-                log.warning("%s from %s: the client left while queued (%s); skipped", op, peer, e)
+            if _peer_left(self.request):
+                log.warning("%s from %s: the client left while queued; skipped", op, peer)
                 return
-            log.info("%s from %s: started", op, peer)
-            reply = daemon.run_locked(op, req)
+            if daemon.closing.is_set():
+                # A restart or stop is under way: never touch the link (no dial into a dying daemon).
+                reply = _error_reply(RuntimeError("speak daemon is restarting; try again in a minute"))
+            else:
+                try:
+                    proto.send_msg(self.request, {"ok": True, "phase": proto.PHASE_STARTED})
+                except OSError as e:
+                    log.warning("%s from %s: the client left while queued (%s); skipped", op, peer, e)
+                    return
+                log.info("%s from %s: started", op, peer)
+                reply = daemon.run_locked(op, req)
+                if op == proto.OP_CALL and reply.get("ok") and proto.is_audio_failure(reply["outcome"]):
+                    restart_reason = reply["outcome"]
+                    daemon.closing.set()   # before the release: no queued op reaches the link
         finally:
             daemon.lock.release()
         self._send(peer, reply)
-        if op == proto.OP_CALL and reply.get("ok") and proto.is_audio_failure(reply["outcome"]):
-            daemon.request_restart(reply["outcome"])   # after the reply: the caller already has its answer
+        if restart_reason is not None:
+            daemon.request_restart(restart_reason)   # after the reply: the caller already has its answer
 
     def _send(self, peer: str, reply: dict) -> None:
         try:
             proto.send_msg(self.request, reply)
+        except (TypeError, ValueError) as e:   # a reply that is not JSON: report it, never a bare close
+            log.exception("reply to %s could not be encoded", peer)
+            self._send(peer, _error_reply(RuntimeError(f"daemon reply could not be encoded: {e}")))
         except OSError as e:
             log.warning("could not send the reply to %s: %s", peer, e)
+
+
+def _peer_left(sock: socket.socket) -> bool:
+    """True when the client closed its end while its request was queued. A client sends one
+    request and then only reads, so a readable socket here means EOF (or a reset)."""
+    readable, _, _ = select.select([sock], [], [], 0)
+    if not readable:
+        return False
+    try:
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except (ConnectionResetError, BrokenPipeError):
+        return True
 
 
 class _TCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -501,14 +545,15 @@ class _TCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 class SpeakDaemon:
     """Owns the link, the engines, the audio lock and the TCP server."""
 
-    def __init__(self, link, engines: Engines, settings: dict, port: int = proto.DAEMON_PORT,
+    def __init__(self, link, engines: Engines, settings: dict, debug: DebugControl, port: int = proto.DAEMON_PORT,
                  on_restart: Callable[[str], None] | None = None) -> None:
         self.link = link
         self.service = SpeakService(link, engines, settings)
         self.lock = AudioLock()
         self.port = port
         self.on_restart = on_restart   # main(): exit 1 so compose restarts the container
-        self.debug = DebugControl()
+        self.debug = debug   # installed on the root logger by main()
+        self.closing = threading.Event()   # set on restart or stop: queued tool ops are refused
         self.started_at = time.monotonic()
         self._server: _TCPServer | None = None
         self._thread: threading.Thread | None = None
@@ -579,6 +624,7 @@ class SpeakDaemon:
         self.on_restart(reason)
 
     def stop(self) -> None:
+        self.closing.set()
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()
@@ -617,13 +663,14 @@ def main() -> None:
         debug = DebugControl()
         debug.install()
         settings = load_settings()
+        log.info("quiet hours %s in %s (local time now %s)", settings["SPEAK_QUIET_HOURS"], settings["TZ"],
+                 datetime.datetime.now(settings["tz"]).strftime("%Y-%m-%d %H:%M %Z"))
         telegram_env = load_env()
         # Startup order (design section 6.2): engines, then Silero + Telegram (link.start), then the bind.
         engines = Engines(settings["SPEAK_KOKORO_MODEL"], settings["SPEAK_VOICE"], settings["SPEAK_SPEED"],
                           settings["SPEAK_WHISPER_MODEL"], settings["SPEAK_LANGUAGE"])
         engines.load()
-        daemon = SpeakDaemon(build_link(telegram_env), engines, settings, on_restart=restart)
-        daemon.debug = debug
+        daemon = SpeakDaemon(build_link(telegram_env), engines, settings, debug, on_restart=restart)
         daemon.start()
         stop.wait()
         daemon.stop()

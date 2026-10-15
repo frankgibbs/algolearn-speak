@@ -63,7 +63,8 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
   `main()` (settings, engine load, Telegram, bind).
 - `speak_engines.py`: `Engines`. Kokoro `KPipeline` (hexgrad/Kokoro-82M) and
   faster-whisper `WhisperModel` (compute_type `float32`) on `cuda`. The load
-  raises if CUDA is missing or Kokoro's weights are not all fp32.
+  raises if CUDA is missing, Kokoro's weights are not all fp32, or Kokoro's
+  espeak-ng fallback did not load.
 - `speak_telegram.py`: `TelegramLink`, the call itself (Telethon + py-tgcalls +
   ntgcalls): dial, opener file, 10 ms raw-frame pump, Silero VAD on the
   owner's audio. Instantiated only by the daemon.
@@ -91,14 +92,19 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
   speech only) as `TimeoutError`, `value` as `ValueError`, `call_ended` and
   `runtime` as `RuntimeError`.
 - **Call expectation, per session:** every tool op carries
-  `expect_generation` (the call this session talked on, or null). The daemon
+  `expect_generation` (the key of the call this session talked on,
+  `"<daemon boot id>:<call generation>"`, or null; the boot id keeps a key from
+  before a daemon restart from matching a new call). The daemon
   applies the rules under the lock: connected, so proceed and expect this
   generation; ended by `hang_up` with the same generation, so clear and raise
   the no-call error; not connected while expected, so `Telegram call ended
-  during <tool>; call back ...`. A reply may carry `"expect"` (int, or null to
-  clear); absent means unchanged.
+  during <tool>; call back ...`. A reply may carry `"expect"` (a key, or null
+  to clear); absent means unchanged.
 - A client that disconnects mid-request does not cancel the daemon's work; the
-  reply is discarded. A client that leaves while still queued is skipped.
+  reply is discarded. A client that leaves while still queued is skipped (the
+  daemon checks the socket for EOF when the op reaches the lock).
+- While the daemon is restarting or stopping, an op that reaches the lock gets
+  `speak daemon is restarting` and never touches the call.
 
 ## Telegram calls
 
@@ -116,7 +122,9 @@ the phone has signal.
   `TELEGRAM_CALL_TARGET` in a git-ignored `.env`. On patrick the `.env` sits
   next to `docker-compose.yml` in the deploy directory; compose passes it with
   `env_file`, and `.dockerignore` keeps it out of the image. Never commit it:
-  this repo is public.
+  this repo is public. `env_file` puts the values in the container config, so
+  `docker inspect speak-telegram` shows them to anyone in patrick's docker
+  group.
 - **Verified quirks (macOS, 2026-10-09), all handled in `speak_telegram.py`:**
   the call must open on an audio FILE of at least 6 s (the greeting itself; 2 s
   gave all-zero audio both ways). **Owner decision (2026-10-12):** no padding;
@@ -165,7 +173,7 @@ the phone has signal.
 | `SPEAK_LANGUAGE` | `en` | Whisper language |
 | `SPEAK_ACK_TEXT` | `Processing.` | Spoken after every successful `listen`, right after the rising chime |
 | `SPEAK_QUIET_HOURS` | `22:00-07:00` | No-call window, may wrap midnight. Validated at startup |
-| `TZ` | `America/Los_Angeles` | The clock quiet hours use |
+| `TZ` | `America/Los_Angeles` | The clock quiet hours use. Resolved with `zoneinfo` at startup (the image has tzdata); an unknown zone stops the daemon |
 
 Models are cached in the `speak_models` volume
 (`/root/.cache/huggingface`). Startup order: engines load and warm, then

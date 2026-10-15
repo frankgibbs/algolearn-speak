@@ -47,6 +47,11 @@ class Engines:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available to torch; the speak daemon needs the GPU")
         self._kokoro = KPipeline(lang_code="a", repo_id=self.kokoro_model, device="cuda")
+        # KPipeline swallows an espeak-ng failure (a warning, fallback=None) and then silently
+        # drops every out-of-vocabulary word from speech. Fail the load instead.
+        if self._kokoro.g2p.fallback is None:
+            raise RuntimeError("Kokoro's espeak-ng fallback did not load (is espeak-ng installed?); "
+                               "out-of-vocabulary words would be skipped silently")
         dtypes = {p.dtype for p in self._kokoro.model.parameters()}
         if dtypes != {torch.float32}:
             raise RuntimeError(f"Kokoro loaded with parameter dtypes {dtypes}; fp32 is required")

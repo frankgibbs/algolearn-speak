@@ -34,6 +34,7 @@ import os
 import socket
 import sys
 import threading
+import time
 
 import anyio
 from mcp.server import MCPServer
@@ -53,7 +54,7 @@ _daemon: tuple[str, int] | None = None   # set in main() from SPEAK_DAEMON
 # The session's call expectation: the daemon's generation of the call this session
 # expects, or None. Updated only from a reply's "expect" key.
 _expect_lock = threading.Lock()
-_call_generation: int | None = None
+_call_generation: str | None = None   # opaque "<daemon boot>:<call generation>"
 
 
 class DaemonUnreachable(RuntimeError):
@@ -73,7 +74,7 @@ def _apply_expect(reply: dict) -> None:
             _call_generation = reply["expect"]
 
 
-def _current_generation() -> int | None:
+def _current_generation() -> str | None:
     with _expect_lock:
         return _call_generation
 
@@ -96,12 +97,13 @@ def _request(op: str, fields: dict, budget: float) -> dict:
             if op in proto.LOCKED_OPS:
                 sock.settimeout(None)
                 reply, _ = proto.recv_msg(sock)
-                if reply.get("ok") and reply.get("phase") == proto.PHASE_STARTED:
-                    sock.settimeout(budget)
-                    reply, _ = proto.recv_msg(sock)
+                if reply.get("ok"):
+                    if reply.get("phase") != proto.PHASE_STARTED:
+                        raise RuntimeError(f"speak daemon at {addr} sent {reply!r} for {op!r} "
+                                           "where it must send 'started' or an error")
+                    reply, _ = proto.recv_msg(sock, deadline=time.monotonic() + budget)
             else:
-                sock.settimeout(budget)
-                reply, _ = proto.recv_msg(sock)
+                reply, _ = proto.recv_msg(sock, deadline=time.monotonic() + budget)
         except TimeoutError:
             raise RuntimeError(f"speak daemon at {addr} did not reply to {op!r} within {budget:.0f}s") from None
         except (OSError, ValueError) as e:
@@ -207,7 +209,8 @@ def _status_sync() -> dict:
         reply = _request(proto.OP_STATUS, {}, QUICK_REPLY_TIMEOUT_SECONDS)
     except DaemonUnreachable as e:   # reported in the result, never hidden: status must not raise
         return {"busy": None, "current_tool": None, "waiting": None, "call": f"daemon unreachable: {e}"}
-    except Exception as e:
+    except (RuntimeError, ValueError) as e:   # reached but failed: also reported in the result, and logged
+        log.exception("status request failed")
         return {"busy": None, "current_tool": None, "waiting": None, "call": f"error: {e}"}
     return {"busy": reply["busy"], "current_tool": reply["current_tool"], "waiting": reply["waiting"],
             "call": reply["call"]["state"]}

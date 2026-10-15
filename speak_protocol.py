@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import socket
 import struct
+import time
 
 DAEMON_PORT = 8765
 MAX_HEADER_BYTES = 1 << 20
@@ -76,9 +77,16 @@ def enable_keepalive(sock: socket.socket, idle: int = 30, interval: int = 10, co
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, count)
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
+def _recv_exact(sock: socket.socket, n: int, deadline: float | None) -> bytes:
+    """`deadline` (time.monotonic()) bounds the whole read, not each recv; None leaves the
+    socket's own timeout in force. Past it, raises TimeoutError."""
     buf = bytearray()
     while len(buf) < n:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("deadline passed while reading a message")
+            sock.settimeout(remaining)
         chunk = sock.recv(n - len(buf))
         if not chunk:
             raise ConnectionError("the peer closed the connection")
@@ -92,17 +100,17 @@ def send_msg(sock: socket.socket, header: dict, payload: bytes = b"") -> None:
     sock.sendall(struct.pack(">I", len(raw)) + raw + payload)
 
 
-def recv_msg(sock: socket.socket) -> tuple[dict, bytes]:
-    (hlen,) = struct.unpack(">I", _recv_exact(sock, 4))
+def recv_msg(sock: socket.socket, deadline: float | None = None) -> tuple[dict, bytes]:
+    (hlen,) = struct.unpack(">I", _recv_exact(sock, 4, deadline))
     if hlen > MAX_HEADER_BYTES:
         raise ValueError(f"message header too large ({hlen} bytes)")
-    header = json.loads(_recv_exact(sock, hlen))
+    header = json.loads(_recv_exact(sock, hlen, deadline))
     if not isinstance(header, dict):
         raise ValueError(f"message header is not a JSON object: {header!r}")
     plen = header.get("payload_len", 0)
     if not isinstance(plen, int) or plen < 0 or plen > MAX_PAYLOAD_BYTES:
         raise ValueError(f"bad payload_len {plen!r}")
-    return header, _recv_exact(sock, plen) if plen else b""
+    return header, _recv_exact(sock, plen, deadline) if plen else b""
 
 
 def parse_address(value: str) -> tuple[str, int]:

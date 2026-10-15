@@ -533,7 +533,7 @@ class TelegramLink:
     async def _audio_failed(self, error: BaseException) -> str:
         """The owner answered but the media connection failed (ntgcalls.TelegramServerError etc.):
         discard the call and report it distinctly from "not answered". The daemon then exits so
-        compose's restart policy restarts it with fresh ntgcalls state (see TelegramDaemon)."""
+        compose's restart policy restarts it with fresh ntgcalls state (see SpeakDaemon)."""
         message = describe(error)
         log.error("call %d: answered but audio failed to connect: %s", self._generation, message)
         self._event("audio_failed", error=message)

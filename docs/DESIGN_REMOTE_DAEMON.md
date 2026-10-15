@@ -1,7 +1,10 @@
 # Design: the speak daemon moves to patrick; every computer runs a thin client
 
-Written 2026-10-15. Status: design, awaiting owner approval. Nothing is built,
-committed or deployed.
+Written 2026-10-15. Status: approved and built on 2026-10-15 (branch
+`telegram-only`). The image is built on patrick; the container has not been
+started. Owner decisions made at build time (full precision, CUDA 12.6, the
+patrick deploy directory) are folded into the sections below and listed in
+section 10.
 
 Labels used throughout:
 - **Owner decision** (2026-10-15 unless dated otherwise): decided by the owner.
@@ -289,11 +292,17 @@ depend on the transport. It moves to `speak_protocol.py` unchanged, and
 |---|---|---|---|
 | `ping` | none | no | `{}` |
 | `status` | none | no | `{busy, current_tool, waiting, call: {state, generation, end_reason}}` |
-| `speak` | `text`, `expect_generation` | yes | `{seconds, generation}` |
-| `listen` | `max_seconds`, `silence_seconds`, `start_timeout_seconds`, `expect_generation` | yes | `{text, generation}` |
-| `converse` | `text` + listen fields + `expect_generation` | yes | `{text, generation}` |
-| `call` | `greeting`, `override_quiet_hours` + listen fields | yes | `{outcome, text?, generation}` |
-| `hang_up` | none | yes | `{outcome}` |
+| `speak` | `text`, `expect_generation` | yes | `{seconds, expect?}` |
+| `listen` | `max_seconds`, `silence_seconds`, `start_timeout_seconds`, `expect_generation` | yes | `{text, expect?}` |
+| `converse` | `text` + listen fields + `expect_generation` | yes | `{text, expect?}` |
+| `call` | `greeting`, `override_quiet_hours` + listen fields + `expect_generation` | yes | `{outcome, text?, expect?}` |
+| `hang_up` | none | yes | `{outcome, expect: null}` |
+
+  `expect` is present only when the session's expectation changed: a string
+  key, or `null` to clear. An error reply carries it too when it changed. The
+  key is `"<boot id>:<call generation>"`; the boot id is random per daemon
+  process, because generations restart at 0 after a restart and a key from
+  before it must never match a new call.
 | `debug` | `lines` | no | as today (`speak_telegram_daemon.py:181-186`) |
 | `set_debug` | `enabled` | no | as today (`speak_telegram_daemon.py:187-192`) |
 
@@ -341,14 +350,14 @@ runs in the daemon under the lock.** The rule that a later drop raises in
 every session that talked on the call needs memory per session
 (`speak_server.py:76-80`, `92-107`). The thin client keeps `_call_expected`
 and `_call_generation`. With every tool op it sends `expect_generation`: its
-generation, or `null`.
+key, or `null`.
 
 Under the lock, the daemon applies `_require_call`'s rules to that value:
 
 | Call state | What happens |
 |---|---|
-| `connected` | The op proceeds. The reply carries the `generation` the session now expects |
-| Ended by `hang_up` (`end_reason == hung_up`), generation matches | The reply tells the client to clear its expectation. The op raises the no-call error below |
+| `connected` | The op proceeds. The reply carries the `expect` key the session now holds |
+| Ended by `hang_up` (`end_reason == hung_up`), key matches | The reply tells the client to clear its expectation. The op raises the no-call error below |
 | Not connected, generation given | A `call_ended` error: "Telegram call ended during <tool>; call back ...". The client clears its expectation, as `_call_ended_error` does today (`speak_server.py:85-89`) |
 | No call, no expectation | `RuntimeError` "<tool> needs a connected Telegram call (call state is ...); place one with the call tool". The message is unchanged from today |
 
@@ -463,13 +472,13 @@ state supports this:
 
 **STT: `faster-whisper==1.2.1`** (CTranslate2).
 - Today: `mlx-whisper` with `mlx-community/whisper-large-v3-turbo`.
-- After: model `large-v3-turbo`, `device="cuda"`, `compute_type="float16"`,
+- After: model `large-v3-turbo`, `device="cuda"`, `compute_type="float32"`
+  (Owner decision 2026-10-15: both models at full precision),
   `beam_size=1`, `language="en"`, `vad_filter=False`.
 - Why:
   - It is the same model as today (Owner decision 6).
   - faster-whisper is already proven on this card by `whisper-service`
     (Verified, section 3).
-  - fp16 is native on sm_86.
   - Greedy decoding matches `mlx_whisper.transcribe`'s default.
   - VAD has already run before Whisper sees the audio, so `vad_filter` is
     off.
@@ -485,10 +494,12 @@ daemon, unchanged from `speak_telegram.py:197-218`.
   and a kernel launch per block for no gain.
 - The code is unchanged, so there is nothing new to verify.
 
-**Torch: `torch==2.14.0`** from the PyTorch CUDA 12.8 wheel index (today
-2.14.0 for macOS, from `uv.lock`).
+**Torch: `torch==2.14.0`** from the PyTorch CUDA 12.6 wheel index on Linux,
+PyPI on macOS (`[tool.uv.sources]` with a platform marker).
 - Driver 580.178.04 supports CUDA ≤ 13.0 (Verified).
-- **Unverified, read before build:** that 2.14.0 is published for cu128.
+- Verified at build: 2.14.0 has no cu128 build; the cu126 `manylinux_2_28`
+  wheel is locked in `uv.lock`. One CUDA major (12) in the process, shared
+  with CTranslate2.
 
 **Settings.**
 - New defaults: `SPEAK_KOKORO_MODEL` becomes `hexgrad/Kokoro-82M` and
@@ -514,20 +525,25 @@ service, and compose restarts the container.
 |---|---|---|
 | whisper-service (existing, large-v3 fp16), until it is retired | 3848 MiB | **Measured** (nvidia-smi, 2026-10-15) |
 | CUDA context, daemon process (one per process, shared by torch and CTranslate2) | ~300–500 MiB | **Estimate**: typical for an Ampere card with torch's kernels loaded |
-| Whisper large-v3-turbo, fp16 (809 M parameters) | ~2.0–2.4 GB | **Estimate**: ~1.6 GB of weights (809 M × 2 bytes) plus ~0.4–0.8 GB of CTranslate2 buffers for a 30 s window with greedy decoding |
+| Whisper large-v3-turbo, fp32 (809 M parameters) | ~3.8–4.5 GB | **Estimate**: ~3.2 GB of weights (809 M × 4 bytes) plus ~0.6–1.3 GB of CTranslate2 buffers for a 30 s window with greedy decoding |
 | Kokoro-82M, fp32 | ~0.5–0.8 GB | **Estimate**: ~0.3 GB of weights (82 M × 4 bytes) plus torch's caching allocator for one sentence |
 | Silero VAD | 0 | On the CPU (Owner decision 9) |
-| **Daemon total** | **~2.8–3.7 GB** | Estimate (the sum of the rows above) |
-| **GPU0 during cutover** (both running) | **~6.7–7.6 GB of 12.0 GB used** | 3.85 GB measured + the daemon estimate |
-| **GPU0 after whisper-service is retired** | **~2.8–3.7 GB used; ~8.3–9.2 GB free** | Daemon estimate only. That free memory is for the planned image-gallery manager |
+| **Daemon total** | **~4.6–5.8 GB** | Estimate (the sum of the rows above) |
+| **GPU0 during cutover** (both running) | **~8.5–9.7 GB of 12.0 GB used** | 3.85 GB measured + the daemon estimate |
+| **GPU0 after whisper-service is retired** | **~4.6–5.8 GB used; ~6.2–7.4 GB free** | Daemon estimate only. That free memory is for the planned image-gallery manager |
 
 Section 9 replaces every estimate here with a measurement:
 `nvidia-smi --query-compute-apps` after warm-up and after a 60 s listen.
 
 ## 7. Deployment on patrick
 
-The daemon is a compose service, built and started with
-`docker --context patrick compose up --build -d` (Owner decision 5). The
+The daemon is a compose service, built and started on patrick from the
+deploy directory `/home/frankg/algolearn-speak`, an rsync of this repo
+without `.git`, `.venv` and `.env`:
+`ssh frankg@192.168.86.31 'cd ~/algolearn-speak && docker compose up --build -d'`.
+The `.env` is copied into that directory separately (`chmod 600`); it sits in
+the build context, and `.dockerignore` keeps it out of the image (Owner
+instruction 2026-10-15: scp the `.env` to patrick). The
 workspace deployment rules apply: always rebuild, never copy files into a
 container, never `down` first, and never run tests or interpreters inside
 the running container. Every build, restart and stop is an owner action,
@@ -537,13 +553,19 @@ Files added to the repo (Owner decision 6: every dependency comes from this
 repo):
 
 **`Dockerfile`**
-- Base image: `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04`. It supplies
-  cuBLAS and cuDNN 9 for CTranslate2; torch brings its own libraries.
-  **Unverified, read before build:** that the tag exists.
-- apt installs `ffmpeg` and `espeak-ng`. py-tgcalls plays the opener file
-  through ffmpeg (`docs/DESIGN_TELEGRAM_CALL.md`, section 9).
+- Base image: `nvidia/cuda:12.6.3-runtime-ubuntu24.04`, the CUDA major of
+  the torch cu126 wheel. CTranslate2 needs cuBLAS 12 and cuDNN 9; both come
+  from the `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` pip packages torch
+  installs, put on `LD_LIBRARY_PATH` so the loader finds them whatever the
+  import order.
+- apt installs `ffmpeg`, `espeak-ng` and `tzdata`. py-tgcalls plays the
+  opener file through ffmpeg (`docs/DESIGN_TELEGRAM_CALL.md`, section 9).
+  Kokoro's out-of-vocabulary G2P needs espeak-ng, and the daemon refuses to
+  start without it. Without tzdata, glibc silently runs `TZ` as UTC; the
+  daemon also resolves `TZ` with `zoneinfo` at startup and refuses to start
+  when it does not resolve.
 - Python 3.12 comes from `uv` (the repo's tool), via
-  `uv sync --frozen --extra daemon`.
+  `uv sync --locked --extra daemon`.
 - The entrypoint is `speak-telegram`.
 
 **`docker-compose.yml`**
@@ -623,7 +645,7 @@ have meant starting a GPU container.
 - Kokoro-82M on an RTX 3060 (torch fp32): **~0.2–0.4 s** for the same 12 s
   of speech. An 82 M model is dominated by kernel launches. G2P runs on the
   CPU on both machines.
-- faster-whisper large-v3-turbo fp16 on a 3060: **~0.3–0.6 s** for 12 s of
+- faster-whisper large-v3-turbo fp32 on a 3060: **~0.5–1.0 s** for 12 s of
   audio: one encoder pass over a 30 s window plus 4-layer greedy decoding.
 - Engine load at daemon start: **~15–40 s** (CUDA init plus loading models
   from the cache volume). The first start downloads the models and takes
@@ -648,8 +670,8 @@ have meant starting a GPU container.
    - kokoro 0.9.4 `KPipeline` arguments;
    - faster-whisper 1.2.1's `large-v3-turbo` mapping, and the CUDA and cuDNN
      major versions of its `ctranslate2`;
-   - torch 2.14.0 cu128 wheels;
-   - the `nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04` tag;
+   - torch 2.14.0 CUDA wheels (resolved: cu126, section 10);
+   - the CUDA base image tag (resolved: `nvidia/cuda:12.6.3-runtime-ubuntu24.04`, section 10);
    - Telethon's behavior when one session is used from two places at once.
 2. **Code, built on the Telegram-only working tree once it is committed:**
    - `speak_protocol.py` and `speak_engines.py`;
@@ -689,7 +711,7 @@ have meant starting a GPU container.
       reconnect its sessions.
 
    **Rollback:** stop the container
-   (`docker --context patrick stop speak-telegram`), re-bootstrap the plist
+   (`ssh frankg@192.168.86.31 docker stop speak-telegram`), re-bootstrap the plist
    on the Mac, and check out the pre-change commit of this repo. The Mac's
    MLX venv is left in place until the owner retires it.
 7. **Retire `whisper-service` (Owner decision 8, an owner action).** Do this
@@ -701,3 +723,32 @@ have meant starting a GPU container.
    - Confirm with `nvidia-smi` that its ~3.8 GB on GPU0 is free.
    - `scratch/voice-claude/livekit_agent.py`, its only known caller, stops
      working at that point.
+
+## 10. Build record (2026-10-15)
+
+Owner decisions given with the build instruction, superseding the earlier
+text of this design where they differ (the sections above are updated to
+match):
+- Both models at full precision: faster-whisper `compute_type="float32"`,
+  Kokoro fp32. `Engines.load` refuses a Kokoro load in any other dtype.
+- Only the speak daemon runs on GPU0; `whisper-service` is retired later by
+  the owner.
+- The Linux Telegram re-test of section 9 step 5 is skipped before the build.
+- No new tests: the obsolete Mac-daemon and old-client tests are deleted;
+  `tests/test_speak_telegram.py` remains.
+- The `.env` reaches patrick by scp into the deploy directory.
+
+Verified while building:
+- torch 2.14.0 has no cu128 build; the cu126 wheel is used (section 6.2).
+- `nvidia/cuda:12.6.3-runtime-ubuntu24.04` exists, and the image builds on
+  patrick with `uv sync --locked --extra daemon`.
+- kokoro 0.9.4 `KPipeline` takes `repo_id`, `device` and `split_pattern`.
+  It swallows an espeak-ng load failure, which the daemon turns into a load
+  error.
+- faster-whisper 1.2.1 maps `large-v3-turbo` to
+  `mobiuslabsgmbh/faster-whisper-large-v3-turbo`.
+
+Not verified (they need the container running, an owner action): the Linux
+call quirks, Telethon's behaviour with one session in two places, the VRAM of
+section 6.3, the timings of section 8, and that torch's cuDNN 9 satisfies
+CTranslate2 at run time.
