@@ -218,7 +218,27 @@ def _status_sync() -> dict:
 
 # ---------------------------------------------------------------- MCP surface
 
-mcp = MCPServer("algolearn-speak")
+_INSTRUCTIONS = """\
+Voice tools for talking with the owner (Frank) over a Telegram call. Owner conventions:
+
+- On calls and in anything spoken you are "Angie", never Claude ("Hi Frank, it's Angie").
+- Spoken text is short and conversational: plain sentences, no markdown, lists or code.
+- Go straight into the answer. Never prefix a reply with "heard you" or a restatement;
+  listen's chime plus the word "Processing" is the acknowledgement.
+- When the owner asks you to call, they are up: pass override_quiet_hours=True without
+  asking. Calls you start on your own respect quiet hours.
+- Call etiquette: "not answered" -> wait an hour. "busy" -> call once more, then wait an
+  hour. Owner hung up -> call back once right away; if that is not answered, wait an hour.
+  "Telegram call ended during ..." -> call back. hang_up only when the owner asks.
+- When a call seems off (silence, no speech heard, drops): set_call_debug(True), place
+  or keep the call, read call_debug (its docstring says how to read the events), and add
+  instrumentation rather than retrying blind. No need to ask first. Turn debug off once
+  calls work.
+- There is one call, shared by every session on every computer; tools queue for it.
+  The owner may also be reading this terminal.
+"""
+
+mcp = MCPServer("algolearn-speak", instructions=_INSTRUCTIONS)
 
 
 async def _run(fn, *args):
@@ -371,9 +391,29 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
     return await _run(_call_sync, greeting, override_quiet_hours, max_seconds, silence_seconds, start_timeout_seconds)
 
 
+_READING_EVENTS = """
+    Reading the events:
+    - `opener_s` (on answered_media_connected and recording) is the greeting's
+      spoken length: the greeting is played as the call's opener file. It is
+      NOT a delay. `raw_frames` and `connected` follow once the opener
+      finishes (opener_s plus about 1 s).
+    - `first_incoming_frame` only means frames arrive from the owner, not that
+      they carry sound.
+    - With debug on, `audio_in` / `audio_out` summarize each window (every 1 s
+      for the first 10 s after answer, then every 10 s; `window_s`, `phase`
+      opener or raw). `audio_in` with `zero_frames == frames` and `peak` 0 is
+      exact digital silence: the call's media is dead (in practice both ways).
+      It is not a muted mic and not VAD.
+    - Real `audio_out` levels (`audio_peak`, `audio_frames` > 0) while
+      `audio_in` is dead and the owner says they hear nothing: the call's media
+      path is dead. Ask the owner to hang up (or `hang_up()` if they ask), then
+      place ONE new call. A listen TimeoutError after the ear-open beep with
+      dead `audio_in` is the same fault, not the owner staying quiet.
+"""
+
+
 @mcp.tool()
-async def call_debug(lines: int = 50) -> dict:
-    """Diagnose Telegram calls in real time: what the speak daemon just did.
+@_doc("""Diagnose Telegram calls in real time: what the speak daemon just did.
 
     Use it during a call, or right after `call()` returned "answered but audio
     failed to connect: ..." or an unexpected "not answered". Returns
@@ -382,11 +422,13 @@ async def call_debug(lines: int = 50) -> dict:
     `events` are the last `lines` structured call events (call_id, ts, event
     such as requested/ringing/busy/audio_failed/ended, elapsed_s, error),
     `log` the last `lines` daemon log lines (set_call_debug(True) adds
-    py-tgcalls/Telethon DEBUG output). A small uptime_seconds right after a
-    failed call is the daemon's self-restart. When the daemon cannot be
-    reached it returns `{"daemon": "unreachable: <error>"}` and nothing else.
-    Never blocks on the audio lock. `lines` is 1 to 1000.
-    """
+    py-tgcalls/Telethon DEBUG output and the audio-level events). A small
+    uptime_seconds right after a failed call is the daemon's self-restart.
+    When the daemon cannot be reached it returns `{"daemon": "unreachable:
+    <error>"}` and nothing else. Never blocks on the audio lock. `lines` is 1
+    to 1000.
+""" + _READING_EVENTS)
+async def call_debug(lines: int = 50) -> dict:
     return await _run(_call_debug_sync, lines)
 
 

@@ -49,7 +49,9 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
 ## Files
 
 - `speak_server.py`: the thin MCP client. Tool definitions and docstrings,
-  `_run`, and the session's call expectation (`_call_generation`). `main()`
+  the server `instructions` (owner conventions sent to every client: the name
+  Angie, spoken style, call etiquette, debugging), `_run`, and the session's
+  call expectation (`_call_generation`). `main()`
   reads `SPEAK_DAEMON` (`host:port`, required, no default; unset or malformed
   fails at startup).
 - `speak_protocol.py`: the wire (stdlib only). Framing: a 4-byte big-endian
