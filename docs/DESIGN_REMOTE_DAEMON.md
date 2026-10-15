@@ -734,7 +734,9 @@ match):
 - The Linux Telegram re-test of section 9 step 5 is skipped before the build.
 - No new tests: the obsolete Mac-daemon and old-client tests are deleted;
   `tests/test_speak_telegram.py` remains.
-- The `.env` reaches patrick by scp into the deploy directory.
+- The daemon is deployed from the repo with the `patrick` docker context; the
+  `.env` stays in the repo directory on the deploying computer, and there is
+  no deploy directory on patrick.
 
 Verified while building:
 - torch 2.14.0 has no cu128 build; the cu126 wheel is used (section 6.2).

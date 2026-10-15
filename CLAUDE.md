@@ -119,8 +119,8 @@ the phone has signal.
   `TELEGRAM_SESSION` anywhere (the retired Mac launchd daemon included).
 - **Credentials:** `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION`
   (a Telethon StringSession: a login, treat as a password),
-  `TELEGRAM_CALL_TARGET` in a git-ignored `.env`. On patrick the `.env` sits
-  next to `docker-compose.yml` in the deploy directory; compose passes it with
+  `TELEGRAM_CALL_TARGET` in a git-ignored `.env` next to `docker-compose.yml`
+  in the repo on the computer that deploys; compose passes it with
   `env_file`, and `.dockerignore` keeps it out of the image. Never commit it:
   this repo is public. `env_file` puts the values in the container config, so
   `docker inspect speak-telegram` shows them to anyone in patrick's docker
