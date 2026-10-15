@@ -37,5 +37,5 @@ COPY speak_server.py speak_protocol.py speak_engines.py speak_telegram.py speak_
 RUN uv sync --locked --extra daemon --no-editable --python 3.12
 
 ENV PATH=/opt/venv/bin:$PATH \
-    LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cublas/lib
+    LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/nvidia/cudnn/lib:/opt/venv/lib/python3.12/site-packages/nvidia/cublas/lib:$LD_LIBRARY_PATH
 CMD ["speak-telegram"]
