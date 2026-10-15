@@ -328,7 +328,9 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
                                                  owner is on another call, or their app is
                                                  still ending the previous one); the phone
                                                  did not ring. This is NOT "not answered".
-                                                 Do not redial right away.
+                                                 Call once more (the daemon already waits
+                                                 10 s after any call ends); if that one is
+                                                 busy or not answered too, wait an hour.
       "answered, then hung up during the greeting"
                                               -- they picked up but ended the call before
                                                  the greeting finished (often because they

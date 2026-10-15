@@ -157,8 +157,9 @@ the phone has signal.
   `override_quiet_hours=True`, used only when the owner said they are up.
   After `not answered`, wait an hour before calling again. `busy (the owner's
   Telegram reports a call in progress)` is its own outcome (Telegram discarded
-  the call as busy; the phone did not ring), not `not answered`; do not redial
-  right away. Owner decision 2026-10-15: `call` waits until
+  the call as busy; the phone did not ring), not `not answered`. After `busy`,
+  call once more; if that one is busy or not answered too, wait an hour (owner
+  decision 2026-10-15). Owner decision 2026-10-15: `call` waits until
   `REDIAL_SETTLE_SECONDS` (10 s, `speak_protocol.py`) have passed since the
   previous call ended, whatever the reason, then dials; the wait is recorded as
   the event `redial_settle_wait`. Verified 2026-10-15: a redial 1.4 s after `hang_up` got
