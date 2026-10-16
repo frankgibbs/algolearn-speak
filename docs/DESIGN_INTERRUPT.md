@@ -310,7 +310,7 @@ never returned to Claude.
 |---|---|---|
 | "hold on" (while she speaks) | Stops talking at once. Waits for "continue". | Nothing yet; the tool is still running |
 | "continue" (while held) | Starts again at the beginning of the sentence she was cut off in, and finishes the reply | The normal result, with one line saying how long she was held |
-| (nothing, for 300 s of hold) | The hold expires: she gives up her turn on the call, which stays connected | The tool result says the hold expired and holds the text that was never spoken |
+| (nothing, for 300 s of hold) | The hold expires: the daemon hangs up | The tool result says the hold expired and the call was ended, and holds the text that was never spoken |
 
 Anything else the owner says while Angie speaks or is held changes nothing.
 
@@ -329,7 +329,7 @@ loop:
                held += time waited
                resume  -> start = cut_index; continue loop
                TIMEOUT -> return HoldExpired(cut=sentences[cut_index], unspoken=rest)
-                          # the op ends here: the audio lock is released, the call stays up
+                          # the op ends here: the daemon hangs up
 ```
 
 How the loop meets Release 1's streaming (synthesis of later sentences while
@@ -346,17 +346,17 @@ when Kokoro may run.
   phrases, and applies the state gating of section 4.2.
 - **Hold expiry.** **Owner decision (2026-10-16):** when a hold reaches its
   maximum (`HOLD_MAX_SECONDS`, 300 s, the holds in one op added up), the
-  daemon does **not** hang up. The call stays connected. The held
-  `speak`/`converse` ends with `HoldExpired` and releases the audio lock,
-  giving up its turn, so the next queued session or HTTP transcription
-  proceeds. The tool result tells the caller the hold expired and includes
-  the text that was never spoken, starting from the beginning of the cut
-  sentence, so the agent can pick it up later. `converse` does not open the
-  ear after an expired hold: the listen half does not run. Claude decides
-  what to say next. While a hold lasts, the op still holds the audio lock, so
-  other sessions wait behind it for up to 300 s; `status` already shows the
-  holder as `current_tool` (`speak_telegram_daemon.py:803-805`, verified at
-  `8b598e8`).
+  daemon **hangs up**: it ends the call. It does not give up the turn on an
+  open line. Reason: the owner does not want another queued agent to pick up
+  the call mid-hold; after the hang-up he ignores incoming calls, so other
+  agents' messages stay queued. The held `speak`/`converse` ends with
+  `HoldExpired`. Its tool result says the hold expired and the call was ended,
+  and includes the text that was never spoken, starting from the beginning of
+  the cut sentence, so the agent can pick it up later. `converse` does not
+  open the ear after an expired hold: the listen half does not run. While a
+  hold lasts, the op holds the audio lock, so other sessions wait behind it
+  for up to 300 s; `status` already shows the holder as `current_tool`
+  (`speak_telegram_daemon.py:803-805`, verified at `8b598e8`).
 - **The `guard_call` and call-expectation logic is unchanged**
   (`speak_telegram_daemon.py:276-306`). A drop during playback or a hold
   raises "Telegram call ended during ...", as today.
@@ -377,7 +377,7 @@ The client's budgets for `speak` and `converse` gain `HOLD_MAX_SECONDS`
 
 ```
 converse/speak, resumed:  [held 42s, then resumed]\n<normal result>
-converse/speak, expired:  [hold expired after 300s; the call is still connected]
+converse/speak, expired:  [hold expired after 300s; the call was ended]
                           cut off in sentence 3 of 5: "<sentence>"
                           not spoken (from the cut sentence): "<rest>"
                           (audio: telegram)
@@ -386,9 +386,10 @@ converse/speak, expired:  [hold expired after 300s; the call is still connected]
 Every result still ends with `AUDIO_NOTE`, which a permission rule in
 `~/.claude/settings.json` depends on. The server instructions
 (`speak_server.py:221-249`) gain two rules:
-- After a hold expiry, the call is still connected and the reply was not
-  finished. Do not assume the owner heard it. Pick up the unspoken text later
-  (for example offer it in the next `converse`); `converse` did not listen.
+- After a hold expiry, the daemon has ended the call and the reply was not
+  finished. Do not assume the owner heard it, and do not call back right away:
+  he ignores incoming calls after the hang-up. Pick up the unspoken text
+  later; `converse` did not listen.
 - Never speak "hold on" or "continue" as a sentence by itself. If the
   owner's phone does not cancel echo, Angie would hear herself (section 8.1).
 
@@ -558,9 +559,9 @@ On a call, while Angie reads a long text:
   sentence and finishes, and the result says `[held 30s, then resumed]`.
 - **Release 2, hold expiry:** with `HOLD_MAX_SECONDS` = 20 in the local venv
   against the fake link only; on the real daemon the constant is not changed.
-  The call stays connected (no hang-up), the audio lock is released, a second
-  queued op then proceeds, the result says the hold expired and carries the
-  unspoken text from the cut sentence, and `converse` ran no listen.
+  The link is hung up, the result says the hold expired and the call was
+  ended and carries the unspoken text from the cut sentence, and `converse`
+  ran no listen.
 - **Release 2, a drop while held:** the owner hangs up while held. The op
   raises "Telegram call ended during converse".
 - **Release 3, pause:** while playing and while held, the result names the
@@ -579,9 +580,9 @@ Release 2:
   silence, `CallEnded` on a drop.
 - Mapping `played_bytes` to a sentence across segment boundaries.
 - Hold, resume and expiry transitions in `SpeakService` with a stub
-  `classify`; on expiry the lock is released, the link is not hung up, the
-  result carries the unspoken text from the cut sentence, and `converse` does
-  not listen.
+  `classify`; on expiry the link is hung up, the result says so and
+  carries the unspoken text from the cut sentence, and `converse` does not
+  listen.
 - Startup refuses missing, empty or duplicate phrases.
 - The client's result formats and budgets, and `import speak_server` still
   imports no numpy, torch or ntgcalls.
