@@ -110,7 +110,10 @@ compete with the pump for the GIL. The sequence keeps them apart, so while
 models run the pump sends only silence. The code follows it: `_speak`
 synthesizes before playing (`speak_telegram_daemon.py:340-348`), and
 `_listen` runs Whisper only after the ear-closed cue has played
-(`speak_telegram_daemon.py:356-358`).
+(`speak_telegram_daemon.py:356-358`). **Owner decision (2026-10-16):** the
+ear-closed cue, the chime and the "Processing." ack are removed; `_listen` now
+runs Whisper right after the capture with nothing queued to play, so the pump
+still sends only silence while it runs.
 
 The harm the rule guards against is **quirk 2** of
 `docs/DESIGN_TELEGRAM_CALL.md`, observed on the Mac on 2026-10-09: "Gaps, or
@@ -179,7 +182,7 @@ How they are matched (Proposal):
 
 The phrases are daemon settings, set in compose's `environment` block and
 added to `REQUIRED_SPEAK_ENV` (`speak_telegram_daemon.py:77-78`), with the
-same rule as `SPEAK_ACK_TEXT`: required, no defaults. Release 2 adds
+same rule as the other `SPEAK_*` settings: required, no defaults. Release 2 adds
 `SPEAK_HOLD_PHRASE` and `SPEAK_RESUME_PHRASE`; Release 3 adds
 `SPEAK_PAUSE_PHRASE`. At startup the daemon refuses an empty phrase, or two
 phrases that normalize to the same text.
@@ -265,8 +268,8 @@ single long utterance, and it does not match.
 - **`watch_for(commands, timeout_s, classify) -> str | TIMEOUT`**. The same
   loop with nothing playing: it returns the first command in `commands`, or
   `TIMEOUT`. It is used while a reply is held.
-- **`play` and `record` are unchanged.** The cues, the "Processing." ack and
-  the `listen` capture still use them, and none of them can be interrupted.
+- **`play` and `record` are unchanged.** The cues and the `listen` capture
+  still use them, and none of them can be interrupted.
 
 The VAD-and-utterance loop is shared with `_capture`
 (`speak_telegram.py:689-719`) as one helper that yields utterances. The
@@ -361,7 +364,7 @@ when Kokoro may run.
   (`speak_telegram_daemon.py:276-306`). A drop during playback or a hold
   raises "Telegram call ended during ...", as today.
 - **Not holdable:** the `call` greeting (the opener file, section 3.1), the
-  cues, the ack, and anything inside a `listen`.
+  cues, and anything inside a `listen`.
 
 ### 5.3 Wire and client (`speak_protocol.py`, `speak_server.py`)
 
@@ -426,8 +429,8 @@ The Release 2 loop gains one branch in each state:
 ```
 
 - **Pause then listens.** On `Interrupted`, `speak` and `converse` both call
-  `_listen` with the listen parameters (ear-open beep, capture, ear-closed
-  cue, Whisper, chime and "Processing."). `converse` does **not** run a
+  `_listen` with the listen parameters (ear-open beep, capture, Whisper; owner
+  decision 2026-10-16 removed the ear-closed cue, chime and ack). `converse` does **not** run a
   second listen after that one. For `speak`, which has no listen parameters
   today, the client sends `listen`'s defaults (120 s, 2.0 s, 45 s). Those
   defaults move into `speak_protocol.py` as constants, so they are defined

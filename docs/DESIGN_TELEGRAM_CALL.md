@@ -175,7 +175,8 @@ no padding path exists.
   under the audio lock. **Owner decision (2026-10-12):** when the call is
   answered, `call` does not return after the greeting; in the same lock hold
   it performs the same listen as `listen()` on the telegram route (ear-open
-  beep, VAD, Whisper, chime and ack) and returns the owner's words, so the
+  beep, VAD, Whisper; the chime and ack were removed by owner decision
+  2026-10-16) and returns the owner's words, so the
   greeting should end with a question or invitation. The listen parameters
   and defaults are `converse`'s. A listen timeout or a drop raises as in
   `listen` (the call stays connected on a timeout). `already connected`

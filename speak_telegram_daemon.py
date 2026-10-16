@@ -65,7 +65,7 @@ import numpy as np
 import speak_protocol as proto
 import speak_telegram as tg
 from speak_engines import STT_RATE, TTS_RATE, WHISPER_DEVICE, Engines
-from speak_tone import cue_pcm, tone
+from speak_tone import cue_pcm
 
 log = logging.getLogger("speak.daemon")
 
@@ -75,7 +75,7 @@ MAX_DEBUG_LINES = 1000
 DEBUG_LOGGERS = ("speak", "pytgcalls", "ntgcalls", "telethon")   # ntgcalls' native C++ log has no Python hook
 REQUIRED_TELEGRAM_ENV = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_CALL_TARGET")
 REQUIRED_SPEAK_ENV = ("SPEAK_KOKORO_MODEL", "SPEAK_VOICE", "SPEAK_SPEED", "SPEAK_WHISPER_MODEL",
-                      "SPEAK_LANGUAGE", "SPEAK_ACK_TEXT", "SPEAK_QUIET_HOURS", "TZ")
+                      "SPEAK_LANGUAGE", "SPEAK_QUIET_HOURS", "TZ")
 BIND_HOST = "0.0.0.0"   # open to the LAN by design (owner decision 4); no auth, no TLS
 WHISPER_HTTP_PORT = 9000   # the retired whisper-service's port, so its clients need no change
 TRANSCRIBE_TOOL = "transcribe"   # how status names an HTTP transcription holding the audio lock
@@ -257,7 +257,6 @@ class SpeakService:
     def __init__(self, link, engines: Engines, settings: dict) -> None:
         self.link = link
         self.engines = engines
-        self.ack_text = settings["SPEAK_ACK_TEXT"]
         self.quiet_hours = settings["SPEAK_QUIET_HOURS"]
         self.quiet_window = settings["quiet_window"]
         self.tz = settings["tz"]
@@ -305,29 +304,10 @@ class SpeakService:
             raise self._call_ended(sess, tool, f"call state is {self.link.state()}; {partial}")
         return result
 
-    def _after_capture(self, play: Callable[[], None]) -> None:
-        """Cues played after the owner's words are captured. A call that has just ended (the
-        owner said their piece and hung up) makes them fail; the words must still be
-        transcribed and returned, so that failure is skipped here and guard_call then raises
-        "call ended" WITH the transcript. Any failure while the call is connected raises."""
-        try:
-            play()
-        except RuntimeError:
-            if self.link.state() != tg.CONNECTED:
-                log.info("call ended right after the capture; keeping the words for the drop report")
-                return
-            raise
-
     # -- audio
 
     def _cue(self, freq_hz: float, seconds: float = 0.12, volume: float = 0.2, lead_silence: float = 0.0) -> None:
         self.link.play(cue_pcm(freq_hz, seconds, volume, lead_silence), TTS_RATE)
-
-    def _ack(self) -> None:
-        """Rising two-note chime then a spoken word: the transcript is in hand and is being
-        sent to the model. Distinct from the single ear-open/ear-closed cues."""
-        self.link.play(np.concatenate([tone(660.0, 0.10), tone(990.0, 0.14)]), TTS_RATE)
-        self._speak(self.ack_text)
 
     @staticmethod
     def plain(text: str) -> str:
@@ -349,18 +329,23 @@ class SpeakService:
         return self.link.play_stream(self.engines.synthesize_stream(text), TTS_RATE)
 
     def _listen(self, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
+        """The ear-open beep, the capture, then Whisper. Owner decision 2026-10-16: the
+        ear-open beep is the only listen cue; no ear-closed beep, chime or spoken ack follows
+        the capture (replies start fast with streamed speech, so they added nothing). Whisper
+        never overlaps outgoing speech: record() returns only after the ear-open beep has
+        played and the capture is done, and nothing is queued after it, so the pump sends
+        only silence while Whisper runs. A call that ends right after the capture still has
+        its words transcribed; guard_call then raises "call ended" with the transcript."""
         audio = self.link.record(max_seconds, silence_seconds, start_timeout_seconds,
                                  cue_pcm(880.0, 0.5, 0.5, 0.2), TTS_RATE)
         if audio is tg.TIMEOUT:
             self._cue(330.0)
             raise NoSpeech(f"no speech detected within {start_timeout_seconds:.0f}s")
-        self._after_capture(lambda: self._cue(440.0))   # ear closed; Whisper runs only after it has played
         t0 = time.time()
         text = self.engines.transcribe(audio)
         log.info("listen: %.1fs of audio transcribed in %.1fs: %r", len(audio) / STT_RATE, time.time() - t0, text)
         if not text:
             raise RuntimeError(f"speech was detected ({len(audio) / STT_RATE:.1f}s) but Whisper returned no text")
-        self._after_capture(self._ack)
         return text
 
     # -- tool ops (lock held)

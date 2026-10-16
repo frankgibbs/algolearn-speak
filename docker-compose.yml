@@ -23,7 +23,6 @@ services:
       SPEAK_SPEED: "1.0"
       SPEAK_WHISPER_MODEL: large-v3-turbo
       SPEAK_LANGUAGE: en
-      SPEAK_ACK_TEXT: Processing.
       SPEAK_QUIET_HOURS: "22:00-07:00"
     volumes:
       - speak_models:/root/.cache/huggingface   # models download once, not on every rebuild

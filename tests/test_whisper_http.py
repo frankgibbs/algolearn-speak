@@ -60,7 +60,7 @@ class FakeLink:
         return proto.NONE
 
 
-SETTINGS = {"SPEAK_ACK_TEXT": "Processing.", "SPEAK_QUIET_HOURS": "22:00-07:00", "quiet_window": (1320, 420),
+SETTINGS = {"SPEAK_QUIET_HOURS": "22:00-07:00", "quiet_window": (1320, 420),
             "tz": None}
 
 

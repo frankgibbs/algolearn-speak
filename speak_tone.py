@@ -1,6 +1,7 @@
-"""Tone synthesis for algolearn-speak's cues (ear open, ear closed, the
-"processing" chime), played into the Telegram call by the speak daemon
-(speak_telegram_daemon.py).
+"""Tone synthesis for algolearn-speak's cues (the ear-open beep and the
+no-speech timeout beep), played into the Telegram call by the speak daemon
+(speak_telegram_daemon.py). Owner decision 2026-10-16: the ear-closed beep,
+the rising "processing" chime and the spoken ack are gone.
 
 No hardware access here: this module only does numpy math.
 """

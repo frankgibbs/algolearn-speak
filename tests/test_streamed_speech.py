@@ -17,7 +17,7 @@ import speak_telegram as tg
 import speak_telegram_daemon as d
 
 RATE = eng.TTS_RATE
-SETTINGS = {"SPEAK_ACK_TEXT": "Processing.", "SPEAK_QUIET_HOURS": "22:00-07:00", "quiet_window": (1320, 420),
+SETTINGS = {"SPEAK_QUIET_HOURS": "22:00-07:00", "quiet_window": (1320, 420),
             "tz": None}
 
 
@@ -50,6 +50,8 @@ class FakeLink:
         self.log = log
         self._state = tg.CONNECTED
         self.drop_during_stream = False
+        self.record_result = np.zeros(eng.STT_RATE, dtype=np.float32)
+        self.drop_after_record = False
 
     def info(self) -> dict:
         return {"state": self._state, "generation": 1, "end_reason": None}
@@ -73,8 +75,10 @@ class FakeLink:
         return samples / rate
 
     def record(self, max_seconds, silence_seconds, start_timeout_seconds, cue, rate):
-        self.log.append(("record",))
-        return np.zeros(eng.STT_RATE, dtype=np.float32)
+        self.log.append(("record", len(cue)))
+        if self.drop_after_record:   # the owner said their piece and hung up
+            self._state = tg.NONE
+        return self.record_result
 
     def call(self, audio, rate) -> str:
         self.log.append(("dial", len(audio)))
@@ -117,9 +121,8 @@ class ServiceCase(unittest.TestCase):
         names = self.names()
         self.assertLess(names.index("stream_done"), names.index("record"))
         self.assertLess(names.index("record"), names.index("transcribe"))
-        self.assertEqual(names.count("stream_done"), 2)   # the speech, then the "Processing." ack
-        self.assertGreater(names.index("transcribe"), names.index("stream_done"))
-        self.assertEqual(self.log[-1], ("stream_done",))
+        self.assertEqual(names.count("stream_done"), 1)   # the speech only: no spoken ack
+        self.assertEqual(self.log[-1], ("transcribe",))   # nothing plays after the capture
 
     def test_greeting_is_one_whole_synthesis(self):
         self.link._state = tg.NONE
@@ -195,6 +198,48 @@ class TestEnginesStream(unittest.TestCase):
             list(e.synthesize_stream("..."))
         with self.assertRaisesRegex(RuntimeError, "produced no audio"):
             e.synthesize("...")
+
+
+class ListenCues(ServiceCase):
+    """Owner decision 2026-10-16: the ear-open beep is the only listen cue. No ear-closed
+    beep, rising chime or spoken "Processing." ack follows the capture, and Whisper runs
+    with nothing queued to play (the pump sends only silence)."""
+
+    def test_listen_plays_only_the_ear_open_cue_then_transcribes(self):
+        result = self.svc.listen(self.sess, 120, 2.0, 45)
+        self.assertEqual(result, {"text": "hi Angie"})
+        ear_open = len(d.cue_pcm(880.0, 0.5, 0.5, 0.2))
+        self.assertEqual(self.log, [("record", ear_open), ("transcribe",)])
+
+    def test_converse_plays_nothing_after_the_capture(self):
+        self.svc.converse(self.sess, "One. Two.", 120, 2.0, 45)
+        after = self.names()[self.names().index("record") + 1:]
+        self.assertEqual(after, ["transcribe"])
+        self.assertNotIn("play", self.names())
+
+    def test_call_listen_plays_nothing_after_the_capture(self):
+        self.link._state = tg.NONE
+        result = self.svc.call(self.sess, "Hi Frank, it's Angie. Calling about the build.", True, 120, 2.0, 45)
+        self.assertEqual(result, {"outcome": tg.ANSWERED, "text": "hi Angie"})
+        self.assertEqual(self.names()[-2:], ["record", "transcribe"])
+        self.assertNotIn("play", self.names())
+        self.assertNotIn("stream_begin", self.names())
+
+    def test_a_drop_right_after_the_capture_still_reports_the_words(self):
+        self.link.drop_after_record = True
+        with self.assertRaisesRegex(d.CallEndedError, "transcript before the drop: 'hi Angie'"):
+            self.svc.listen(self.sess, 120, 2.0, 45)
+        self.assertEqual(self.names(), ["record", "transcribe"])
+
+    def test_no_speech_plays_the_timeout_beep_and_raises(self):
+        self.link.record_result = tg.TIMEOUT
+        with self.assertRaises(d.NoSpeech):
+            self.svc.listen(self.sess, 120, 2.0, 45)
+        self.assertEqual(self.names(), ["record", "play"])
+        self.assertNotIn("transcribe", self.names())
+
+    def test_the_daemon_does_not_require_an_ack_setting(self):
+        self.assertNotIn("SPEAK_ACK_TEXT", d.REQUIRED_SPEAK_ENV)
 
 
 if __name__ == "__main__":
