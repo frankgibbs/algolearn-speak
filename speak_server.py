@@ -9,7 +9,7 @@ Telegram call placed by that daemon; there is no local microphone or speaker.
   speak(text)     -> the daemon synthesises with Kokoro and plays into the call
   listen(...)     -> the daemon captures the owner's reply (Silero VAD) and
                      transcribes it with Whisper; returns the text
-  converse(text)  -> speak, then listen
+  converse(text)  -> speak, then listen under one lock hold: one call per turn
   call(greeting)  -> Telegram voice call to the owner; speak/listen/converse need it
                      connected (docs/DESIGN_TELEGRAM_CALL.md)
   hang_up()       -> end that call
@@ -222,7 +222,17 @@ _INSTRUCTIONS = """\
 Voice tools for talking with the owner (Frank) over a Telegram call. Owner conventions:
 
 - On calls and in anything spoken you are "Angie", never Claude ("Hi Frank, it's Angie").
-- Spoken text is short and conversational: plain sentences, no markdown, lists or code.
+- Spoken text is conversational: plain sentences, no markdown, lists or code.
+- One topic at a time, one aspect at a time, and one question at a time, so the
+  conversation flows linearly.
+- Every conversational turn is ONE converse(text) call. Never speak() then listen() for
+  a turn: the gap between the two calls is seconds of dead air before the ear-open beep;
+  converse() opens the ear right after the last word. speak() alone only for words that
+  need no reply (a last sentence before hang_up, a quick "one moment" before long silent
+  work); listen() alone only to reopen the ear after a TimeoutError or when there is
+  nothing to say first.
+- A listen/converse TimeoutError means nobody spoke in time; the call is still up.
+  Reopen the ear with listen(). Do not assume the owner left, do not hang up.
 - Go straight into the answer. Never prefix a reply with "heard you" or a restatement;
   listen's chime plus the word "Processing" is the acknowledgement.
 - When the owner asks you to call, they are up: pass override_quiet_hours=True without
@@ -286,7 +296,12 @@ _CALL_NOTE = """
 @mcp.tool()
 @_doc("""Say `text` to the owner over the connected Telegram call and return once playback finishes.
 
-    Write it as spoken prose: short sentences, no markdown, no code. Returns the spoken duration.
+    Write it as spoken prose: plain sentences, no markdown, no code. Returns the spoken duration.
+
+    Only for words that need no reply (a last sentence before hang_up, a quick "one
+    moment" before long silent work). For a conversational turn use `converse(text)`,
+    never speak() then listen(): the gap between the two calls is seconds of dead air
+    before the ear-open beep.
 """ + _QUEUE_NOTE + _CALL_NOTE)
 async def speak(text: str) -> str:
     seconds = await _run(_speak_sync, text)
@@ -300,6 +315,11 @@ async def speak(text: str) -> str:
     the word "Processing" means the transcript was captured and is on its way to you. Recording ends after
     `silence_seconds` of quiet following speech, or at `max_seconds` of speech. Raises
     TimeoutError if nobody speaks within `start_timeout_seconds` (the call stays connected).
+
+    Use it alone only to reopen the ear after a TimeoutError or when there is nothing to
+    say first; a conversational turn is one `converse(text)`, never speak() then listen().
+    After a TimeoutError the call is still up: listen again; do not assume the owner left
+    and do not hang up.
 """ + _QUEUE_NOTE + _CALL_NOTE)
 async def listen(max_seconds: float = 120.0, silence_seconds: float = 2.0, start_timeout_seconds: float = 45.0) -> str:
     text = await _run(_listen_sync, max_seconds, silence_seconds, start_timeout_seconds)
@@ -308,6 +328,13 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 2.0, start
 
 @mcp.tool()
 @_doc("""Say `text` over the connected Telegram call, then listen for the reply. One spoken round trip; returns the owner's words.
+
+    Every conversational turn is ONE converse call: speak and listen run under one lock
+    hold, so the ear-open beep follows the last word at once (speak() then listen() leaves
+    seconds of dead air). One topic, one aspect and one question per turn. Takes listen's
+    parameters and raises TimeoutError as listen does if nobody speaks within
+    `start_timeout_seconds`; the call is still up, so reopen the ear with `listen()`; do
+    not assume the owner left and do not hang up.
 """ + _QUEUE_NOTE + _CALL_NOTE)
 async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float = 2.0, start_timeout_seconds: float = 45.0) -> str:
     reply = await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)
@@ -336,9 +363,10 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
     over the call until it ends; without a connected call they raise. Returns one of:
       "answered\\n<their words>\\n(audio: telegram)"
                                               -- they picked up, heard the greeting and
-                                                 replied; continue with listen or converse.
-                                                 A listen timeout or a drop raises as in
-                                                 listen (a timeout leaves the call connected)
+                                                 replied; reply with converse (not speak
+                                                 then listen). A listen timeout or a drop
+                                                 raises as in listen (a timeout leaves the
+                                                 call connected: reopen the ear with listen)
       "already connected"                     -- a call is already up (greeting not
                                                  spoken); just talk
       "not answered (declined or no answer)"  -- what you have can wait; do not

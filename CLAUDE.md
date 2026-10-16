@@ -2,8 +2,8 @@
 
 An ear and voice for Claude Code over a Telegram voice call. Claude drives an
 MCP server (stdio) directly, so a spoken back-and-forth happens inside one
-turn: Claude calls `call` (or joins a connected call), then `speak` and
-`listen`, reads the transcript as a tool result, and continues.
+turn: Claude calls `call` (or joins a connected call), then `converse` for
+each turn, reads the transcript as a tool result, and continues.
 
 **Two parts (docs/DESIGN_REMOTE_DAEMON.md):**
 - **The speak daemon**, one per LAN, in the `speak-telegram` container on
@@ -50,7 +50,8 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
 
 - `speak_server.py`: the thin MCP client. Tool definitions and docstrings,
   the server `instructions` (owner conventions sent to every client: the name
-  Angie, spoken style, call etiquette, debugging), `_run`, and the session's
+  Angie, spoken style, one converse per turn, timeout handling, call
+  etiquette, debugging), `_run`, and the session's
   call expectation (`_call_generation`). `main()`
   reads `SPEAK_DAEMON` (`host:port`, required, no default; unset or malformed
   fails at startup).
