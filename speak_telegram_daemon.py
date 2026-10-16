@@ -13,6 +13,13 @@ audio lock, get `{"ok": true, "phase": "started"}` the moment they hold it, then
 their final reply. Quick ops (`ping`, `status`, `debug`, `set_debug`) never
 touch the lock, so they answer while a call is ringing or connected.
 
+A second listener on HTTP 0.0.0.0:9000 replaces the retired whisper-service with
+its API (owner decision 2026-10-16): `POST /` takes raw 16 kHz mono int16 PCM and
+returns `{"text": ...}`, `GET /health` returns `{"status": "ok", "model", "device"}`.
+It reuses the loaded Whisper engine, and every transcription waits in the same FIFO
+audio lock as the tool ops (status shows it as `transcribe (<ip>)`), so inference
+never overlaps call audio.
+
 Single instance: the TCP bind is the guard (a second daemon gets EADDRINUSE),
 and compose's fixed container_name refuses a second container.
 
@@ -34,6 +41,7 @@ from __future__ import annotations
 
 import datetime
 import faulthandler
+import json
 import logging
 import math
 import os
@@ -48,13 +56,15 @@ import threading
 import time
 import zoneinfo
 from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
+from urllib.parse import urlsplit
 
 import numpy as np
 
 import speak_protocol as proto
 import speak_telegram as tg
-from speak_engines import STT_RATE, TTS_RATE, Engines
+from speak_engines import STT_RATE, TTS_RATE, WHISPER_DEVICE, Engines
 from speak_tone import cue_pcm, tone
 
 log = logging.getLogger("speak.daemon")
@@ -67,6 +77,8 @@ REQUIRED_TELEGRAM_ENV = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSI
 REQUIRED_SPEAK_ENV = ("SPEAK_KOKORO_MODEL", "SPEAK_VOICE", "SPEAK_SPEED", "SPEAK_WHISPER_MODEL",
                       "SPEAK_LANGUAGE", "SPEAK_ACK_TEXT", "SPEAK_QUIET_HOURS", "TZ")
 BIND_HOST = "0.0.0.0"   # open to the LAN by design (owner decision 4); no auth, no TLS
+WHISPER_HTTP_PORT = 9000   # the retired whisper-service's port, so its clients need no change
+TRANSCRIBE_TOOL = "transcribe"   # how status names an HTTP transcription holding the audio lock
 
 
 # ------------------------------------------------------------------ errors
@@ -549,31 +561,170 @@ class _TCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True   # TIME_WAIT only; a live listener still refuses a second bind (EADDRINUSE)
 
 
+# ------------------------------------------------------------------ HTTP whisper API (port 9000)
+
+def _json_bytes(obj: dict) -> bytes:
+    """Encoded exactly as the old service's Starlette JSONResponse: compact, UTF-8, no NaN."""
+    return json.dumps(obj, ensure_ascii=False, allow_nan=False, indent=None, separators=(",", ":")).encode("utf-8")
+
+
+class _BadRequest(ValueError):
+    """The request's framing could not be read (bad Content-Length or chunk size)."""
+
+
+class _WhisperHandler(BaseHTTPRequestHandler):
+    """The retired whisper-service's API (scratch/whisper-service/server.py, FastAPI under
+    uvicorn), reproduced: the same routes, status codes, bodies and content types, including
+    FastAPI's 404/405 `{"detail": ...}` replies and its redirect of a trailing slash."""
+
+    protocol_version = "HTTP/1.1"   # keep-alive, as uvicorn; every reply carries Content-Length
+    ROUTES = {"/": "POST", "/health": "GET"}
+
+    def do_GET(self) -> None:
+        self._route()
+
+    do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = do_GET
+
+    def log_message(self, fmt: str, *args) -> None:   # access log through logging (stderr), not raw stderr
+        log.info("http %s: %s", self.client_address[0], fmt % args)
+
+    def _route(self) -> None:
+        try:
+            body = self._read_body()   # always read, so a kept-alive connection stays in step
+        except _BadRequest as e:
+            log.warning("http %s: %s", self.client_address[0], e)
+            self.close_connection = True
+            self._reply(400, b"Invalid HTTP request received.", "text/plain; charset=utf-8")
+            return
+        path = urlsplit(self.path).path
+        method = self.command
+        if path in self.ROUTES:
+            if self.ROUTES[path] != method:
+                self._reply(405, _json_bytes({"detail": "Method Not Allowed"}), "application/json",
+                            {"Allow": self.ROUTES[path]})
+            elif path == "/health":
+                self._health()
+            else:
+                self._transcribe(body)
+            return
+        if path != "/":
+            other = path[:-1] if path.endswith("/") else path + "/"
+            if other in self.ROUTES:   # Starlette's redirect_slashes: 307 to the other spelling
+                query = urlsplit(self.path).query
+                host = self.headers.get("Host", f"{self.server.server_address[0]}:{self.server.server_address[1]}")
+                self._reply(307, b"", None, {"Location": f"http://{host}{other}" + (f"?{query}" if query else "")})
+                return
+        self._reply(404, _json_bytes({"detail": "Not Found"}), "application/json")
+
+    def _read_body(self) -> bytes:
+        if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
+            chunks = []
+            while True:
+                line = self.rfile.readline(65537)
+                try:
+                    size = int(line.split(b";", 1)[0].strip(), 16)
+                except ValueError:
+                    raise _BadRequest(f"bad chunk size line {line[:40]!r}") from None
+                if size == 0:
+                    while self.rfile.readline(65537) not in (b"\r\n", b"\n", b""):
+                        pass   # trailers
+                    return b"".join(chunks)
+                chunks.append(self.rfile.read(size))
+                self.rfile.readline()   # the CRLF after the chunk
+        length = self.headers.get("Content-Length")
+        if length is None:
+            return b""
+        if not length.strip().isdigit():
+            raise _BadRequest(f"bad Content-Length {length!r}")
+        return self.rfile.read(int(length))
+
+    def _health(self) -> None:
+        daemon: SpeakDaemon = self.server.daemon  # type: ignore[attr-defined]
+        self._reply(200, _json_bytes({"status": "ok", "model": daemon.service.engines.whisper_model,
+                                      "device": WHISPER_DEVICE}), "application/json")
+
+    def _transcribe(self, body: bytes) -> None:
+        daemon: SpeakDaemon = self.server.daemon  # type: ignore[attr-defined]
+        try:
+            text = daemon.transcribe_pcm(body, self.client_address[0])
+        except Exception:   # the old service's unhandled exception: uvicorn's plain 500
+            log.exception("http %s: transcription failed", self.client_address[0])
+            self._reply(500, b"Internal Server Error", "text/plain; charset=utf-8")
+            return
+        self._reply(200, _json_bytes({"text": text}), "application/json")
+
+    def _reply(self, status: int, body: bytes, content_type: str | None, headers: dict | None = None) -> None:
+        try:
+            self.send_response(status)
+            if content_type is not None:
+                self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except OSError as e:
+            self.close_connection = True
+            log.warning("http %s: could not send the reply: %s", self.client_address[0], e)
+
+
+class _WhisperHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True   # TIME_WAIT only; a live listener still refuses a second bind (EADDRINUSE)
+
+
 class SpeakDaemon:
-    """Owns the link, the engines, the audio lock and the TCP server."""
+    """Owns the link, the engines, the audio lock, the TCP server and the HTTP whisper API."""
 
     def __init__(self, link, engines: Engines, settings: dict, debug: DebugControl, port: int = proto.DAEMON_PORT,
-                 on_restart: Callable[[str], None] | None = None) -> None:
+                 on_restart: Callable[[str], None] | None = None, http_port: int = WHISPER_HTTP_PORT) -> None:
         self.link = link
         self.service = SpeakService(link, engines, settings)
         self.lock = AudioLock()
         self.port = port
+        self.http_port = http_port
         self.on_restart = on_restart   # main(): exit 1 so compose restarts the container
         self.debug = debug   # installed on the root logger by main()
         self.closing = threading.Event()   # set on restart or stop: queued tool ops are refused
         self.started_at = time.monotonic()
         self._server: _TCPServer | None = None
-        self._thread: threading.Thread | None = None
+        self._http: _WhisperHTTPServer | None = None
 
     def start(self) -> None:
-        """Telegram (Silero preload, login) first, then the bind: a refused connection always
-        means "not ready or not running", never "running without models or a login"."""
+        """Telegram (Silero preload, login) first, then the binds: a refused connection on
+        either port always means "not ready or not running", never "running without models
+        or a login". Both ports bind before either serves, so a failed bind serves nothing."""
         self.link.start()
-        self._server = _TCPServer((BIND_HOST, self.port), _Handler)
-        self._server.daemon = self  # type: ignore[attr-defined]
-        self._thread = threading.Thread(target=self._server.serve_forever, name="speak-tcp", daemon=True)
-        self._thread.start()
-        log.info("speak daemon: listening on %s:%d", BIND_HOST, self.port)
+        server = _TCPServer((BIND_HOST, self.port), _Handler)
+        try:
+            http = _WhisperHTTPServer((BIND_HOST, self.http_port), _WhisperHandler)
+        except BaseException:
+            server.server_close()
+            raise
+        server.daemon = self  # type: ignore[attr-defined]
+        http.daemon = self  # type: ignore[attr-defined]
+        self._server, self._http = server, http
+        threading.Thread(target=server.serve_forever, name="speak-tcp", daemon=True).start()
+        threading.Thread(target=http.serve_forever, name="speak-http", daemon=True).start()
+        log.info("speak daemon: listening on %s:%d (tools) and http %s:%d (whisper API)",
+                 BIND_HOST, server.server_address[1], BIND_HOST, http.server_address[1])
+
+    def transcribe_pcm(self, body: bytes, peer: str) -> str:
+        """POST / on port 9000: raw 16 kHz mono int16 PCM -> text, converted as the retired
+        whisper-service did (an odd byte count raises, which the handler sends as a 500).
+        Inference waits in the audio lock, FIFO with the tool ops, so it never overlaps call
+        audio. No "no text" error here, unlike listen: the old API returned an empty text."""
+        audio = np.frombuffer(body, dtype=np.int16).astype(np.float32) / 32768.0
+        self.lock.acquire(TRANSCRIBE_TOOL, peer)
+        try:
+            t0 = time.time()
+            text = self.service.engines.transcribe(audio)
+        finally:
+            self.lock.release()
+        log.info("http transcribe from %s: %.1fs of audio in %.1fs: %r", peer, len(audio) / STT_RATE,
+                 time.time() - t0, text)
+        return text
 
     def quick(self, op: str, req: dict) -> dict:
         link = self.link
@@ -632,10 +783,11 @@ class SpeakDaemon:
 
     def stop(self) -> None:
         self.closing.set()
-        if self._server is not None:
-            self._server.shutdown()
-            self._server.server_close()
-            self._server = None
+        for server in (self._server, self._http):
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+        self._server = self._http = None
         self.link.stop()
 
 
@@ -682,7 +834,7 @@ def main() -> None:
         log.info("quiet hours %s in %s (local time now %s)", settings["SPEAK_QUIET_HOURS"], settings["TZ"],
                  datetime.datetime.now(settings["tz"]).strftime("%Y-%m-%d %H:%M %Z"))
         telegram_env = load_env()
-        # Startup order (design section 6.2): engines, then Silero + Telegram (link.start), then the bind.
+        # Startup order (design section 6.2): engines, then Silero + Telegram (link.start), then the binds.
         engines = Engines(settings["SPEAK_KOKORO_MODEL"], settings["SPEAK_VOICE"], settings["SPEAK_SPEED"],
                           settings["SPEAK_WHISPER_MODEL"], settings["SPEAK_LANGUAGE"])
         engines.load()

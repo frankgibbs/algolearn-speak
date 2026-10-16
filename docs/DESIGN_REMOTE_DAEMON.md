@@ -51,7 +51,9 @@ lock described here.
    patrick.
 7. The daemon shares the RTX 3060 that runs `whisper-service` today (GPU0).
 8. **Retire `whisper-service` on patrick once the new daemon is verified
-   working.** This is the last cutover step (section 9).
+   working.** This is the last cutover step (section 9). Superseded in part by
+   the owner decision of 2026-10-16 (section 11): the daemon now serves
+   `whisper-service`'s HTTP API on port 9000 itself.
 9. **Silero VAD runs on the CPU**, not the GPU.
 
 Before and after:
@@ -720,7 +722,8 @@ have meant starting a GPU container.
      one use of `down` the workspace rules allow.
    - Confirm with `nvidia-smi` that its ~3.8 GB on GPU0 is free.
    - `scratch/voice-claude/livekit_agent.py`, its only known caller, stops
-     working at that point.
+     working at that point, until the daemon's HTTP whisper API (section 11)
+     is deployed on the same port.
 
 ## 10. Build record (2026-10-15)
 
@@ -752,3 +755,25 @@ Not verified (they need the container running, an owner action): the Linux
 call quirks, Telethon's behaviour with one session in two places, the VRAM of
 section 6.3, the timings of section 8, and that torch's cuDNN 9 satisfies
 CTranslate2 at run time.
+
+## 11. HTTP whisper API on port 9000 (owner decision 2026-10-16)
+
+The owner retired `whisper-service` and decided that the daemon serves its
+API, so its clients need no change:
+- A second listener in the daemon, on HTTP `0.0.0.0:9000` (stdlib
+  `ThreadingHTTPServer`): `POST /` takes raw 16 kHz mono int16 PCM and returns
+  `{"text"}`; `GET /health` returns `{"status":"ok","model","device"}`. The
+  status codes, bodies and content types are those of the old FastAPI service.
+- It reuses the loaded Whisper engine: no new model, container or setting.
+- Every transcription queues in the same FIFO audio lock as the tool ops, so
+  inference never overlaps call audio; a request may wait a conversational
+  turn.
+- The port binds after Telegram connects, with 8765.
+
+Differences from the old service (Decision): `/health` reports the model the
+daemon actually runs (`large-v3-turbo` fp32, not `large-v3` fp16);
+transcription uses `Engines.transcribe`, whose decoding settings match the
+old service (`language="en"`, `beam_size=1`, `vad_filter=False`) but which
+joins segment texts with no separator (the old service joined them with a
+space, which doubled the space between segments); FastAPI's `/docs`,
+`/redoc` and `/openapi.json` pages are not served.

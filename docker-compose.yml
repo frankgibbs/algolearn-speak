@@ -12,7 +12,9 @@ services:
     image: algolearn-speak-telegram:latest
     container_name: speak-telegram   # a second container is refused; the TCP bind refuses a second daemon
     restart: unless-stopped           # also restarts it after an audio failure (the daemon exits 1)
-    network_mode: host                # WebRTC media is UDP; no second NAT in front of ICE. Port 8765 on the LAN
+    network_mode: host                # WebRTC media is UDP; no second NAT in front of ICE. Ports 8765 (tools) and
+                                      # 9000 (HTTP whisper API, the retired whisper-service's) are on the LAN as
+                                      # bound; host mode has no port mapping, Docker discards a `ports:` list
     env_file: .env
     environment:
       TZ: America/Los_Angeles         # quiet hours are judged on this clock

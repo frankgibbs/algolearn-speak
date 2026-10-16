@@ -15,6 +15,9 @@ each turn, reads the transcript as a tool result, and continues.
   any LAN computer. It holds no models and no audio; each tool is one request
   to the daemon named by `SPEAK_DAEMON`. It imports only `mcp`, `anyio`, the
   standard library and `speak_protocol`.
+- **The HTTP whisper API** (owner decision 2026-10-16), a second listener in
+  the daemon on `0.0.0.0:9000`, replacing the retired `whisper-service` with
+  its API (see "HTTP whisper API" below).
 
 **Telegram only (owner decision 2026-10-15).** No audio device is opened
 anywhere. `speak`, `listen` and `converse` work only while a Telegram call is
@@ -34,7 +37,7 @@ owner and hold a spoken conversation.
 | `converse(text, ...)` | `speak` then `listen` under one lock hold. Returns the user's words. |
 | `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is the whole opening, spoken the moment they answer: who is calling, why, and the context, ending with a question or invitation. It must be at least 6 s when spoken (measured on the synthesized audio); a shorter one raises `ValueError` BEFORE dialing (phone never rings; owner decision 2026-10-12) telling the model to add the context of why it is calling, or, on a fresh conversation with nothing to report, to open with something playful (a joke, something funny or flirty). Never padded. Once answered, `call` immediately does the `listen` (ear-open beep, VAD, Whisper, chime + ack) under the same lock hold and returns the owner's words; listen parameters and defaults match `converse`, and a listen timeout or a drop raises as in `listen` (the call stays connected on a timeout). Returns `answered\n<their words>\n(audio: telegram)`, `already connected` (greeting not spoken, no listen), `not answered (declined or no answer)`, `busy (the owner's Telegram reports a call in progress)` (Telegram discarded it as busy; the phone did not ring), `answered, then hung up during the greeting` (the owner picked up and ended it before the greeting finished; one call back right away is allowed, then the one-hour rule), `hung up` (another session's `hang_up` ended it during the greeting), `answered but audio failed to connect: <error>` (the owner picked up but media failed; the daemon container restarts itself) or `not called: quiet hours (...)`. Check order: quiet hours, already connected, then the greeting length, then the wait until 10 s have passed since the last call ended, then the dial. |
 | `hang_up()` | End that call (only when the owner asks). Always clears the session's call expectation. |
-| `status()` | `{busy, current_tool, waiting, call}`: what holds the daemon's lock (`"<tool> (<client ip>)"`), how many requests from every session wait behind it, and the call state (`none`/`ringing`/`connected`). When the daemon is not reached, `call` is `daemon unreachable: <error>` and the other three are null. Never raises, never waits on the lock. |
+| `status()` | `{busy, current_tool, waiting, call}`: what holds the daemon's lock (`"<tool> (<client ip>)"`; `transcribe` is an HTTP whisper API request), how many requests from every session wait behind it, and the call state (`none`/`ringing`/`connected`). When the daemon is not reached, `call` is `daemon unreachable: <error>` and the other three are null. Never raises, never waits on the lock. |
 | `call_debug(lines=50)` / `set_call_debug(enabled)` | The daemon's recent call events and log tail; DEBUG logging on or off at runtime. No lock. `{"daemon": "unreachable: <error>"}` when the daemon is not reached. |
 
 Every `speak`/`listen`/`converse` result, and an answered `call`, ends with
@@ -62,8 +65,9 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
   `OPENER_MIN_SECONDS`, ...), each defined once.
 - `speak_telegram_daemon.py`: the daemon (`speak-telegram` entry point). TCP
   server, the FIFO audio lock (`AudioLock`), the tool logic (`SpeakService`:
-  call checks, quiet hours, markdown stripping, cues, ack), the debug ops, and
-  `main()` (settings, engine load, Telegram, bind).
+  call checks, quiet hours, markdown stripping, cues, ack), the debug ops, the
+  HTTP whisper API (`_WhisperHandler`, `SpeakDaemon.transcribe_pcm`), and
+  `main()` (settings, engine load, Telegram, binds).
 - `speak_engines.py`: `Engines`. Kokoro `KPipeline` (hexgrad/Kokoro-82M) and
   faster-whisper `WhisperModel` (compute_type `float32`) on `cuda`. The load
   raises if CUDA is missing, Kokoro's weights are not all fp32, or Kokoro's
@@ -108,6 +112,32 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
   daemon checks the socket for EOF when the op reaches the lock).
 - While the daemon is restarting or stopping, an op that reaches the lock gets
   `speak daemon is restarting` and never touches the call.
+
+## HTTP whisper API (port 9000)
+
+The retired `whisper-service` (`scratch/whisper-service/server.py`, FastAPI)
+reproduced in the daemon (`_WhisperHandler` in `speak_telegram_daemon.py`,
+stdlib `http.server`). Known client: `scratch/voice-claude/livekit_agent.py`
+(`WhisperServiceSTT`, `WHISPER_URL=http://patrick:9000/`).
+
+- `POST /`: raw body of 16 kHz mono int16 PCM, no header. `200
+  application/json` `{"text": "..."}` (an empty text is returned, not
+  raised). An odd byte count or an engine failure is `500 text/plain`
+  `Internal Server Error`.
+- `GET /health`: `{"status":"ok","model":"large-v3-turbo","device":"cuda"}`.
+- As FastAPI: a wrong method is `405` `{"detail":"Method Not Allowed"}` with
+  `Allow`, an unknown path `404` `{"detail":"Not Found"}`, a trailing slash
+  `307` to the other spelling. HTTP/1.1 keep-alive and chunked bodies.
+- It reuses the loaded Whisper engine (`Engines.transcribe`: large-v3-turbo
+  fp32, `language=SPEAK_LANGUAGE` (en), `beam_size=1`, `vad_filter=False`).
+  No new model, no new container, no new setting.
+- Every transcription waits in the same FIFO audio lock as the tool ops
+  (status shows `transcribe (<ip>)`), so inference never overlaps call audio;
+  a request can wait behind a whole call or converse turn. The PCM is read
+  before the request queues.
+- Port 9000 binds right after 8765, both only after the engines and Telegram
+  are up; a failed bind on either stops the daemon. Open to the LAN like 8765:
+  no authentication, no TLS.
 
 ## Telegram calls
 
@@ -199,7 +229,7 @@ the phone has signal.
 
 Models are cached in the `speak_models` volume
 (`/root/.cache/huggingface`). Startup order: engines load and warm, then
-Silero and Telegram connect, then the port binds; so a refused connection
+Silero and Telegram connect, then ports 8765 and 9000 bind; so a refused connection
 means "not ready or not running", never "running without models".
 
 ## Deployment on patrick

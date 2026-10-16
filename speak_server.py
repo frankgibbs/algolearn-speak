@@ -491,7 +491,8 @@ async def status() -> dict:
     "daemon unreachable: <error>", or "error: <reason>" if it could not be read;
     when the daemon is not reached, busy/current_tool/waiting are null (unknown).
     speak/listen/converse work only while `call` is "connected".
-    `current_tool` is `"<tool> (<client ip>)"` for the tool holding the lock,
+    `current_tool` is `"<tool> (<client ip>)"` for the tool holding the lock
+    ("transcribe" is a request to the daemon's HTTP whisper API on port 9000),
     or null if idle. `waiting` counts every queued caller from every session.
     Never raises and never blocks on the audio lock.
     """

@@ -23,6 +23,7 @@ TTS_RATE = 24_000              # Kokoro output rate
 STT_RATE = 16_000              # Whisper input rate
 SENTENCE_SPLIT = r"(?<=[.!?])\s+"
 WHISPER_COMPUTE_TYPE = "float32"
+WHISPER_DEVICE = "cuda"        # also reported by the daemon's GET /health (port 9000)
 
 
 class Engines:
@@ -55,7 +56,7 @@ class Engines:
         dtypes = {p.dtype for p in self._kokoro.model.parameters()}
         if dtypes != {torch.float32}:
             raise RuntimeError(f"Kokoro loaded with parameter dtypes {dtypes}; fp32 is required")
-        self._whisper = WhisperModel(self.whisper_model, device="cuda", device_index=0,
+        self._whisper = WhisperModel(self.whisper_model, device=WHISPER_DEVICE, device_index=0,
                                      compute_type=WHISPER_COMPUTE_TYPE)
         # Warm both so the first speak/listen does not pay CUDA kernel selection or the voice load.
         self.synthesize("Ready.")
@@ -74,6 +75,6 @@ class Engines:
         return np.concatenate(chunks)
 
     def transcribe(self, audio: np.ndarray) -> str:
-        """16 kHz mono float32 -> text."""
+        """16 kHz mono float32 -> text. Used by listen and by the daemon's POST / (port 9000)."""
         segments, _info = self._whisper.transcribe(audio, language=self.language, beam_size=1, vad_filter=False)
         return "".join(segment.text for segment in segments).strip()
