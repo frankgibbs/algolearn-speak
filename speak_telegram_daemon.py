@@ -31,7 +31,7 @@ A native crash (SIGSEGV, SIGABRT, ...) in ntgcalls, torch or ctranslate2 dumps e
 Python thread's stack to stderr before the process dies with the signal (exit
 139 for SIGSEGV), so `docker logs speak-telegram` shows what each thread was
 doing: the telegram-loop thread (pump, record, play) or a request thread inside
-Engines.synthesize/transcribe or the Silero VAD.
+Engines.synthesize_stream/synthesize/transcribe or the Silero VAD.
 
 No fallbacks: every setting is required, a model or login failure stops the
 daemon before the port is bound, and every failure raises.
@@ -338,14 +338,15 @@ class SpeakService:
         return re.sub(r"[ \t]+", " ", text).strip()
 
     def _speak(self, text: str) -> float:
-        """Synthesize all of it, then play it: inference never overlaps outgoing speech
-        (design section 4.6). Returns the spoken seconds."""
+        """Stream it: the first Kokoro segment starts playing as soon as it is synthesized,
+        and the rest are synthesized while earlier ones play (owner decision 2026-10-16,
+        docs/DESIGN_STREAMED_SPEECH.md, superseding design section 4.6 for Kokoro during
+        speech). Returns once all of it has played, so Whisper never overlaps outgoing
+        speech. Returns the spoken seconds."""
         text = self.plain(text)
         if not text:
             raise ValueError("speak() called with empty text")
-        audio = self.engines.synthesize(text)
-        self.link.play(audio, TTS_RATE)
-        return len(audio) / TTS_RATE
+        return self.link.play_stream(self.engines.synthesize_stream(text), TTS_RATE)
 
     def _listen(self, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
         audio = self.link.record(max_seconds, silence_seconds, start_timeout_seconds,

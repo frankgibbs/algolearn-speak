@@ -32,7 +32,7 @@ owner and hold a spoken conversation.
 
 | Tool | What it does |
 |---|---|
-| `speak(text)` | The daemon synthesizes `text` with Kokoro-82M (all of it, before playing any) and plays it into the connected call. Returns spoken duration. |
+| `speak(text)` | The daemon synthesizes `text` with Kokoro-82M one segment (a sentence) at a time and plays each into the connected call as soon as it is made, synthesizing the next while earlier ones play (owner decision 2026-10-16). Returns once all of it has played, with the spoken duration. |
 | `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep, then records the owner's call audio until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech). Low beep, then Whisper large-v3-turbo transcribes. Once text is in hand, a rising two-note chime and the spoken word "Processing" tell the user their words were captured. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. |
 | `converse(text, ...)` | `speak` then `listen` under one lock hold. Returns the user's words. |
 | `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is the whole opening, spoken the moment they answer: who is calling, why, and the context, ending with a question or invitation. It must be at least 6 s when spoken (measured on the synthesized audio); a shorter one raises `ValueError` BEFORE dialing (phone never rings; owner decision 2026-10-12) telling the model to add the context of why it is calling, or, on a fresh conversation with nothing to report, to open with something playful (a joke, something funny or flirty). Never padded. Once answered, `call` immediately does the `listen` (ear-open beep, VAD, Whisper, chime + ack) under the same lock hold and returns the owner's words; listen parameters and defaults match `converse`, and a listen timeout or a drop raises as in `listen` (the call stays connected on a timeout). Returns `answered\n<their words>\n(audio: telegram)`, `already connected` (greeting not spoken, no listen), `not answered (declined or no answer)`, `busy (the owner's Telegram reports a call in progress)` (Telegram discarded it as busy; the phone did not ring), `answered, then hung up during the greeting` (the owner picked up and ended it before the greeting finished; one call back right away is allowed, then the one-hour rule), `hung up` (another session's `hang_up` ended it during the greeting), `answered but audio failed to connect: <error>` (the owner picked up but media failed; the daemon container restarts itself) or `not called: quiet hours (...)`. Check order: quiet hours, already connected, then the greeting length, then the wait until 10 s have passed since the last call ended, then the dial. |
@@ -68,7 +68,8 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
   call checks, quiet hours, markdown stripping, cues, ack), the debug ops, the
   HTTP whisper API (`_WhisperHandler`, `SpeakDaemon.transcribe_pcm`), and
   `main()` (settings, engine load, Telegram, binds).
-- `speak_engines.py`: `Engines`. Kokoro `KPipeline` (hexgrad/Kokoro-82M) and
+- `speak_engines.py`: `Engines` (`synthesize_stream` per segment for speak,
+  `synthesize` whole for the greeting). Kokoro `KPipeline` (hexgrad/Kokoro-82M) and
   faster-whisper `WhisperModel` (compute_type `float32`) on `cuda`. The load
   raises if CUDA is missing, Kokoro's weights are not all fp32, or Kokoro's
   espeak-ng fallback did not load.
@@ -177,9 +178,17 @@ the phone has signal.
   (bursts sped audio up); ntgcalls aborts in its C++ destructors at exit, so
   the daemon always leaves via `os._exit`. These are not yet re-verified on
   Linux.
-- **Inference never overlaps outgoing speech:** speak synthesizes everything
-  before playing any of it, and Whisper runs only after the ear-closed cue has
-  played, so the pump sends only silence while models run.
+- **Streamed speech (owner decision 2026-10-16, `docs/DESIGN_STREAMED_SPEECH.md`):**
+  speak plays Kokoro's first segment as soon as it is synthesized and
+  synthesizes the rest while earlier segments play (`Engines.synthesize_stream`
+  feeding `TelegramLink.play_stream`). This supersedes the earlier rule that
+  inference never overlaps outgoing speech, for Kokoro only. If a segment is
+  not ready when the previous one finishes, the pump sends silence (never a
+  burst) and records `speak_underrun` with the gap; every streamed speech ends
+  with a `speech_stream_done` summary (segments, first-audio latency,
+  underruns, max pump lag, pump stalls). The call greeting is still
+  synthesized whole (the 6 s opener file). Whisper still never overlaps
+  outgoing speech: it runs only after the ear-closed cue has played.
 - **Call required:** a call that ends mid-operation raises `Telegram call
   ended during ...`; the rule of engagement is to call back. The call is
   shared by every session on every computer (they take turns through the

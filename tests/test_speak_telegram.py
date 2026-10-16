@@ -726,3 +726,155 @@ class TestAmplitudeEvents(LinkCase):
         self.assertTrue(e["exposed"])
         self.assertEqual(e["frames"], 3)
         self.assertAlmostEqual(e["peak"], 0.3 * 32767, delta=5)
+
+
+def sine(seconds: float, freq: float = 440.0, rate: int = 24000) -> np.ndarray:
+    """A loud tone whose 10 ms frames are never all zero (a whole number of frames at 24 kHz)."""
+    return (0.3 * np.sin(2 * np.pi * freq * np.arange(int(seconds * rate)) / rate)).astype(np.float32)
+
+
+class TestPlayStream(LinkCase):
+    """play_stream (docs/DESIGN_STREAMED_SPEECH.md): each segment plays as its producer yields it."""
+
+    SILENCE = bytes(tg.FRAME_BYTES)
+
+    def setUp(self):
+        super().setUp()
+        self.link.call(np.zeros(100, dtype=np.float32), 24000)
+
+    def loud(self, frames=None):
+        return [f for f in (self.calls.frames if frames is None else frames) if f != self.SILENCE]
+
+    def summary(self):
+        done = events_named(self.link, "speech_stream_done")
+        self.assertEqual(len(done), 1)
+        return done[0]
+
+    def test_first_segment_plays_before_the_second_is_produced(self):
+        def produce():
+            yield sine(0.3)
+            # Still inside the producer: the first segment must already be on the call.
+            self.wait_until(lambda: len(self.loud()) >= 5)
+            yield sine(0.3, 660.0)
+
+        self.assertAlmostEqual(self.link.play_stream(produce(), 24000), 0.6)
+        self.assertEqual(len(self.loud()), 60)
+
+    def test_segments_in_time_play_contiguously_without_underrun(self):
+        a, b, c = sine(0.2), sine(0.3, 550.0), sine(0.1, 660.0)
+        n0 = len(self.calls.frames)
+        self.link.play_stream(iter([a, b, c]), 24000)
+        sent = self.calls.frames[n0:]
+        first = next(i for i, f in enumerate(sent) if f != self.SILENCE)
+        self.assertEqual(sent[first:first + 60], self.loud(sent))   # 60 loud frames back to back
+        self.assertEqual(b"".join(self.loud(sent)), tg.to_call_pcm(a, 24000) + tg.to_call_pcm(b, 24000)
+                         + tg.to_call_pcm(c, 24000))
+        self.assertEqual(events_named(self.link, "speak_underrun"), [])
+        s = self.summary()
+        self.assertEqual((s["segments"], s["audio_ms"], s["underruns"], s["underrun_ms"], s["aborted"]),
+                         (3, 600, 0, 0, False))
+
+    def test_a_slow_producer_gets_silence_between_segments_and_an_underrun_event(self):
+        a, b = sine(0.2), sine(0.2, 660.0)
+
+        def produce():
+            yield a
+            time.sleep(0.5)   # synthesis slower than the 0.2 s that is playing
+            yield b
+
+        n0 = len(self.calls.frames)
+        self.link.play_stream(produce(), 24000)
+        sent = self.calls.frames[n0:]
+        # The audio itself is exact: nothing sped up, dropped or repeated.
+        self.assertEqual(b"".join(self.loud(sent)), tg.to_call_pcm(a, 24000) + tg.to_call_pcm(b, 24000))
+        first = next(i for i, f in enumerate(sent) if f != self.SILENCE)
+        gap = sent[first + 20:]
+        silent_between = next(i for i, f in enumerate(gap) if f != self.SILENCE)
+        (u,) = events_named(self.link, "speak_underrun")
+        self.assertEqual(u["before_segment"], 2)
+        self.assertEqual(u["gap_ms"], silent_between * 10)   # exactly the silence the pump sent
+        self.assertTrue(150 <= u["gap_ms"] <= 600, u)
+        s = self.summary()
+        self.assertEqual((s["underruns"], s["underrun_ms"], s["segments"]), (1, u["gap_ms"], 2))
+
+    def test_the_wait_for_the_first_segment_is_latency_not_underrun(self):
+        def produce():
+            time.sleep(0.15)
+            yield sine(0.1)
+
+        self.link.play_stream(produce(), 24000)
+        s = self.summary()
+        self.assertGreaterEqual(s["first_audio_ms"], 140)
+        self.assertEqual(s["underruns"], 0)
+        queued = events_named(self.link, "playback_queued")[-1]
+        self.assertEqual(queued["segment"], 1)
+        self.assertGreaterEqual(queued["produce_ms"], 140)
+
+    def test_a_producer_error_stops_the_speech_and_propagates(self):
+        def produce():
+            yield sine(2.0)
+            raise ValueError("kokoro broke")
+
+        with self.assertRaisesRegex(ValueError, "kokoro broke"):
+            self.link.play_stream(produce(), 24000)
+        self.assertEqual(len(self.link._outgoing), 0)
+        n = len(self.loud())
+        time.sleep(0.15)
+        self.assertEqual(len(self.loud()), n)   # nothing plays after the error
+        s = self.summary()
+        self.assertTrue(s["aborted"])
+        self.assertEqual(s["error"], "ValueError: kokoro broke")
+        self.assertEqual(self.link.state(), tg.CONNECTED)   # the call itself is untouched
+
+    def test_remote_hang_up_mid_stream_raises_call_ended(self):
+        def produce():
+            yield sine(2.0)
+            self.remote_hang_up()
+            yield sine(0.5)
+
+        with self.assertRaisesRegex(tg.CallEnded, "ended during playback"):
+            self.link.play_stream(produce(), 24000)
+        self.assertTrue(self.summary()["aborted"])
+
+    def test_remote_hang_up_while_the_last_segment_plays_raises_call_ended(self):
+        threading.Timer(0.1, self.remote_hang_up).start()
+        with self.assertRaisesRegex(tg.CallEnded, "ended during playback"):
+            self.link.play_stream(iter([sine(2.0)]), 24000)
+
+    def test_no_audio_raises(self):
+        with self.assertRaisesRegex(RuntimeError, "got no audio"):
+            self.link.play_stream(iter([]), 24000)
+        self.assertTrue(self.summary()["aborted"])
+
+    def test_pump_stalls_during_the_stream_are_counted(self):
+        def produce():
+            yield sine(0.4)
+            time.sleep(0.05)
+            self.link._loop.call_soon_threadsafe(time.sleep, 0.15)   # block the loop: the pump falls behind
+            time.sleep(0.05)
+            yield sine(0.2)
+
+        self.link.play_stream(produce(), 24000)
+        s = self.summary()
+        self.assertGreaterEqual(s["pump_stalls"], 1)
+        self.assertGreaterEqual(s["max_pump_lag_ms"], 50)
+
+    def test_plain_play_reports_pump_timing(self):
+        self.link.play(sine(0.1), 24000)
+        done = events_named(self.link, "playback_done")[-1]
+        self.assertIn("max_pump_lag_ms", done)
+        self.assertEqual(done["pump_stalls"], 0)
+
+
+class TestPlayStreamWithoutCall(LinkCase):
+    def test_raises_before_the_producer_is_touched(self):
+        touched = []
+
+        def produce():
+            touched.append(True)
+            yield sine(0.1)
+
+        with self.assertRaisesRegex(tg.CallEnded, "no connected"):
+            self.link.play_stream(produce(), 24000)
+        self.assertEqual(touched, [])
+        self.assertEqual(events_named(self.link, "speech_stream_done"), [])

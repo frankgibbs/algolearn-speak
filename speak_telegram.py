@@ -13,6 +13,12 @@ Built around what the 2026-10-09 spike verified:
   then switches to raw frames.
 - A 10 ms pump sends a frame every 10 ms for the whole call (silence when idle)
   and never bursts after a stall (bursts played the next audio sped up).
+
+Speech streams (owner decision 2026-10-16, docs/DESIGN_STREAMED_SPEECH.md):
+`play_stream` queues each segment as its producer (Kokoro, on the calling
+thread) yields it, so playback starts after the first segment. If the producer
+falls behind, the pump sends silence until the next segment arrives and
+records the gap as a `speak_underrun` event; it never bursts to catch up.
 - py-tgcalls raises CallDeclined / CallBusy / TimedOutAnswer / CallDiscarded
   from play() when the call is not taken (read in pytgcalls
   methods/internal/handle_mtproto_updates.py and connect_call.py).
@@ -37,6 +43,7 @@ import threading
 import time
 import uuid
 import wave
+from collections.abc import Iterable
 from typing import Callable
 
 import ntgcalls
@@ -65,12 +72,28 @@ STATS_FAST_INTERVAL = 1.0    # amplitude summaries: every second ...
 STATS_FAST_SECONDS = 10.0    # ... for the first 10 s after the call is answered ...
 STATS_SLOW_INTERVAL = 10.0   # ... then every 10 s
 MAX_LAG_EVENTS = 20   # pump_stall events per call, so a stalled call cannot flood the buffer
+STREAM_STEP_TIMEOUT = 5.0   # play_stream: one loop round-trip to open, queue into, or stop a stream
 
 TIMEOUT = object()   # record(): nobody spoke within start_timeout_seconds
 
 
 class CallEnded(RuntimeError):
     pass
+
+
+class _Stream:
+    """One streamed utterance (play_stream), touched on the loop thread only."""
+
+    def __init__(self) -> None:
+        self.t0 = time.monotonic()
+        self.segments = 0
+        self.audio_bytes = 0
+        self.first_audio_ms: int | None = None   # stream start -> first segment queued
+        self.audio_started = False   # the pump has sent the first segment's first frame
+        self.gap_frames = 0          # silence frames sent since the queue ran dry mid-stream
+        self.resume_segment = 0      # the segment queued into an empty buffer after audio started
+        self.underruns = 0
+        self.underrun_frames = 0
 
 
 def describe(error: BaseException) -> str:
@@ -257,6 +280,11 @@ class TelegramLink:
         self._opener_out_stats = AudioStats() # outgoing frames py-tgcalls reports during the opener file
         self._stats_task: asyncio.Task | None = None
         self._stats_t = 0.0
+        # Pump timing per playback (loop thread only): the largest lag behind the 10 ms schedule
+        # and the number of stalls over PUMP_MAX_LAG since the last play/play_stream began.
+        self._lag_max = 0.0
+        self._lag_stalls = 0
+        self._stream: _Stream | None = None
 
     def _event(self, event: str, **fields) -> None:
         """Record a call event for the current call (elapsed seconds since it was requested)."""
@@ -593,9 +621,18 @@ class TelegramLink:
         first_sent, lag_events, was_sending = False, 0, False
         while True:
             sending = bool(self._outgoing)
+            stream = self._stream
             if sending:
                 if not was_sending:
                     self._event("audio_out_start", queued_ms=len(self._outgoing) // FRAME_BYTES * 10)
+                    if stream is not None:
+                        if stream.gap_frames:   # the producer fell behind: the pump sent this much silence
+                            stream.underruns += 1
+                            stream.underrun_frames += stream.gap_frames
+                            self._event("speak_underrun", gap_ms=stream.gap_frames * 10,
+                                        before_segment=stream.resume_segment)
+                            stream.gap_frames = 0
+                        stream.audio_started = True
                 was_sending = True
                 frame = bytes(self._outgoing[:FRAME_BYTES]).ljust(FRAME_BYTES, b"\0")
                 del self._outgoing[:FRAME_BYTES]
@@ -606,6 +643,8 @@ class TelegramLink:
                     self._event("audio_out_end")
                 was_sending = False
                 frame = silence
+                if stream is not None and stream.audio_started:
+                    stream.gap_frames += 1
             await self._calls.send_frame(self._user_id, Device.MICROPHONE, frame)
             self._out_stats.add(frame)
             if sending:
@@ -617,7 +656,10 @@ class TelegramLink:
                 self._event("first_frame_sent")
             n += 1
             lag = time.monotonic() - (start + n * 0.01)
+            if lag > self._lag_max:
+                self._lag_max = lag
             if lag > PUMP_MAX_LAG:
+                self._lag_stalls += 1
                 if lag_events < MAX_LAG_EVENTS:   # an underrun/gap: the outgoing stream stalled this long
                     lag_events += 1
                     self._event("pump_stall", lag_ms=round(lag * 1000), sending_audio=was_sending)
@@ -649,11 +691,22 @@ class TelegramLink:
         self._run(self._play(pcm), len(pcm) / (FRAME_BYTES * 100) + 30.0, "playing audio into the call")
 
     async def _play(self, pcm: bytes) -> None:
-        if self._state != CONNECTED or self._pump_task is None or self._pump_task.done():
-            raise CallEnded("no connected Telegram call")
+        self._require_pump()
+        self._lag_max, self._lag_stalls = 0.0, 0
         self._drained.clear()
         self._outgoing.extend(pcm)
         self._event("playback_queued", audio_ms=len(pcm) // FRAME_BYTES * 10)
+        await self._wait_drained()
+        if self._ended.is_set():
+            raise CallEnded("the Telegram call ended during playback")
+        self._event("playback_done", max_pump_lag_ms=round(self._lag_max * 1000), pump_stalls=self._lag_stalls)
+
+    def _require_pump(self) -> None:
+        if self._state != CONNECTED or self._pump_task is None or self._pump_task.done():
+            raise CallEnded("no connected Telegram call")
+
+    async def _wait_drained(self) -> None:
+        """Until the pump has sent everything queued (or the call ended, which also sets it)."""
         try:
             while not self._drained.is_set():
                 try:
@@ -663,9 +716,89 @@ class TelegramLink:
         except asyncio.CancelledError:
             self._outgoing.clear()   # timed out: the rest must not play after the error
             raise
+
+    # ------------------------------------------------------------ streamed audio out
+
+    def play_stream(self, segments: Iterable[np.ndarray], rate: int) -> float:
+        """Play audio that is produced segment by segment (owner decision 2026-10-16,
+        docs/DESIGN_STREAMED_SPEECH.md). Each segment is queued on the call the moment
+        `segments` yields it, while the earlier ones play; the iterator runs on the calling
+        thread (Kokoro synthesis happens in its next()). Returns, once everything has been
+        sent, the seconds of audio played (silence from underruns not counted).
+
+        With no connected call this raises CallEnded before `segments` is touched. Any
+        failure after that (the producer raised, the call ended, a timeout) clears what is
+        still queued, so nothing plays after the error, records an aborted
+        speech_stream_done, and propagates. Raises RuntimeError if `segments` is empty."""
+        self._run(self._stream_begin(), STREAM_STEP_TIMEOUT, "starting streamed playback")
+        samples = 0
+        queued_seconds = 0.0
+        try:
+            it = iter(segments)
+            while True:
+                t0 = time.monotonic()
+                audio = next(it, None)
+                if audio is None:
+                    break
+                produce_s = time.monotonic() - t0
+                pcm = to_call_pcm(audio, rate)
+                samples += len(audio)
+                queued_seconds += len(pcm) / (FRAME_BYTES * 100)
+                self._run(self._stream_add(pcm, produce_s), STREAM_STEP_TIMEOUT, "queueing streamed audio")
+            if samples == 0:
+                raise RuntimeError("streamed playback got no audio")
+            self._run(self._stream_finish(), queued_seconds + 30.0, "playing streamed audio into the call")
+        except BaseException as e:
+            self._run(self._stream_abort(describe(e)), STREAM_STEP_TIMEOUT, "stopping streamed playback")
+            raise
+        return samples / rate
+
+    async def _stream_begin(self) -> None:
+        self._require_pump()
+        self._lag_max, self._lag_stalls = 0.0, 0
+        self._stream = _Stream()
+
+    async def _stream_add(self, pcm: bytes, produce_s: float) -> None:
+        st = self._stream
+        if st is None:
+            raise RuntimeError("streamed audio queued with no stream open")
+        if self._state != CONNECTED or self._pump_task is None or self._pump_task.done():
+            raise CallEnded("the Telegram call ended during playback")
+        st.segments += 1
+        st.audio_bytes += len(pcm)
+        if st.first_audio_ms is None:
+            st.first_audio_ms = round((time.monotonic() - st.t0) * 1000)
+        if not self._outgoing and st.audio_started:
+            st.resume_segment = st.segments   # into an empty buffer: speech resumes with this one
+        self._drained.clear()
+        self._outgoing.extend(pcm)
+        self._event("playback_queued", audio_ms=len(pcm) // FRAME_BYTES * 10, segment=st.segments,
+                    produce_ms=round(produce_s * 1000))
+
+    async def _stream_finish(self) -> None:
+        await self._wait_drained()
         if self._ended.is_set():
             raise CallEnded("the Telegram call ended during playback")
-        self._event("playback_done")
+        self._stream_done(aborted=False)
+
+    async def _stream_abort(self, error: str) -> None:
+        self._outgoing.clear()   # nothing plays after the error
+        self._drained.set()
+        self._stream_done(aborted=True, error=error)
+
+    def _stream_done(self, aborted: bool, error: str | None = None) -> None:
+        """One speech_stream_done summary per streamed utterance, debug on or off."""
+        st = self._stream
+        if st is None:   # already summarized: the failure came after a completed finish
+            return
+        self._stream = None
+        fields = {"segments": st.segments, "audio_ms": round(st.audio_bytes / (FRAME_BYTES * 100) * 1000),
+                  "first_audio_ms": st.first_audio_ms, "underruns": st.underruns,
+                  "underrun_ms": st.underrun_frames * 10, "max_pump_lag_ms": round(self._lag_max * 1000),
+                  "pump_stalls": self._lag_stalls, "aborted": aborted}
+        if error is not None:
+            fields["error"] = error
+        self._event("speech_stream_done", **fields)
 
     # ------------------------------------------------------------ audio in
 

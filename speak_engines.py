@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Iterator
 
 import numpy as np
 
@@ -65,14 +66,24 @@ class Engines:
                  self.kokoro_model, self.voice, self.whisper_model, WHISPER_COMPUTE_TYPE,
                  torch.cuda.get_device_name(0))
 
-    def synthesize(self, text: str) -> np.ndarray:
-        """All of `text` as mono float32 at TTS_RATE. Synthesis finishes before any of it
-        is played, so inference never overlaps outgoing speech (design section 4.6)."""
-        chunks = [result.audio.detach().cpu().numpy().astype(np.float32).reshape(-1)
-                  for result in self._kokoro(text, voice=self.voice, speed=self.speed, split_pattern=SENTENCE_SPLIT)]
-        if not chunks:
+    def synthesize_stream(self, text: str) -> Iterator[np.ndarray]:
+        """`text` as mono float32 at TTS_RATE, one array per Kokoro segment (a sentence, or a
+        part of one over 510 phonemes), each yielded as soon as Kokoro has made it: KPipeline
+        is a lazy generator, so each next() is one segment's synthesis on the calling thread.
+        speak plays each segment while the next is synthesized (owner decision 2026-10-16,
+        docs/DESIGN_STREAMED_SPEECH.md). Raises if Kokoro yields nothing."""
+        produced = False
+        for result in self._kokoro(text, voice=self.voice, speed=self.speed, split_pattern=SENTENCE_SPLIT):
+            produced = True
+            yield result.audio.detach().cpu().numpy().astype(np.float32).reshape(-1)
+        if not produced:
             raise RuntimeError(f"Kokoro produced no audio for {text!r}")
-        return np.concatenate(chunks)
+
+    def synthesize(self, text: str) -> np.ndarray:
+        """All of `text` as one mono float32 array at TTS_RATE: the call greeting, which must
+        be one opener file of at least OPENER_MIN_SECONDS, measured before dialing, and the
+        warm-up. Speech on a connected call streams instead (synthesize_stream)."""
+        return np.concatenate(list(self.synthesize_stream(text)))
 
     def transcribe(self, audio: np.ndarray) -> str:
         """16 kHz mono float32 -> text. Used by listen and by the daemon's POST / (port 9000)."""

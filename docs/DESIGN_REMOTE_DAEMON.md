@@ -417,6 +417,11 @@ GIL. The current sequence already keeps them apart:
 So while models run, the pump sends only silence frames. The move keeps that
 order as a rule.
 
+**Superseded for Kokoro during speak (owner decision 2026-10-16):** speak now
+synthesizes each segment while earlier ones play; the greeting is still
+synthesized whole, and Whisper still never overlaps outgoing speech. See
+`docs/DESIGN_STREAMED_SPEECH.md`.
+
 Silero VAD stays on the CPU (Owner decision 9). It runs during capture, when
 the pump is sending silence, as it does on the Mac today. Section 9 re-tests
 on Linux whether a stall among silence frames is harmless. The pump's
