@@ -39,6 +39,14 @@ queued to play after the capture, so the pump sends only silence while it
 runs. Sections 2 and 7 describe the cues as they were when streamed
 speech was built.
 
+**Owner decision (2026-10-16), later that day, after a call testing the
+above:** the silence after the owner stops talking felt like a gap, so the
+rising two-note chime is back, played where it was: after Whisper has the
+transcript, so Whisper still never overlaps outgoing audio. It applies to
+`listen`, `converse` and `call`'s listen. The ear-closed low beep and the
+spoken ack stay removed (`SPEAK_ACK_TEXT` stays gone). The chime is distinct
+from the ear-open beep and tells the owner "you're done, I heard you".
+
 ## 2. Where synthesis and playback happen today (Verified, at 8b598e8)
 
 - `SpeakService._speak` strips markdown, calls `Engines.synthesize(text)`,
@@ -63,8 +71,8 @@ speech was built.
   per call (`speak_telegram.py:59`, `67`, `588-625`).
 - `converse` runs `_speak` then `_listen` under one lock hold
   (`speak_telegram_daemon.py:376-384`). `_listen` runs Whisper only after the
-  ear-closed cue has played (superseded 2026-10-16: that cue is removed, only the ear-open beep remains) (`speak_telegram_daemon.py:356-358`).
-- (Superseded 2026-10-16: removed, only the ear-open beep remains.) The ack after every listen is a chime plus `_speak(SPEAK_ACK_TEXT)`
+  ear-closed cue has played (superseded 2026-10-16: that cue is removed; the ear-open beep and, after Whisper, the rising chime remain) (`speak_telegram_daemon.py:356-358`).
+- (Superseded 2026-10-16: the spoken ack is removed; the chime is kept, played after Whisper.) The ack after every listen is a chime plus `_speak(SPEAK_ACK_TEXT)`
   (`speak_telegram_daemon.py:326-330`).
 - `call` synthesizes the greeting in full, measures it against
   `OPENER_MIN_SECONDS`, and hands it to `link.call`, which writes it as the
@@ -192,7 +200,7 @@ measured on the synthesized audio before dialing (Verified,
 - **`converse` and the ack:** `_speak` returns only after every segment has
   been synthesized and played, so `_listen`, the ear-open cue and Whisper
   start exactly as before. Whisper still never overlaps outgoing speech. The
-  ack ("Processing.") is one segment and plays as before (ack removed 2026-10-16: only the ear-open beep remains).
+  ack ("Processing.") is one segment and plays as before (ack removed 2026-10-16; the rising chime alone still plays after Whisper).
 - **A call that drops mid-speech** raises `Telegram call ended during
   speak` (or `converse`) as before, through `guard_call`.
 

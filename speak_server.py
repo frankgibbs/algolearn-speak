@@ -234,8 +234,9 @@ Voice tools for talking with the owner (Frank) over a Telegram call. Owner conve
 - A listen/converse TimeoutError means nobody spoke in time; the call is still up.
   Reopen the ear with listen(). Do not assume the owner left, do not hang up.
 - Go straight into the answer. Never prefix a reply with "heard you" or a restatement;
-  there is no spoken acknowledgement, so answer first and hand real work to agents
-  (subagents, background tasks) rather than going silent while you do it.
+  listen's rising two-note chime (played once your transcript is captured) is the
+  acknowledgement, and there is no spoken one. So answer first and hand real work to
+  agents (subagents, background tasks) rather than going silent while you do it.
 - When the owner asks you to call, they are up: pass override_quiet_hours=True without
   asking. Calls you start on your own respect quiet hours.
 - Call etiquette: "not answered" -> wait an hour. "busy" -> call once more, then wait an
@@ -312,8 +313,9 @@ async def speak(text: str) -> str:
 @mcp.tool()
 @_doc("""Listen to the owner on the connected Telegram call until they finish talking and return what they said.
 
-    A high beep means the ear is open; it is the only cue (no beep, chime or spoken
-    acknowledgement follows the capture), so answer straight away. Recording ends after
+    A high beep means the ear is open; a rising two-note chime, played once the transcript
+    is captured, tells the owner their words were heard. There is no spoken acknowledgement,
+    so answer straight away. Recording ends after
     `silence_seconds` of quiet following speech, or at `max_seconds` of speech. Raises
     TimeoutError if nobody speaks within `start_timeout_seconds` (the call stays connected).
 

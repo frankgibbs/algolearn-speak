@@ -65,7 +65,7 @@ import numpy as np
 import speak_protocol as proto
 import speak_telegram as tg
 from speak_engines import STT_RATE, TTS_RATE, WHISPER_DEVICE, Engines
-from speak_tone import cue_pcm
+from speak_tone import chime_pcm, cue_pcm
 
 log = logging.getLogger("speak.daemon")
 
@@ -304,6 +304,19 @@ class SpeakService:
             raise self._call_ended(sess, tool, f"call state is {self.link.state()}; {partial}")
         return result
 
+    def _after_capture(self, play: Callable[[], None]) -> None:
+        """A cue played after the owner's words are captured. A call that has just ended (the
+        owner said their piece and hung up) makes it fail; the words must still be returned,
+        so that failure is skipped here and guard_call then raises "call ended" WITH the
+        transcript. Any failure while the call is connected raises."""
+        try:
+            play()
+        except RuntimeError:
+            if self.link.state() != tg.CONNECTED:
+                log.info("call ended right after the capture; keeping the words for the drop report")
+                return
+            raise
+
     # -- audio
 
     def _cue(self, freq_hz: float, seconds: float = 0.12, volume: float = 0.2, lead_silence: float = 0.0) -> None:
@@ -329,13 +342,16 @@ class SpeakService:
         return self.link.play_stream(self.engines.synthesize_stream(text), TTS_RATE)
 
     def _listen(self, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
-        """The ear-open beep, the capture, then Whisper. Owner decision 2026-10-16: the
-        ear-open beep is the only listen cue; no ear-closed beep, chime or spoken ack follows
-        the capture (replies start fast with streamed speech, so they added nothing). Whisper
-        never overlaps outgoing speech: record() returns only after the ear-open beep has
-        played and the capture is done, and nothing is queued after it, so the pump sends
-        only silence while Whisper runs. A call that ends right after the capture still has
-        its words transcribed; guard_call then raises "call ended" with the transcript."""
+        """The ear-open beep, the capture, Whisper, then the rising two-note chime.
+
+        Owner decisions 2026-10-16: no ear-closed beep and no spoken ack; the rising chime
+        is back, played once Whisper has the transcript, so the owner hears "you're done, I
+        heard you" (it is distinct from the ear-open beep). Whisper never overlaps outgoing
+        audio: record() returns only after the ear-open beep has played and the capture is
+        done, nothing is queued before Whisper finishes, and the chime is queued only after.
+        A call that ends right after the capture still has its words transcribed: the chime's
+        failure on that dropped call is skipped (_after_capture) and guard_call then raises
+        "call ended" with the transcript."""
         audio = self.link.record(max_seconds, silence_seconds, start_timeout_seconds,
                                  cue_pcm(880.0, 0.5, 0.5, 0.2), TTS_RATE)
         if audio is tg.TIMEOUT:
@@ -346,6 +362,7 @@ class SpeakService:
         log.info("listen: %.1fs of audio transcribed in %.1fs: %r", len(audio) / STT_RATE, time.time() - t0, text)
         if not text:
             raise RuntimeError(f"speech was detected ({len(audio) / STT_RATE:.1f}s) but Whisper returned no text")
+        self._after_capture(lambda: self.link.play(chime_pcm(), TTS_RATE))   # captured
         return text
 
     # -- tool ops (lock held)

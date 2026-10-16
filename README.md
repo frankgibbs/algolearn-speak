@@ -76,7 +76,8 @@ uv sync   # the script uses only the client code
 From Claude Code: start a new session (or `/mcp`, reconnect), then type `call
 me`. Your phone rings on Telegram. When you answer, Claude speaks its
 greeting, you hear a beep, and you can answer out loud. When you stop talking
-your words are transcribed and handed to Claude, and the reply follows.
+you hear a rising two-note chime, which means your words were transcribed
+and handed to Claude; the reply follows.
 
 ## Tools
 
@@ -84,7 +85,7 @@ your words are transcribed and handed to Claude, and the reply follows.
 |---|---|
 | `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call to you (from a second Telegram account). `greeting` (at least 6 s when spoken) is played when you answer; then `call` listens and returns your words. No calls 22:00-07:00 unless overridden. |
 | `speak(text)` | Says `text` into the connected call. Returns the spoken duration. |
-| `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep, records your call audio until you have been quiet for `silence_seconds` (or spoke for `max_seconds`), then transcribes. Raises if nobody speaks within `start_timeout_seconds`. |
+| `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep, records your call audio until you have been quiet for `silence_seconds` (or spoke for `max_seconds`), transcribes, then plays a rising chime. Raises if nobody speaks within `start_timeout_seconds`. |
 | `converse(text, ...)` | `speak` then `listen`. Returns your words. |
 | `hang_up()` | Ends the call. |
 | `status()` | `{"busy", "current_tool", "waiting", "call"}`: what is running in the daemon now (and from which computer), how many requests wait behind it, and the call state. Never blocks. |
@@ -113,6 +114,7 @@ All cues are played into the call.
 | Cue | Meaning |
 |---|---|
 | Long high beep | The ear is open. Start talking. |
+| Rising two-note chime | Your words were transcribed and sent to Claude. |
 | Short lower beep | Nobody spoke before the timeout. `listen` raises a timeout error. |
 
 ## Configuration

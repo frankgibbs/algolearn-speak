@@ -33,9 +33,9 @@ owner and hold a spoken conversation.
 | Tool | What it does |
 |---|---|
 | `speak(text)` | The daemon synthesizes `text` with Kokoro-82M one segment (a sentence) at a time and plays each into the connected call as soon as it is made, synthesizing the next while earlier ones play (owner decision 2026-10-16). Returns once all of it has played, with the spoken duration. |
-| `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep (the ear is open; the only listen cue, owner decision 2026-10-16), then records the owner's call audio until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech), then Whisper large-v3-turbo transcribes. No beep, chime or spoken acknowledgement follows the capture. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. |
+| `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep (the ear is open), then records the owner's call audio until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech), then Whisper large-v3-turbo transcribes. Once text is in hand, a rising two-note chime tells the owner their words were captured (owner decision 2026-10-16). No ear-closed beep and no spoken acknowledgement. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. |
 | `converse(text, ...)` | `speak` then `listen` under one lock hold. Returns the user's words. |
-| `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is the whole opening, spoken the moment they answer: who is calling, why, and the context, ending with a question or invitation. It must be at least 6 s when spoken (measured on the synthesized audio); a shorter one raises `ValueError` BEFORE dialing (phone never rings; owner decision 2026-10-12) telling the model to add the context of why it is calling, or, on a fresh conversation with nothing to report, to open with something playful (a joke, something funny or flirty). Never padded. Once answered, `call` immediately does the `listen` (ear-open beep, VAD, Whisper) under the same lock hold and returns the owner's words; listen parameters and defaults match `converse`, and a listen timeout or a drop raises as in `listen` (the call stays connected on a timeout). Returns `answered\n<their words>\n(audio: telegram)`, `already connected` (greeting not spoken, no listen), `not answered (declined or no answer)`, `busy (the owner's Telegram reports a call in progress)` (Telegram discarded it as busy; the phone did not ring), `answered, then hung up during the greeting` (the owner picked up and ended it before the greeting finished; one call back right away is allowed, then the one-hour rule), `hung up` (another session's `hang_up` ended it during the greeting), `answered but audio failed to connect: <error>` (the owner picked up but media failed; the daemon container restarts itself) or `not called: quiet hours (...)`. Check order: quiet hours, already connected, then the greeting length, then the wait until 10 s have passed since the last call ended, then the dial. |
+| `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is the whole opening, spoken the moment they answer: who is calling, why, and the context, ending with a question or invitation. It must be at least 6 s when spoken (measured on the synthesized audio); a shorter one raises `ValueError` BEFORE dialing (phone never rings; owner decision 2026-10-12) telling the model to add the context of why it is calling, or, on a fresh conversation with nothing to report, to open with something playful (a joke, something funny or flirty). Never padded. Once answered, `call` immediately does the `listen` (ear-open beep, VAD, Whisper, rising chime) under the same lock hold and returns the owner's words; listen parameters and defaults match `converse`, and a listen timeout or a drop raises as in `listen` (the call stays connected on a timeout). Returns `answered\n<their words>\n(audio: telegram)`, `already connected` (greeting not spoken, no listen), `not answered (declined or no answer)`, `busy (the owner's Telegram reports a call in progress)` (Telegram discarded it as busy; the phone did not ring), `answered, then hung up during the greeting` (the owner picked up and ended it before the greeting finished; one call back right away is allowed, then the one-hour rule), `hung up` (another session's `hang_up` ended it during the greeting), `answered but audio failed to connect: <error>` (the owner picked up but media failed; the daemon container restarts itself) or `not called: quiet hours (...)`. Check order: quiet hours, already connected, then the greeting length, then the wait until 10 s have passed since the last call ended, then the dial. |
 | `hang_up()` | End that call (only when the owner asks). Always clears the session's call expectation. |
 | `status()` | `{busy, current_tool, waiting, call}`: what holds the daemon's lock (`"<tool> (<client ip>)"`; `transcribe` is an HTTP whisper API request), how many requests from every session wait behind it, and the call state (`none`/`ringing`/`connected`). When the daemon is not reached, `call` is `daemon unreachable: <error>` and the other three are null. Never raises, never waits on the lock. |
 | `call_debug(lines=50)` / `set_call_debug(enabled)` | The daemon's recent call events and log tail; DEBUG logging on or off at runtime. No lock. `{"daemon": "unreachable: <error>"}` when the daemon is not reached. |
@@ -76,7 +76,7 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
 - `speak_telegram.py`: `TelegramLink`, the call itself (Telethon + py-tgcalls +
   ntgcalls): dial, opener file, 10 ms raw-frame pump, Silero VAD on the
   owner's audio. Instantiated only by the daemon.
-- `speak_tone.py`: the beep cue PCM, the ear-open and no-speech timeout beeps (played into the call by the daemon).
+- `speak_tone.py`: the cue PCM: the ear-open beep, the rising "captured" chime and the no-speech timeout beep (played into the call by the daemon).
 - `Dockerfile`, `docker-compose.yml`, `.dockerignore`: the daemon image and
   service.
 - `scripts/drive_daemon.py`: drives the daemon over TCP with the client's own
@@ -188,16 +188,22 @@ the phone has signal.
   with a `speech_stream_done` summary (segments, first-audio latency,
   underruns, max pump lag, pump stalls). The call greeting is still
   synthesized whole (the 6 s opener file). Whisper still never overlaps
-  outgoing speech: `record` returns only after the ear-open beep has played
-  and the capture is done, and nothing is queued to play after it, so the
-  pump sends only silence while Whisper runs.
-- **Listen cues (owner decision 2026-10-16):** the ear-open beep is the only
-  listen cue. No ear-closed beep, chime or spoken ack follows the capture:
-  with streamed speech the reply itself starts right away. Sessions answer
-  first and hand real work to agents rather than going silent. (A
-  no-speech timeout still plays its short low beep before `TimeoutError`.)
-  The server instructions changed with this, so running sessions need `/mcp`
-  reconnect (or a new session) to get them.
+  outgoing audio: `record` returns only after the ear-open beep has played
+  and the capture is done, nothing is queued until Whisper has finished, and
+  only then is the chime queued, so the pump sends only silence while
+  Whisper runs.
+- **Listen cues (owner decisions 2026-10-16):** the ear-open beep opens the
+  ear; the rising two-note chime, played after Whisper has the transcript,
+  says "you're done, I heard you" (it is distinct from the ear-open beep).
+  The ear-closed low beep and the spoken "Processing." ack are removed
+  (`SPEAK_ACK_TEXT` is not a setting). If the call has just dropped when the
+  chime plays (the owner said their piece and hung up), the chime's failure
+  is skipped (`_after_capture`) so `guard_call` raises "call ended" with the
+  transcript; any chime failure on a connected call raises. Sessions answer
+  first and hand real work to agents rather than going silent. (A no-speech
+  timeout still plays its short low beep before `TimeoutError`.) The server
+  instructions changed with this, so running sessions need `/mcp` reconnect
+  (or a new session) to get them.
 - **Call required:** a call that ends mid-operation raises `Telegram call
   ended during ...`; the rule of engagement is to call back. The call is
   shared by every session on every computer (they take turns through the

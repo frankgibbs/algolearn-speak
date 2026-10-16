@@ -17,6 +17,8 @@ import speak_telegram as tg
 import speak_telegram_daemon as d
 
 RATE = eng.TTS_RATE
+CHIME = len(d.chime_pcm())
+EAR_OPEN = len(d.cue_pcm(880.0, 0.5, 0.5, 0.2))
 SETTINGS = {"SPEAK_QUIET_HOURS": "22:00-07:00", "quiet_window": (1320, 420),
             "tz": None}
 
@@ -52,6 +54,7 @@ class FakeLink:
         self.drop_during_stream = False
         self.record_result = np.zeros(eng.STT_RATE, dtype=np.float32)
         self.drop_after_record = False
+        self.fail_play = False
 
     def info(self) -> dict:
         return {"state": self._state, "generation": 1, "end_reason": None}
@@ -61,6 +64,10 @@ class FakeLink:
 
     def play(self, audio, rate) -> None:
         self.log.append(("play", len(audio)))
+        if self._state != tg.CONNECTED:
+            raise tg.CallEnded("the Telegram call ended during playback")
+        if self.fail_play:
+            raise RuntimeError("playback failed on a connected call")
 
     def play_stream(self, segments, rate) -> float:
         self.log.append(("stream_begin",))
@@ -122,7 +129,7 @@ class ServiceCase(unittest.TestCase):
         self.assertLess(names.index("stream_done"), names.index("record"))
         self.assertLess(names.index("record"), names.index("transcribe"))
         self.assertEqual(names.count("stream_done"), 1)   # the speech only: no spoken ack
-        self.assertEqual(self.log[-1], ("transcribe",))   # nothing plays after the capture
+        self.assertEqual(self.log[-2:], [("transcribe",), ("play", CHIME)])   # chime only after Whisper
 
     def test_greeting_is_one_whole_synthesis(self):
         self.link._state = tg.NONE
@@ -201,41 +208,49 @@ class TestEnginesStream(unittest.TestCase):
 
 
 class ListenCues(ServiceCase):
-    """Owner decision 2026-10-16: the ear-open beep is the only listen cue. No ear-closed
-    beep, rising chime or spoken "Processing." ack follows the capture, and Whisper runs
-    with nothing queued to play (the pump sends only silence)."""
+    """Owner decisions 2026-10-16: the ear-open beep opens the ear, and the rising two-note
+    chime plays once Whisper has the transcript (so Whisper never overlaps outgoing audio).
+    No ear-closed beep and no spoken "Processing." ack."""
 
-    def test_listen_plays_only_the_ear_open_cue_then_transcribes(self):
+    def test_chime_is_a_rising_two_note_chime_distinct_from_the_beeps(self):
+        self.assertNotEqual(CHIME, EAR_OPEN)
+        self.assertEqual(CHIME, int(RATE * 0.10) + int(RATE * 0.14))
+
+    def test_listen_plays_the_ear_open_cue_then_transcribes_then_chimes(self):
         result = self.svc.listen(self.sess, 120, 2.0, 45)
         self.assertEqual(result, {"text": "hi Angie"})
-        ear_open = len(d.cue_pcm(880.0, 0.5, 0.5, 0.2))
-        self.assertEqual(self.log, [("record", ear_open), ("transcribe",)])
+        self.assertEqual(self.log, [("record", EAR_OPEN), ("transcribe",), ("play", CHIME)])
 
-    def test_converse_plays_nothing_after_the_capture(self):
+    def test_converse_chimes_only_after_whisper(self):
         self.svc.converse(self.sess, "One. Two.", 120, 2.0, 45)
-        after = self.names()[self.names().index("record") + 1:]
-        self.assertEqual(after, ["transcribe"])
-        self.assertNotIn("play", self.names())
+        after = self.log[self.names().index("record") + 1:]
+        self.assertEqual(after, [("transcribe",), ("play", CHIME)])
+        self.assertEqual(self.names().count("stream_done"), 1)   # no spoken ack
 
-    def test_call_listen_plays_nothing_after_the_capture(self):
+    def test_call_listen_chimes_only_after_whisper(self):
         self.link._state = tg.NONE
         result = self.svc.call(self.sess, "Hi Frank, it's Angie. Calling about the build.", True, 120, 2.0, 45)
         self.assertEqual(result, {"outcome": tg.ANSWERED, "text": "hi Angie"})
-        self.assertEqual(self.names()[-2:], ["record", "transcribe"])
-        self.assertNotIn("play", self.names())
+        self.assertEqual(self.log[-3:], [("record", EAR_OPEN), ("transcribe",), ("play", CHIME)])
         self.assertNotIn("stream_begin", self.names())
 
     def test_a_drop_right_after_the_capture_still_reports_the_words(self):
         self.link.drop_after_record = True
         with self.assertRaisesRegex(d.CallEndedError, "transcript before the drop: 'hi Angie'"):
             self.svc.listen(self.sess, 120, 2.0, 45)
-        self.assertEqual(self.names(), ["record", "transcribe"])
+        self.assertEqual(self.log, [("record", EAR_OPEN), ("transcribe",), ("play", CHIME)])
+
+    def test_a_chime_failure_on_a_connected_call_raises(self):
+        self.link.fail_play = True
+        with self.assertRaisesRegex(RuntimeError, "playback failed on a connected call"):
+            self.svc.listen(self.sess, 120, 2.0, 45)
 
     def test_no_speech_plays_the_timeout_beep_and_raises(self):
         self.link.record_result = tg.TIMEOUT
         with self.assertRaises(d.NoSpeech):
             self.svc.listen(self.sess, 120, 2.0, 45)
         self.assertEqual(self.names(), ["record", "play"])
+        self.assertNotEqual(self.log[1], ("play", CHIME))
         self.assertNotIn("transcribe", self.names())
 
     def test_the_daemon_does_not_require_an_ack_setting(self):

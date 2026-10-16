@@ -119,7 +119,7 @@ they are committed, the line numbers move with them.
     Telegram call" (`speak_server.py:92-107`, `85-89`).
   - `_guard_call` re-checks the call state after the work and raises with
     any captured transcript (`speak_server.py:110-132`).
-  - `_after_capture` (removed 2026-10-16 with the ack) keeps the words when the owner hangs up right after
+  - `_after_capture` (removed and then restored 2026-10-16, for the rising chime) keeps the words when the owner hangs up right after
     speaking (`speak_server.py:446-457`).
 - **TTS.** `_speak_impl` collects every Kokoro sentence chunk and then plays
   them as one buffer through `telegram.play` (`speak_server.py:395-423`,
@@ -130,8 +130,8 @@ they are committed, the line numbers move with them.
   2. It plays the ear-closed cue.
   3. Only then does it transcribe with `mlx_whisper`, in this process.
   4. It plays the ack: a rising chime plus Kokoro saying "Processing."
-     (Steps 2 and 4 were removed by owner decision 2026-10-16: the ear-open
-     beep is now the only listen cue and `SPEAK_ACK_TEXT` is gone.)
+     (Owner decisions 2026-10-16: step 2 is removed, and step 4 keeps only
+     the rising chime; the spoken ack and `SPEAK_ACK_TEXT` are gone.)
      (`speak_server.py:370-374`).
 - **Call.** `_call_sync` takes the lock and runs these checks in order:
   quiet hours, daemon not running, already connected, then the greeting
@@ -377,7 +377,7 @@ on that text (section 2.1).
 | Tool (signature unchanged) | Client does | Daemon does |
 |---|---|---|
 | `speak(text)` | `speak` op; returns `spoke for Ns\n(audio: telegram)` | lock → call check → `_plain` → Kokoro (all chunks) → `link.play` → guard |
-| `listen(max, silence, start_timeout)` | `listen` op | lock → call check → ear-open cue + `link.record` → ear-closed cue → Whisper → ack (chime + "Processing.") → guard. Since owner decision 2026-10-16: ear-open cue + `link.record` → Whisper → guard (no ear-closed cue, chime or ack) |
+| `listen(max, silence, start_timeout)` | `listen` op | lock → call check → ear-open cue + `link.record` → ear-closed cue → Whisper → ack (chime + "Processing.") → guard. Since owner decisions 2026-10-16: ear-open cue + `link.record` → Whisper → rising chime → guard (no ear-closed cue, no spoken ack) |
 | `converse(text, ...)` | `converse` op | speak then listen, one lock hold |
 | `call(greeting, override_quiet_hours, ...)` | `call` op; sets its expectation from the reply | lock → quiet hours (daemon clock, `TZ=America/Los_Angeles`) → already connected → Kokoro greeting and the ≥ 6 s check → `link.call` → on `answered`, the listen above in the same hold. Outcomes and check order are as in `speak_server.py:502-541` |
 | `hang_up()` | `hang_up` op; always clears its expectation (`speak_server.py:552`) | lock → `link.hang_up()` |
@@ -417,7 +417,8 @@ GIL. The current sequence already keeps them apart:
   (`speak_server.py:435-438`). (Owner decision 2026-10-16 removed the
   ear-closed cue, the chime and the ack; Whisper now runs right after the
   capture, with nothing queued to play, so the pump still sends only
-  silence.)
+  silence. Owner decision later on 2026-10-16: the rising chime is back,
+  queued only after Whisper has the transcript.)
 
 So while models run, the pump sends only silence frames. The move keeps that
 order as a rule.
@@ -669,7 +670,7 @@ have meant starting a GPU container.
 - The wire adds about 10 ms.
 - At the low end of the estimates it is no worse than today.
 - The fixed parts are unchanged: the 6 s opener, the cues,
-  `silence_seconds` of end-of-speech wait, and the "Processing." ack (ack removed 2026-10-16: only the ear-open beep remains).
+  `silence_seconds` of end-of-speech wait, and the "Processing." ack (ack removed 2026-10-16; the rising chime still plays after Whisper).
 - After an audio-failure restart, the daemon is unreachable for the engine
   load time above. Today's launchd restart takes a few seconds.
 

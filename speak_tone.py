@@ -1,7 +1,8 @@
-"""Tone synthesis for algolearn-speak's cues (the ear-open beep and the
-no-speech timeout beep), played into the Telegram call by the speak daemon
-(speak_telegram_daemon.py). Owner decision 2026-10-16: the ear-closed beep,
-the rising "processing" chime and the spoken ack are gone.
+"""Tone synthesis for algolearn-speak's cues (the ear-open beep, the rising
+"captured" chime and the no-speech timeout beep), played into the Telegram
+call by the speak daemon (speak_telegram_daemon.py). Owner decisions
+2026-10-16: the ear-closed beep and the spoken ack are gone; the rising chime
+stays, played after Whisper has the transcript.
 
 No hardware access here: this module only does numpy math.
 """
@@ -28,3 +29,9 @@ def cue_pcm(freq_hz: float, seconds: float = 0.12, volume: float = 0.2, lead_sil
     if lead_silence:
         audio = np.concatenate([np.zeros(int(TONE_RATE * lead_silence), dtype=np.float32), audio])
     return audio
+
+
+def chime_pcm() -> np.ndarray:
+    """The rising two-note chime (660 Hz then 990 Hz): the owner's words were captured.
+    Distinct from the single-tone ear-open and timeout beeps."""
+    return np.concatenate([tone(660.0, 0.10), tone(990.0, 0.14)])

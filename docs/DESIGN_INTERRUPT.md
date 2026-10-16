@@ -113,7 +113,10 @@ synthesizes before playing (`speak_telegram_daemon.py:340-348`), and
 (`speak_telegram_daemon.py:356-358`). **Owner decision (2026-10-16):** the
 ear-closed cue, the chime and the "Processing." ack are removed; `_listen` now
 runs Whisper right after the capture with nothing queued to play, so the pump
-still sends only silence while it runs.
+still sends only silence while it runs. **Owner decision (2026-10-16), later
+that day:** the rising chime is back, played after Whisper has the transcript
+(the ear-closed cue and the ack stay removed), so Whisper still never
+overlaps outgoing audio.
 
 The harm the rule guards against is **quirk 2** of
 `docs/DESIGN_TELEGRAM_CALL.md`, observed on the Mac on 2026-10-09: "Gaps, or
@@ -430,7 +433,7 @@ The Release 2 loop gains one branch in each state:
 
 - **Pause then listens.** On `Interrupted`, `speak` and `converse` both call
   `_listen` with the listen parameters (ear-open beep, capture, Whisper; owner
-  decision 2026-10-16 removed the ear-closed cue, chime and ack). `converse` does **not** run a
+  decisions 2026-10-16 removed the ear-closed cue and the ack, and kept the rising chime after Whisper). `converse` does **not** run a
   second listen after that one. For `speak`, which has no listen parameters
   today, the client sends `listen`'s defaults (120 s, 2.0 s, 45 s). Those
   defaults move into `speak_protocol.py` as constants, so they are defined
