@@ -777,3 +777,17 @@ old service (`language="en"`, `beam_size=1`, `vad_filter=False`) but which
 joins segment texts with no separator (the old service joined them with a
 space, which doubled the space between segments); FastAPI's `/docs`,
 `/redoc` and `/openapi.json` pages are not served.
+
+Hardening, a deliberate departure from the old service, which had no limits
+(Decision, owner 2026-10-16):
+- A body larger than 15 minutes of 16 kHz mono int16 PCM (28,800,000 bytes)
+  is refused with `413` `{"detail": ...}` before it is read: Content-Length is
+  checked before the read, a chunked body's running total as each chunk size
+  arrives. The connection then closes.
+- A request that reaches the audio lock after its client has gone is skipped
+  without inference, as tool ops are; one that reaches it while the daemon is
+  restarting or stopping gets `503` `{"detail":"speak daemon is restarting"}`.
+- A 30 s socket timeout closes idle keep-alive and slowloris connections
+  (above httpx's 5 s keep-alive expiry, so the client closes an idle
+  connection first); a body that stalls is logged and answered `408`. TCP
+  keepalive is on, as on 8765.

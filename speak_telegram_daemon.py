@@ -79,6 +79,12 @@ REQUIRED_SPEAK_ENV = ("SPEAK_KOKORO_MODEL", "SPEAK_VOICE", "SPEAK_SPEED", "SPEAK
 BIND_HOST = "0.0.0.0"   # open to the LAN by design (owner decision 4); no auth, no TLS
 WHISPER_HTTP_PORT = 9000   # the retired whisper-service's port, so its clients need no change
 TRANSCRIBE_TOOL = "transcribe"   # how status names an HTTP transcription holding the audio lock
+MAX_TRANSCRIBE_SECONDS = 15 * 60   # owner decision 2026-10-16: the longest audio port 9000 accepts
+MAX_BODY_BYTES = MAX_TRANSCRIBE_SECONDS * STT_RATE * np.dtype(np.int16).itemsize   # 28,800,000: mono int16 PCM
+# Port 9000's per-recv socket timeout. A LAN upload's gaps are milliseconds, and the
+# known client (httpx) drops an idle pooled connection after 5 s, so it always closes
+# first; an idle keep-alive or slowloris connection is closed after this.
+HTTP_TIMEOUT_SECONDS = 30
 
 
 # ------------------------------------------------------------------ errors
@@ -572,6 +578,19 @@ class _BadRequest(ValueError):
     """The request's framing could not be read (bad Content-Length or chunk size)."""
 
 
+class _TooLarge(ValueError):
+    """The request body is larger than MAX_BODY_BYTES; raised before the excess is read."""
+
+
+class ClientLeft(Exception):
+    """transcribe_pcm: the HTTP client closed its connection while the request was queued
+    for the audio lock; inference was skipped."""
+
+
+class DaemonClosing(RuntimeError):
+    """transcribe_pcm: a restart or stop is under way; inference was skipped."""
+
+
 class _WhisperHandler(BaseHTTPRequestHandler):
     """The retired whisper-service's API (scratch/whisper-service/server.py, FastAPI under
     uvicorn), reproduced: the same routes, status codes, bodies and content types, including
@@ -579,6 +598,11 @@ class _WhisperHandler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"   # keep-alive, as uvicorn; every reply carries Content-Length
     ROUTES = {"/": "POST", "/health": "GET"}
+    timeout = HTTP_TIMEOUT_SECONDS   # StreamRequestHandler.setup applies it as the socket timeout
+
+    def setup(self) -> None:
+        super().setup()
+        proto.enable_keepalive(self.request)   # a dead peer is detected while its request waits for the lock
 
     def do_GET(self) -> None:
         self._route()
@@ -588,6 +612,9 @@ class _WhisperHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args) -> None:   # access log through logging (stderr), not raw stderr
         log.info("http %s: %s", self.client_address[0], fmt % args)
 
+    def log_error(self, fmt: str, *args) -> None:   # e.g. "Request timed out" on an idle connection
+        log.warning("http %s: %s", self.client_address[0], fmt % args)
+
     def _route(self) -> None:
         try:
             body = self._read_body()   # always read, so a kept-alive connection stays in step
@@ -595,6 +622,16 @@ class _WhisperHandler(BaseHTTPRequestHandler):
             log.warning("http %s: %s", self.client_address[0], e)
             self.close_connection = True
             self._reply(400, b"Invalid HTTP request received.", "text/plain; charset=utf-8")
+            return
+        except _TooLarge as e:   # the rest of the body is never read, so the connection cannot stay in step
+            log.warning("http %s: %s", self.client_address[0], e)
+            self.close_connection = True
+            self._reply(413, _json_bytes({"detail": str(e)}), "application/json", {"Connection": "close"})
+            return
+        except TimeoutError as e:   # the body stalled for HTTP_TIMEOUT_SECONDS
+            log.warning("http %s: body read timed out after %ss: %s", self.client_address[0], self.timeout, e)
+            self.close_connection = True
+            self._reply(408, _json_bytes({"detail": "Request Timeout"}), "application/json", {"Connection": "close"})
             return
         path = urlsplit(self.path).path
         method = self.command
@@ -616,9 +653,17 @@ class _WhisperHandler(BaseHTTPRequestHandler):
                 return
         self._reply(404, _json_bytes({"detail": "Not Found"}), "application/json")
 
+    @staticmethod
+    def _too_large(size: int) -> _TooLarge:
+        return _TooLarge(f"request body of {size} bytes exceeds the limit of {MAX_BODY_BYTES} bytes "
+                         f"({MAX_TRANSCRIBE_SECONDS // 60} minutes of 16 kHz mono int16 PCM)")
+
     def _read_body(self) -> bytes:
+        """The whole body, never more than MAX_BODY_BYTES: a larger declared size raises
+        _TooLarge before the body (or the chunk that passes the limit) is read."""
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
             chunks = []
+            total = 0
             while True:
                 line = self.rfile.readline(65537)
                 try:
@@ -629,6 +674,9 @@ class _WhisperHandler(BaseHTTPRequestHandler):
                     while self.rfile.readline(65537) not in (b"\r\n", b"\n", b""):
                         pass   # trailers
                     return b"".join(chunks)
+                total += size
+                if total > MAX_BODY_BYTES:
+                    raise self._too_large(total)
                 chunks.append(self.rfile.read(size))
                 self.rfile.readline()   # the CRLF after the chunk
         length = self.headers.get("Content-Length")
@@ -636,6 +684,8 @@ class _WhisperHandler(BaseHTTPRequestHandler):
             return b""
         if not length.strip().isdigit():
             raise _BadRequest(f"bad Content-Length {length!r}")
+        if int(length) > MAX_BODY_BYTES:
+            raise self._too_large(int(length))
         return self.rfile.read(int(length))
 
     def _health(self) -> None:
@@ -645,8 +695,18 @@ class _WhisperHandler(BaseHTTPRequestHandler):
 
     def _transcribe(self, body: bytes) -> None:
         daemon: SpeakDaemon = self.server.daemon  # type: ignore[attr-defined]
+        peer = self.client_address[0]
         try:
-            text = daemon.transcribe_pcm(body, self.client_address[0])
+            text = daemon.transcribe_pcm(body, peer, self.request)
+        except ClientLeft:
+            log.warning("http transcribe from %s: the client left while queued; skipped", peer)
+            self.close_connection = True   # nobody to reply to
+            return
+        except DaemonClosing as e:
+            log.warning("http transcribe from %s: refused, %s", peer, e)
+            self.close_connection = True
+            self._reply(503, _json_bytes({"detail": str(e)}), "application/json", {"Connection": "close"})
+            return
         except Exception:   # the old service's unhandled exception: uvicorn's plain 500
             log.exception("http %s: transcription failed", self.client_address[0])
             self._reply(500, b"Internal Server Error", "text/plain; charset=utf-8")
@@ -710,14 +770,21 @@ class SpeakDaemon:
         log.info("speak daemon: listening on %s:%d (tools) and http %s:%d (whisper API)",
                  BIND_HOST, server.server_address[1], BIND_HOST, http.server_address[1])
 
-    def transcribe_pcm(self, body: bytes, peer: str) -> str:
+    def transcribe_pcm(self, body: bytes, peer: str, sock: socket.socket) -> str:
         """POST / on port 9000: raw 16 kHz mono int16 PCM -> text, converted as the retired
         whisper-service did (an odd byte count raises, which the handler sends as a 500).
         Inference waits in the audio lock, FIFO with the tool ops, so it never overlaps call
-        audio. No "no text" error here, unlike listen: the old API returned an empty text."""
+        audio. No "no text" error here, unlike listen: the old API returned an empty text.
+        Once the lock is held, as for the tool ops: a client that left while queued (`sock`
+        at EOF; httpx does not pipeline, so nothing else is readable) raises ClientLeft, and
+        a restart or stop under way raises DaemonClosing; neither runs inference."""
         audio = np.frombuffer(body, dtype=np.int16).astype(np.float32) / 32768.0
         self.lock.acquire(TRANSCRIBE_TOOL, peer)
         try:
+            if _peer_left(sock):
+                raise ClientLeft(f"http transcribe from {peer}: the client left while queued")
+            if self.closing.is_set():
+                raise DaemonClosing("speak daemon is restarting")
             t0 = time.time()
             text = self.service.engines.transcribe(audio)
         finally:

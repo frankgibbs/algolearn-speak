@@ -14,6 +14,7 @@ import socket
 import threading
 import time
 import unittest
+from unittest import mock
 
 import httpx
 import numpy as np
@@ -222,6 +223,127 @@ class TestAudioLock(HttpCase):
         self.engines.gate.set()
         t.join(10)
         self.assertEqual(self.daemon.lock.snapshot(), (False, None, 0))
+
+
+def _recv_all(s: socket.socket) -> bytes:
+    """Everything the server sends until it closes the connection."""
+    data = b""
+    while chunk := s.recv(65536):
+        data += chunk
+    return data
+
+
+class TestHardening(HttpCase):
+    def raw(self, request: bytes) -> bytes:
+        with socket.create_connection(("127.0.0.1", self.http_port), timeout=10) as s:
+            s.sendall(request)
+            return _recv_all(s)
+
+    def assert_413(self, data: bytes) -> None:
+        self.assertTrue(data.startswith(b"HTTP/1.1 413"), data)
+        self.assertIn(b"Connection: close", data)
+        head, _, body = data.partition(b"\r\n\r\n")
+        self.assertIn(b"exceeds the limit of", json.loads(body)["detail"].encode())
+        self.assertEqual(self.engines.calls, [])
+
+    def test_limit_is_15_minutes_of_16khz_mono_int16(self):
+        self.assertEqual(d.MAX_BODY_BYTES, 15 * 60 * 16000 * 2)
+        self.assertEqual(d.MAX_BODY_BYTES, 28_800_000)
+
+    def test_content_length_over_the_limit_is_413_before_the_body_is_read(self):
+        with self.assertLogs("speak.daemon", "WARNING"):
+            data = self.raw(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n" % (d.MAX_BODY_BYTES + 1))
+        self.assert_413(data)   # answered and closed with no body bytes sent
+
+    def test_content_length_at_the_limit_is_accepted(self):
+        with mock.patch.object(d, "MAX_BODY_BYTES", 100):
+            resp, _ = self.request("POST", "/", b"\x00" * 100)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(len(self.engines.calls[0]), 50)
+
+    def test_chunked_body_over_the_limit_is_413_once_the_running_total_passes_it(self):
+        with mock.patch.object(d, "MAX_BODY_BYTES", 100), self.assertLogs("speak.daemon", "WARNING"):
+            # 60 + 60 > 100: refused at the second chunk's size line, whose bytes are never sent
+            data = self.raw(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                            b"3c\r\n" + b"\x00" * 60 + b"\r\n3c\r\n")
+        self.assert_413(data)
+
+    def test_one_huge_chunk_is_413_before_it_is_read(self):
+        data = self.raw(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+                        + b"%x\r\n" % (d.MAX_BODY_BYTES + 1))
+        self.assert_413(data)
+
+    def test_client_that_left_while_queued_is_skipped(self):
+        self.daemon.lock.acquire(proto.OP_CONVERSE, "10.0.0.5")
+        s = socket.create_connection(("127.0.0.1", self.http_port), timeout=10)
+        s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n\x00\x00\x00\x00")
+        deadline = time.time() + 5
+        while self.daemon.lock.snapshot()[2] == 0 and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.daemon.lock.snapshot()[2], 1)   # queued behind the tool op
+        s.close()   # the client gives up
+        time.sleep(0.1)   # let the FIN arrive
+        with self.assertLogs("speak.daemon", "WARNING") as logs:
+            self.daemon.lock.release()
+            deadline = time.time() + 5
+            while self.daemon.lock.snapshot() != (False, None, 0) and time.time() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.1)   # the handler logs after releasing the lock
+        self.assertEqual(self.daemon.lock.snapshot(), (False, None, 0))
+        self.assertEqual(self.engines.calls, [])
+        self.assertTrue(any("left while queued; skipped" in line for line in logs.output), logs.output)
+
+    def test_closing_daemon_is_503_without_inference(self):
+        self.daemon.closing.set()
+        resp, body = self.request("POST", "/", b"\x00\x00")
+        self.assertEqual(resp.status, 503)
+        self.assertEqual(resp.getheader("Content-Type"), "application/json")
+        self.assertEqual(body, b'{"detail":"speak daemon is restarting"}')
+        self.assertEqual(self.engines.calls, [])
+        self.assertEqual(self.daemon.lock.snapshot(), (False, None, 0))
+
+    def test_keepalive_is_enabled_on_the_connection(self):
+        with mock.patch.object(d.proto, "enable_keepalive", wraps=proto.enable_keepalive) as ka:
+            resp, _ = self.request("GET", "/health")
+        self.assertEqual(resp.status, 200)
+        ka.assert_called_once()
+
+    def test_timeout_is_comfortably_above_upload_gaps(self):
+        self.assertEqual(d._WhisperHandler.timeout, d.HTTP_TIMEOUT_SECONDS)
+        self.assertGreater(d.HTTP_TIMEOUT_SECONDS, 5)   # httpx's keep-alive expiry: the client closes first
+
+
+class TestTimeouts(HttpCase):
+    def setUp(self):
+        patcher = mock.patch.object(d._WhisperHandler, "timeout", 0.3)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
+
+    def test_idle_connection_is_closed(self):
+        with self.assertLogs("speak.daemon", "WARNING") as logs:
+            with socket.create_connection(("127.0.0.1", self.http_port), timeout=10) as s:
+                t0 = time.time()
+                self.assertEqual(s.recv(1), b"")   # EOF: the server closed the idle connection
+                self.assertLess(time.time() - t0, 5)
+            time.sleep(0.1)
+        self.assertTrue(any("timed out" in line for line in logs.output), logs.output)
+
+    def test_idle_keep_alive_connection_is_closed_after_a_request(self):
+        with socket.create_connection(("127.0.0.1", self.http_port), timeout=10) as s:
+            s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            data = _recv_all(s)   # the reply, then EOF once the connection sits idle
+        self.assertTrue(data.startswith(b"HTTP/1.1 200"), data)
+
+    def test_stalled_body_is_logged_408_and_closed(self):
+        with self.assertLogs("speak.daemon", "WARNING") as logs:
+            with socket.create_connection(("127.0.0.1", self.http_port), timeout=10) as s:
+                s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n\x00\x00")
+                data = _recv_all(s)
+        self.assertTrue(data.startswith(b"HTTP/1.1 408"), data)
+        self.assertTrue(data.endswith(b'{"detail":"Request Timeout"}'), data)
+        self.assertTrue(any("body read timed out" in line for line in logs.output), logs.output)
+        self.assertEqual(self.engines.calls, [])
 
 
 class TestStartup(unittest.TestCase):

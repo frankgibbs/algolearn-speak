@@ -135,6 +135,16 @@ stdlib `http.server`). Known client: `scratch/voice-claude/livekit_agent.py`
   (status shows `transcribe (<ip>)`), so inference never overlaps call audio;
   a request can wait behind a whole call or converse turn. The PCM is read
   before the request queues.
+- Hardening (departures from the old service): a body over `MAX_BODY_BYTES`
+  (15 minutes of 16 kHz mono int16 PCM, 28,800,000 bytes; owner decision
+  2026-10-16) is `413` `{"detail": ...}` and the connection closes, checked
+  on Content-Length before the read and on the running total of a chunked
+  body. Once a request holds the lock, a client that has left is skipped (no
+  inference, logged) and a restart or stop under way is `503`
+  `{"detail":"speak daemon is restarting"}`. A `30 s` socket timeout
+  (`HTTP_TIMEOUT_SECONDS`, above httpx's 5 s keep-alive expiry) closes idle
+  and slow connections; a body that stalls is logged and answered `408`.
+  TCP keepalive as on 8765.
 - Port 9000 binds right after 8765, both only after the engines and Telegram
   are up; a failed bind on either stops the daemon. Open to the LAN like 8765:
   no authentication, no TLS.
