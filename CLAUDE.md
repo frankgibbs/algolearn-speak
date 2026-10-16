@@ -155,6 +155,14 @@ the phone has signal.
   **Debugging is reactive (owner decision 2026-10-12):** `set_call_debug(True)`
   also turns on the audio-level events (`opener_written`, `audio_in`,
   `audio_out`, `audio_opener_out`); with debug off they are not recorded.
+- **Native crashes:** the daemon enables Python's `faulthandler` (all threads) first
+  thing in `main()`, so a SIGSEGV/SIGABRT in ntgcalls, torch or ctranslate2 writes
+  every Python thread's stack to `docker logs speak-telegram` before the process
+  dies by the signal (exit 139 for SIGSEGV; compose restarts it). The kernel log on
+  patrick (`journalctl -k | grep segfault`) names the library, the offset and the
+  native thread. Verified 2026-10-16 09:17: a SIGSEGV on ntgcalls' `ntg-work`
+  thread, a null read in `IncomingAudioChannel`'s constructor (ntgcalls 3.0.2,
+  offset 0x39d642), about 9 s into the 16 s greeting.
 - **Quiet hours:** `call` refuses 22:00-07:00 (`SPEAK_QUIET_HOURS`, judged on
   the daemon's clock, `TZ=America/Los_Angeles`) unless
   `override_quiet_hours=True`, used only when the owner said they are up.

@@ -20,6 +20,12 @@ A call that was answered but whose media connection failed makes the daemon
 exit 1 right after the caller has its reply, so compose's restart policy
 restarts it with fresh ntgcalls state.
 
+A native crash (SIGSEGV, SIGABRT, ...) in ntgcalls, torch or ctranslate2 dumps every
+Python thread's stack to stderr before the process dies with the signal (exit
+139 for SIGSEGV), so `docker logs speak-telegram` shows what each thread was
+doing: the telegram-loop thread (pump, record, play) or a request thread inside
+Engines.synthesize/transcribe or the Silero VAD.
+
 No fallbacks: every setting is required, a model or login failure stops the
 daemon before the port is bound, and every failure raises.
 """
@@ -27,6 +33,7 @@ daemon before the port is bound, and every failure raises.
 from __future__ import annotations
 
 import datetime
+import faulthandler
 import logging
 import math
 import os
@@ -647,7 +654,16 @@ def build_link(env: dict[str, str]) -> tg.TelegramLink:
     )
 
 
+def enable_crash_dumps() -> None:
+    """On a fatal signal, write every Python thread's stack to stderr, then die by that
+    signal as before (compose still sees exit 139 for SIGSEGV and restarts the daemon).
+    The SIGSEGV of 2026-10-16 09:17 left no trace in the log; the kernel log named only
+    ntgcalls and its native thread."""
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+
+
 def main() -> None:
+    enable_crash_dumps()   # first: a crash while the engines load is dumped too
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format=LOG_FORMAT)
     code = 0
     try:
