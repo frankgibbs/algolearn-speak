@@ -8,8 +8,10 @@ httpx and Content-Type application/octet-stream; test_livekit_client_call does e
 
 from __future__ import annotations
 
+import errno
 import http.client
 import json
+import os
 import socket
 import threading
 import time
@@ -273,6 +275,18 @@ class TestHardening(HttpCase):
                         + b"%x\r\n" % (d.MAX_BODY_BYTES + 1))
         self.assert_413(data)
 
+    def test_negative_chunk_size_is_400_not_a_read_to_eof(self):
+        # int("-1", 16) parses; read(-1) would read to EOF, past the size limit
+        with mock.patch.object(d, "MAX_BODY_BYTES", 100), self.assertLogs("speak.daemon", "WARNING") as logs:
+            with socket.create_connection(("127.0.0.1", self.http_port), timeout=10) as s:
+                s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n-1\r\n"
+                          + b"\x00" * 200)   # the connection stays open: a read to EOF would hang here
+                data = _recv_all(s)
+        self.assertTrue(data.startswith(b"HTTP/1.1 400"), data)
+        self.assertTrue(data.endswith(b"Invalid HTTP request received."), data)
+        self.assertTrue(any("bad chunk size line b'-1\\r\\n'" in line for line in logs.output), logs.output)
+        self.assertEqual(self.engines.calls, [])
+
     def test_client_that_left_while_queued_is_skipped(self):
         self.daemon.lock.acquire(proto.OP_CONVERSE, "10.0.0.5")
         s = socket.create_connection(("127.0.0.1", self.http_port), timeout=10)
@@ -344,6 +358,51 @@ class TestTimeouts(HttpCase):
         self.assertTrue(data.endswith(b'{"detail":"Request Timeout"}'), data)
         self.assertTrue(any("body read timed out" in line for line in logs.output), logs.output)
         self.assertEqual(self.engines.calls, [])
+
+
+    def test_request_queued_longer_than_the_timeout_still_gets_its_text(self):
+        # the socket timeout covers reads from the client, not the wait for the audio lock
+        self.daemon.lock.acquire(proto.OP_CONVERSE, "10.0.0.5")
+        result: dict = {}
+
+        def post():
+            result["resp"] = httpx.post(self.url + "/", content=b"\x00\x00" * 16, timeout=30)
+
+        t = threading.Thread(target=post)
+        t.start()
+        time.sleep(2.0)   # queued for about 7x the handler timeout
+        self.assertEqual(self.daemon.lock.snapshot(), (True, "converse (10.0.0.5)", 1))
+        self.daemon.lock.release()
+        t.join(10)
+        self.assertEqual(result["resp"].status_code, 200)
+        self.assertEqual(result["resp"].json(), {"text": "hello there"})
+        self.assertEqual(len(self.engines.calls), 1)
+        self.assertEqual(self.daemon.lock.snapshot(), (False, None, 0))
+
+
+class TestPeerLeft(unittest.TestCase):
+    """_peer_left is shared by the 8765 tool handler and the port-9000 handler."""
+
+    def setUp(self):
+        self.ours, self.theirs = socket.socketpair()
+        self.addCleanup(self.ours.close)
+        self.addCleanup(self.theirs.close)
+
+    def test_quiet_peer_is_still_there(self):
+        self.assertFalse(d._peer_left(self.ours))
+
+    def test_closed_peer_is_gone(self):
+        self.theirs.close()
+        self.assertTrue(d._peer_left(self.ours))
+
+    def test_a_socket_error_on_the_peek_means_the_peer_is_gone(self):
+        # a dead peer found by TCP keepalive: select reports readable, recv raises ETIMEDOUT or EHOSTUNREACH
+        self.theirs.sendall(b"x")   # readable, so _peer_left peeks
+        for err in (errno.ETIMEDOUT, errno.EHOSTUNREACH):
+            with self.subTest(errno=errno.errorcode[err]):
+                sock = mock.Mock(fileno=self.ours.fileno, recv=mock.Mock(side_effect=OSError(err, os.strerror(err))))
+                self.assertTrue(d._peer_left(sock))
+                sock.recv.assert_called_once_with(1, socket.MSG_PEEK)
 
 
 class TestStartup(unittest.TestCase):

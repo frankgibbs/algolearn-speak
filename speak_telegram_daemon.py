@@ -552,13 +552,14 @@ class _Handler(socketserver.BaseRequestHandler):
 
 def _peer_left(sock: socket.socket) -> bool:
     """True when the client closed its end while its request was queued. A client sends one
-    request and then only reads, so a readable socket here means EOF (or a reset)."""
+    request and then only reads, so a readable socket here means EOF, a reset, or a socket
+    error such as keepalive's ETIMEDOUT or EHOSTUNREACH: in every case the peer is gone."""
     readable, _, _ = select.select([sock], [], [], 0)
     if not readable:
         return False
     try:
         return sock.recv(1, socket.MSG_PEEK) == b""
-    except (ConnectionResetError, BrokenPipeError):
+    except OSError:
         return True
 
 
@@ -670,6 +671,8 @@ class _WhisperHandler(BaseHTTPRequestHandler):
                     size = int(line.split(b";", 1)[0].strip(), 16)
                 except ValueError:
                     raise _BadRequest(f"bad chunk size line {line[:40]!r}") from None
+                if size < 0:   # int() accepts "-1", and read(-1) would read to EOF past the limit
+                    raise _BadRequest(f"bad chunk size line {line[:40]!r}")
                 if size == 0:
                     while self.rfile.readline(65537) not in (b"\r\n", b"\n", b""):
                         pass   # trailers
