@@ -57,6 +57,7 @@ class FakeCalls:
         self.ring_forever = False
         self.fail_record: BaseException | None = None
         self.fail_send: BaseException | None = None
+        self.stall_send = 0.0   # > 0: every send_frame takes this long (the pump falls behind)
         self.accept_before_ring_error = False   # emit the callee's ACCEPTED update before play() raises
         self.mtproto_handler = None
         self.handler = None
@@ -97,6 +98,8 @@ class FakeCalls:
         assert device == Device.MICROPHONE and len(data) == tg.FRAME_BYTES
         if self.fail_send:
             raise self.fail_send
+        if self.stall_send:
+            await asyncio.sleep(self.stall_send)
         self.frames.append(data)
 
     async def leave_call(self, chat_id):
@@ -368,6 +371,7 @@ class TestVadPreload(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "silero load failed"):
             link.start()
         self.assertFalse(link._thread.is_alive())
+        self.assertTrue(link._loop.is_closed())
 
     def test_factory_refuses_when_model_not_preloaded(self):
         with mock.patch.object(tg, "_silero_model", None):
@@ -383,7 +387,22 @@ class TestRevokedSession(unittest.TestCase):
                                vad_preload=lambda: None)
         with self.assertRaisesRegex(RuntimeError, "not authorized"):
             link.start()
-        link._loop.call_soon_threadsafe(link._loop.stop)
+        self.assertFalse(link._thread.is_alive())   # a failed start stops and closes its loop
+        self.assertTrue(link._loop.is_closed())
+
+
+class TestStop(unittest.TestCase):
+    def test_stop_hangs_up_and_closes_the_loop(self):
+        made = []
+        link = tg.TelegramLink("owner", FakeTelethon, lambda c: made.append(FakeCalls(c)) or made[-1],
+                               vad_factory=StubVAD, vad_preload=lambda: None)
+        with mock.patch.multiple(tg, OPENER_MIN_SECONDS=0.004, OPENER_TAIL_SECONDS=0.02, REDIAL_SETTLE_SECONDS=0.0):
+            link.start()
+            link.call(np.zeros(100, dtype=np.float32), 24000)
+            link.stop()
+        self.assertEqual(made[0].left, 1)
+        self.assertFalse(link._thread.is_alive())
+        self.assertTrue(link._loop.is_closed())
 
 
 class TestRecord(LinkCase):

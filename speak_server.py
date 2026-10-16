@@ -10,6 +10,8 @@ Telegram call placed by that daemon; there is no local microphone or speaker.
   listen(...)     -> the daemon captures the owner's reply (Silero VAD) and
                      transcribes it with Whisper; returns the text
   converse(text)  -> speak, then listen under one lock hold: one call per turn
+                     (speak and converse can be held by the owner: "hold on" /
+                     "continue", docs/DESIGN_INTERRUPT.md)
   call(greeting)  -> Telegram voice call to the owner; speak/listen/converse need it
                      connected (docs/DESIGN_TELEGRAM_CALL.md)
   hang_up()       -> end that call
@@ -29,6 +31,7 @@ drop raises "call ended ... call back" in every session that used the call.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import socket
@@ -61,6 +64,42 @@ class DaemonUnreachable(RuntimeError):
     """The TCP connect to the daemon failed: it is not running, not ready yet, or not reachable."""
 
 
+class _Abort:
+    """Lets a cancelled tool call close its request's socket from the event loop, so the
+    daemon sees the client leave (a held speak/converse then ends and frees the lock).
+    The worker thread attaches the socket for the life of the request."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sock: socket.socket | None = None
+        self.cancelled = False
+
+    def attach(self, sock: socket.socket) -> None:
+        with self._lock:
+            if self.cancelled:
+                raise RuntimeError("the tool call was cancelled before its request was sent")
+            self._sock = sock
+
+    def detach(self) -> None:
+        with self._lock:
+            self._sock = None
+
+    def cancel(self) -> None:
+        with self._lock:
+            self.cancelled = True
+            if self._sock is None:
+                return
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError as e:   # already closed by the peer: the cancellation itself stands
+                log.warning("closing the cancelled request's socket failed: %s", e)
+
+
+# The running tool call's _Abort; None when a _sync function is driven directly
+# (scripts/drive_daemon.py), where there is no cancellation to forward.
+_abort_var: contextvars.ContextVar[_Abort | None] = contextvars.ContextVar("speak_abort", default=None)
+
+
 def _address() -> str:
     if _daemon is None:
         raise RuntimeError("SPEAK_DAEMON was not read; main() sets it at startup")
@@ -90,10 +129,13 @@ def _request(op: str, fields: dict, budget: float) -> dict:
         sock = socket.create_connection(_daemon, timeout=CONNECT_TIMEOUT_SECONDS)
     except OSError as e:
         raise DaemonUnreachable(f"speak daemon at {addr} is not reachable: {e}") from e
+    abort = _abort_var.get()
     with sock:
+        if abort is not None:
+            abort.attach(sock)
         try:
             proto.enable_keepalive(sock)
-            proto.send_msg(sock, {"op": op, **fields})
+            proto.send_msg(sock, {"op": op, proto.FIELD_PROTOCOL: proto.PROTOCOL_VERSION, **fields})
             if op in proto.LOCKED_OPS:
                 sock.settimeout(None)
                 reply, _ = proto.recv_msg(sock)
@@ -108,6 +150,9 @@ def _request(op: str, fields: dict, budget: float) -> dict:
             raise RuntimeError(f"speak daemon at {addr} did not reply to {op!r} within {budget:.0f}s") from None
         except (OSError, ValueError) as e:
             raise RuntimeError(f"speak daemon at {addr} failed during {op!r}: {type(e).__name__}: {e}") from e
+        finally:
+            if abort is not None:
+                abort.detach()
     _apply_expect(reply)
     if not reply.get("ok"):
         message = reply.get("error") or f"speak daemon reported an error without a message: {reply!r}"
@@ -123,7 +168,9 @@ def _request(op: str, fields: dict, budget: float) -> dict:
 # ---------------------------------------------------------------- budgets after "started"
 
 def _speak_budget(text: str) -> float:
-    return 60.0 + len(text) / 5
+    """Synthesis and playback, plus the longest the owner may hold Angie (the holds of one
+    op add up to at most HOLD_MAX_SECONDS; then the daemon ends the call and replies)."""
+    return 60.0 + len(text) / 5 + proto.HOLD_MAX_SECONDS
 
 
 def _listen_budget(max_seconds: float, start_timeout_seconds: float) -> float:
@@ -137,10 +184,38 @@ def _listen_fields(max_seconds: float, silence_seconds: float, start_timeout_sec
 
 # ---------------------------------------------------------------- sync bodies (worker thread)
 
-def _speak_sync(text: str) -> float:
+def _held_prefix(reply: dict) -> str:
+    """"[held 42s, then resumed]\n" when the owner held Angie and she finished; "" otherwise."""
+    held = reply[proto.REPLY_HELD_SECONDS]
+    return f"[held {held:.0f}s, then resumed]\n" if held > 0 else ""
+
+
+def _expired_result(reply: dict) -> str:
+    """The result of a speak/converse whose hold expired (the daemon ended the call)."""
+    i = reply[proto.REPLY_INTERRUPTION]
+    if i["command"] != proto.INTERRUPTION_HOLD_EXPIRED:
+        raise RuntimeError(f"speak daemon sent an unknown interruption: {i!r}")
+    return (f"[hold expired after {reply[proto.REPLY_HELD_SECONDS]:.0f}s; the call was ended]\n"
+            f"cut off in sentence {i['cut_index']} of {i['sentence_count']}: \"{i['cut_sentence']}\"\n"
+            f"not spoken (from the cut sentence): \"{i['unspoken']}\"{AUDIO_NOTE}")
+
+
+def _speak_result(reply: dict) -> str:
+    if proto.REPLY_INTERRUPTION in reply:
+        return _expired_result(reply)
+    return f"{_held_prefix(reply)}spoke for {reply['seconds']:.1f}s{AUDIO_NOTE}"
+
+
+def _converse_result(reply: dict) -> str:
+    if proto.REPLY_INTERRUPTION in reply:
+        return _expired_result(reply)
+    return f"{_held_prefix(reply)}{reply['text']}{AUDIO_NOTE}"
+
+
+def _speak_sync(text: str) -> str:
     reply = _request(proto.OP_SPEAK, {"text": text, "expect_generation": _current_generation()},
                      _speak_budget(text))
-    return reply["seconds"]
+    return _speak_result(reply)
 
 
 def _listen_sync(max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
@@ -156,7 +231,7 @@ def _converse_sync(text: str, max_seconds: float, silence_seconds: float, start_
                      {"text": text, **_listen_fields(max_seconds, silence_seconds, start_timeout_seconds),
                       "expect_generation": _current_generation()},
                      _speak_budget(text) + _listen_budget(max_seconds, start_timeout_seconds))
-    return reply["text"]
+    return _converse_result(reply)
 
 
 def _call_sync(greeting: str, override_quiet_hours: bool, max_seconds: float, silence_seconds: float,
@@ -212,6 +287,12 @@ def _status_sync() -> dict:
     except (RuntimeError, ValueError) as e:   # reached but failed: also reported in the result, and logged
         log.exception("status request failed")
         return {"busy": None, "current_tool": None, "waiting": None, "call": f"error: {e}"}
+    daemon_protocol = reply.get(proto.FIELD_PROTOCOL)   # absent: a daemon older than versioning
+    if daemon_protocol != proto.PROTOCOL_VERSION:
+        return {"busy": None, "current_tool": None, "waiting": None,
+                "call": f"protocol mismatch: speak client protocol {proto.PROTOCOL_VERSION} does not match "
+                        f"daemon protocol {daemon_protocol}; update the client (git pull) and reconnect /mcp, "
+                        "or deploy the daemon"}
     return {"busy": reply["busy"], "current_tool": reply["current_tool"], "waiting": reply["waiting"],
             "call": reply["call"]["state"]}
 
@@ -237,6 +318,15 @@ Voice tools for talking with the owner (Frank) over a Telegram call. Owner conve
   listen's rising two-note chime (played once your transcript is captured) is the
   acknowledgement, and there is no spoken one. So answer first and hand real work to
   agents (subagents, background tasks) rather than going silent while you do it.
+- The owner can hold you mid-sentence by saying "hold on" alone; you stop at once and
+  wait in silence, and "continue" restarts the sentence you were cut off in. A result
+  starting "[held Ns, then resumed]" means everything was said; carry on as normal.
+  A result starting "[hold expired after ...; the call was ended]" means the owner never
+  said "continue" within 5 minutes, so the daemon hung up: the reply was NOT finished
+  and converse did NOT listen. Do not assume he heard it and do not call back right
+  away (he ignores calls after this); keep the "not spoken" text and pick it up later.
+- Never speak "hold on" or "continue" as a sentence by itself: on a phone without echo
+  cancellation you would hear yourself and hold or resume your own speech.
 - When the owner asks you to call, they are up: pass override_quiet_hours=True without
   asking. Calls you start on your own respect quiet hours.
 - Call etiquette: "not answered" -> wait an hour. "busy" -> call once more, then wait an
@@ -256,14 +346,25 @@ mcp = MCPServer("algolearn-speak", instructions=_INSTRUCTIONS)
 async def _run(fn, *args):
     """Run the request off the event loop. Expected failures (no speech, empty text, no
     call, daemon unreachable) are re-raised as ToolError so the model sees the reason;
-    the SDK masks any other exception as a generic crash."""
+    the SDK masks any other exception as a generic crash.
+
+    A cancelled tool call (the user interrupts, the session closes) closes the request's
+    socket and leaves the worker thread behind: the daemon sees the client leave, and a
+    held speak/converse ends instead of keeping the lock."""
+    abort = _Abort()
+    token = _abort_var.set(abort)   # copied into the worker thread's context by anyio
     try:
-        return await anyio.to_thread.run_sync(fn, *args)
+        return await anyio.to_thread.run_sync(fn, *args, abandon_on_cancel=True)
+    except anyio.get_cancelled_exc_class():
+        abort.cancel()
+        raise
     except (TimeoutError, RuntimeError, ValueError) as e:
         raise ToolError(str(e)) from e
     except Exception as e:
         log.exception("%s failed", getattr(fn, "__name__", fn))
         raise ToolError(f"{type(e).__name__}: {e}") from e
+    finally:
+        _abort_var.reset(token)
 
 
 _QUEUE_NOTE = """
@@ -282,6 +383,22 @@ def _doc(doc: str):
         fn.__doc__ = doc
         return fn
     return apply
+
+
+_HOLD_NOTE = """
+    Hold: while the speech plays, the owner saying "hold on" by itself stops it at once
+    and holds (silence); "continue" restarts the sentence that was cut off and finishes.
+    The result then starts with "[held Ns, then resumed]" and is otherwise the normal
+    result. If no "continue" comes within 300 s (holds of one call added up), the daemon
+    ENDS THE CALL and the result is:
+      [hold expired after 300s; the call was ended]
+      cut off in sentence 3 of 5: "<the cut sentence>"
+      not spoken (from the cut sentence): "<everything not said>"
+      (audio: telegram)
+    The reply was not finished (and converse did not listen). Do not call back right
+    away; keep the unspoken text and bring it up later. Never speak "hold on" or
+    "continue" as a sentence by itself.
+"""
 
 
 _CALL_NOTE = """
@@ -304,10 +421,9 @@ _CALL_NOTE = """
     moment" before long silent work). For a conversational turn use `converse(text)`,
     never speak() then listen(): the gap between the two calls is seconds of dead air
     before the ear-open beep.
-""" + _QUEUE_NOTE + _CALL_NOTE)
+""" + _HOLD_NOTE + _QUEUE_NOTE + _CALL_NOTE)
 async def speak(text: str) -> str:
-    seconds = await _run(_speak_sync, text)
-    return f"spoke for {seconds:.1f}s{AUDIO_NOTE}"
+    return await _run(_speak_sync, text)
 
 
 @mcp.tool()
@@ -338,10 +454,9 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 2.0, start
     parameters and raises TimeoutError as listen does if nobody speaks within
     `start_timeout_seconds`; the call is still up, so reopen the ear with `listen()`; do
     not assume the owner left and do not hang up.
-""" + _QUEUE_NOTE + _CALL_NOTE)
+""" + _HOLD_NOTE + _QUEUE_NOTE + _CALL_NOTE)
 async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float = 2.0, start_timeout_seconds: float = 45.0) -> str:
-    reply = await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)
-    return reply + AUDIO_NOTE
+    return await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)
 
 
 @mcp.tool()
@@ -429,7 +544,8 @@ _READING_EVENTS = """
       NOT a delay. `raw_frames` and `connected` follow once the opener
       finishes (opener_s plus about 1 s).
     - `first_incoming_frame` only means frames arrive from the owner, not that
-      they carry sound.
+      they carry sound. It fires once per call, during the first listen or the
+      first watched speech (`during`: listen or watch), whichever comes first.
     - With debug on, `audio_in` / `audio_out` summarize each window (every 1 s
       for the first 10 s after answer, then every 10 s; `window_s`, `phase`
       opener or raw). `audio_in` with `zero_frames == frames` and `peak` 0 is
@@ -491,8 +607,10 @@ async def status() -> dict:
 
     Returns `{"busy": bool, "current_tool": str | None, "waiting": int, "call": str}`.
     `call` is the daemon's call state ("none", "ringing", "connected"),
-    "daemon unreachable: <error>", or "error: <reason>" if it could not be read;
-    when the daemon is not reached, busy/current_tool/waiting are null (unknown).
+    "daemon unreachable: <error>", "protocol mismatch: <detail>" (this client and the
+    daemon speak different wire versions: update the client and reconnect /mcp, or
+    deploy the daemon), or "error: <reason>" if it could not be read; when the daemon
+    is not reached or mismatched, busy/current_tool/waiting are null (unknown).
     speak/listen/converse work only while `call` is "connected".
     `current_tool` is `"<tool> (<client ip>)"` for the tool holding the lock
     ("transcribe" is a request to the daemon's HTTP whisper API on port 9000),

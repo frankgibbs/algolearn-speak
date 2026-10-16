@@ -19,6 +19,12 @@ reply. A failure is `{"ok": false, "error": "...", "kind": KIND_*}`.
 A tool reply (success or failure) may carry `"expect"`: the call generation the
 session should now expect (an int), or null for none. When the key is absent the
 session's expectation is unchanged.
+
+Every request carries FIELD_PROTOCOL = PROTOCOL_VERSION. The daemon refuses `ping`
+and every tool op whose version is missing or differs (a `value` error telling the
+session to update its client and reconnect /mcp). `status`, `debug` and `set_debug`
+are served to any client and carry the daemon's version in their reply, so an old
+client can still see what is wrong.
 """
 
 from __future__ import annotations
@@ -32,10 +38,17 @@ DAEMON_PORT = 8765
 MAX_HEADER_BYTES = 1 << 20
 MAX_PAYLOAD_BYTES = 1 << 20   # text only crosses the wire
 
+# The wire version. Bump it whenever a request or reply changes in a way an older peer
+# would misread. The unversioned protocol before it counts as 1; 2 is Release 2 of
+# docs/DESIGN_INTERRUPT.md (hold replies, longer speak budgets).
+PROTOCOL_VERSION = 2
+FIELD_PROTOCOL = "protocol"
+
 # ops
 OP_PING, OP_STATUS, OP_DEBUG, OP_SET_DEBUG = "ping", "status", "debug", "set_debug"
 OP_SPEAK, OP_LISTEN, OP_CONVERSE, OP_CALL, OP_HANG_UP = "speak", "listen", "converse", "call", "hang_up"
 QUICK_OPS = frozenset({OP_PING, OP_STATUS, OP_DEBUG, OP_SET_DEBUG})
+VERSIONLESS_OPS = frozenset({OP_STATUS, OP_DEBUG, OP_SET_DEBUG})   # served to a client of any protocol
 LOCKED_OPS = frozenset({OP_SPEAK, OP_LISTEN, OP_CONVERSE, OP_CALL, OP_HANG_UP})
 PHASE_STARTED = "started"
 
@@ -66,6 +79,17 @@ RING_TIMEOUT_SECONDS = 60
 REDIAL_SETTLE_SECONDS = 10.0
 CONNECT_GRACE_SECONDS = 30   # py-tgcalls waits for the media connection with no timeout of its own
 OPENER_MIN_SECONDS = 6.0     # 2 s failed, 6 s worked (2026-10-09). The one definition: the daemon rejects shorter greetings before dialing, write_opener raises on them
+
+# Holding Angie by spoken command (docs/DESIGN_INTERRUPT.md, Release 2). A speak/converse
+# reply always carries REPLY_HELD_SECONDS; after a hold expiry it also carries
+# REPLY_INTERRUPTION = {"command": INTERRUPTION_HOLD_EXPIRED, "cut_index" (1-based),
+# "sentence_count", "cut_sentence", "unspoken" (from the start of the cut sentence)}.
+# Owner decision 2026-10-16: a hold that reaches HOLD_MAX_SECONDS (the holds of one op added
+# up) ends the call. The client's speak/converse budgets include it.
+HOLD_MAX_SECONDS = 300.0
+CMD_HOLD, CMD_RESUME = "hold", "resume"
+INTERRUPTION_HOLD_EXPIRED = "hold_expired"
+REPLY_HELD_SECONDS, REPLY_INTERRUPTION = "held_seconds", "interruption"
 
 AUDIO_NOTE = "\n(audio: telegram)"   # ends every speak/listen/converse result and an answered call()
 

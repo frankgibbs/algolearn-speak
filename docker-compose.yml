@@ -24,6 +24,8 @@ services:
       SPEAK_WHISPER_MODEL: large-v3-turbo
       SPEAK_LANGUAGE: en
       SPEAK_QUIET_HOURS: "22:00-07:00"
+      SPEAK_HOLD_PHRASE: "hold on"       # said alone while Angie speaks: she stops and holds
+      SPEAK_RESUME_PHRASE: "continue"    # said alone while held: she restarts the cut sentence
     volumes:
       - speak_models:/root/.cache/huggingface   # models download once, not on every rebuild
     stop_grace_period: 30s            # a hang-up (<= 10 s) and the disconnect (<= 5 s) finish first

@@ -84,9 +84,9 @@ and handed to Claude; the reply follows.
 | Tool | What it does |
 |---|---|
 | `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call to you (from a second Telegram account). `greeting` (at least 6 s when spoken) is played when you answer; then `call` listens and returns your words. No calls 22:00-07:00 unless overridden. |
-| `speak(text)` | Says `text` into the connected call. Returns the spoken duration. |
+| `speak(text)` | Says `text` into the connected call. Returns the spoken duration. You can hold it (below). |
 | `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep, records your call audio until you have been quiet for `silence_seconds` (or spoke for `max_seconds`), transcribes, then plays a rising chime. Raises if nobody speaks within `start_timeout_seconds`. |
-| `converse(text, ...)` | `speak` then `listen`. Returns your words. |
+| `converse(text, ...)` | `speak` then `listen`. Returns your words. You can hold the speech (below); after an expired hold it does not listen. |
 | `hang_up()` | Ends the call. |
 | `status()` | `{"busy", "current_tool", "waiting", "call"}`: what is running in the daemon now (and from which computer), how many requests wait behind it, and the call state. Never blocks. |
 | `call_debug(lines=50)` | The daemon's recent call events, log tail, call state, pid, uptime, debug flag. |
@@ -96,6 +96,26 @@ Every `speak`/`listen`/`converse` result ends with `(audio: telegram)` on its
 own line. The tools that use the call are serialized through one first-come,
 first-served lock in the daemon, shared by every Claude Code session on every
 computer: a second caller waits its turn and is never rejected.
+
+## Hold on / continue
+
+While Angie is speaking (`speak`, or the speech half of `converse`), pause
+briefly and say **"hold on"** by itself: she stops at once and waits in
+silence. Say **"continue"** by itself: she starts again at the beginning of
+the sentence she was cut off in. Anything else you say while she speaks or
+waits changes nothing; a phrase run into a sentence ("hold on, honey") or
+said without a pause before it does not count.
+
+- A result that was held starts with `[held 42s, then resumed]`.
+- If the holds of one reply add up to 5 minutes, the hold expires: the
+  daemon hangs up, and the result says `[hold expired after 300s; the call
+  was ended]` with the sentence she was cut off in and the text not spoken.
+  `converse` does not listen in that case.
+- While a reply is held, other sessions' requests wait in the queue.
+- The phrases are daemon settings (`SPEAK_HOLD_PHRASE`,
+  `SPEAK_RESUME_PHRASE`). The greeting, the beeps and `listen` cannot be
+  held. Design: [docs/DESIGN_INTERRUPT.md](docs/DESIGN_INTERRUPT.md)
+  (Release 2).
 
 ## Telegram calls
 
@@ -125,7 +145,8 @@ Daemon: set in `docker-compose.yml`'s `environment`, all required:
 `SPEAK_KOKORO_MODEL` (`hexgrad/Kokoro-82M`), `SPEAK_VOICE` (`af_heart`;
 `af_*`/`am_*` American, `bf_*`/`bm_*` British), `SPEAK_SPEED` (`1.0`),
 `SPEAK_WHISPER_MODEL` (`large-v3-turbo`), `SPEAK_LANGUAGE` (`en`),
-`SPEAK_QUIET_HOURS` (`22:00-07:00`), and
+`SPEAK_QUIET_HOURS` (`22:00-07:00`), `SPEAK_HOLD_PHRASE` (`hold on`),
+`SPEAK_RESUME_PHRASE` (`continue`), and
 `TZ`, the clock the quiet hours use.
 
 ## Troubleshooting

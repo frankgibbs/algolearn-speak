@@ -61,7 +61,7 @@ class FakeLink:
 
 
 SETTINGS = {"SPEAK_QUIET_HOURS": "22:00-07:00", "quiet_window": (1320, 420),
-            "tz": None}
+            "tz": None, "phrases": {"hold on": "hold", "continue": "resume"}}
 
 
 class HttpCase(unittest.TestCase):
@@ -177,7 +177,7 @@ class TestRoutes(HttpCase):
     def test_bad_content_length_is_400(self):
         with socket.create_connection(("127.0.0.1", self.http_port), timeout=10) as s:
             s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n")
-            data = s.recv(4096)
+            data = _recv_all(s)   # headers and body arrive in separate sends; the server then closes
         self.assertTrue(data.startswith(b"HTTP/1.1 400"), data)
         self.assertTrue(data.endswith(b"Invalid HTTP request received."), data)
 
@@ -450,7 +450,7 @@ class TestStartup(unittest.TestCase):
         daemon.start()
         self.addCleanup(daemon.stop)
         with socket.create_connection(("127.0.0.1", daemon._server.server_address[1]), timeout=10) as s:
-            proto.send_msg(s, {"op": proto.OP_PING})
+            proto.send_msg(s, {"op": proto.OP_PING, proto.FIELD_PROTOCOL: proto.PROTOCOL_VERSION})
             reply, _ = proto.recv_msg(s)
         self.assertIs(reply["ok"], True)
 

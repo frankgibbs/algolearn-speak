@@ -1,5 +1,6 @@
 """Streamed speech in the daemon (docs/DESIGN_STREAMED_SPEECH.md, owner decision 2026-10-16):
-SpeakService hands Kokoro's lazy per-segment output to TelegramLink.play_stream, the greeting
+SpeakService hands Kokoro's lazy per-segment output to TelegramLink.play_watched (play_stream
+plus the hold watch, docs/DESIGN_INTERRUPT.md; the hold itself is tested in test_hold.py), the greeting
 stays one whole synthesis, and Whisper runs only after the whole speech has played.
 
 Fake engines and a fake link, as in test_whisper_http.py: no CUDA, no Telegram. The link's
@@ -17,10 +18,15 @@ import speak_telegram as tg
 import speak_telegram_daemon as d
 
 RATE = eng.TTS_RATE
+
+
+def NEVER_LEFT() -> bool:   # noqa: N802 - the request's client stays
+    return False
+
 CHIME = len(d.chime_pcm())
 EAR_OPEN = len(d.cue_pcm(880.0, 0.5, 0.5, 0.2))
 SETTINGS = {"SPEAK_QUIET_HOURS": "22:00-07:00", "quiet_window": (1320, 420),
-            "tz": None}
+            "tz": None, "phrases": {"hold on": "hold", "continue": "resume"}}
 
 
 class FakeEngines:
@@ -30,13 +36,13 @@ class FakeEngines:
         self.log = log
         self.fail_after: int | None = None   # raise after this many segments
 
-    def synthesize_stream(self, text: str):
+    def synthesize_segments(self, text: str):
         self.log.append(("stream_start", text))
         for i, sentence in enumerate(s for s in text.split(". ") if s):
             if self.fail_after is not None and i == self.fail_after:
                 raise RuntimeError("kokoro failed")
             self.log.append(("synth", i + 1))
-            yield np.full(RATE // 2, 0.1, dtype=np.float32)
+            yield i, np.full(RATE // 2, 0.1, dtype=np.float32)
 
     def synthesize(self, text: str) -> np.ndarray:
         self.log.append(("synthesize_whole", text))
@@ -69,17 +75,17 @@ class FakeLink:
         if self.fail_play:
             raise RuntimeError("playback failed on a connected call")
 
-    def play_stream(self, segments, rate) -> float:
+    def play_watched(self, segments, rate, classify, accept) -> tg.PlayOutcome:
         self.log.append(("stream_begin",))
         samples = 0
-        for n, seg in enumerate(segments, 1):
+        for n, (_tag, seg) in enumerate(segments, 1):
             self.log.append(("queued", n))
             samples += len(seg)
             if self.drop_during_stream:
                 self._state = tg.NONE
                 raise tg.CallEnded("the Telegram call ended during playback")
         self.log.append(("stream_done",))
-        return samples / rate
+        return tg.PlayOutcome(None, samples, None, samples / rate)
 
     def record(self, max_seconds, silence_seconds, start_timeout_seconds, cue, rate):
         self.log.append(("record", len(cue)))
@@ -105,8 +111,8 @@ class ServiceCase(unittest.TestCase):
         return [e[0] for e in self.log]
 
     def test_speak_streams_and_interleaves_synthesis_with_queueing(self):
-        result = self.svc.speak(self.sess, "One. Two. Three.")
-        self.assertEqual(result, {"seconds": 1.5})   # the same seconds as one whole synthesis
+        result = self.svc.speak(self.sess, "One. Two. Three.", NEVER_LEFT)
+        self.assertEqual(result, {"seconds": 1.5, "held_seconds": 0.0})   # the same seconds as one whole synthesis
         # Lazy: nothing is synthesized until the link has started the stream (its call check).
         self.assertEqual(self.log, [("stream_begin",), ("stream_start", "One. Two. Three."),
                                     ("synth", 1), ("queued", 1), ("synth", 2), ("queued", 2),
@@ -114,17 +120,17 @@ class ServiceCase(unittest.TestCase):
         self.assertNotIn("synthesize_whole", self.names())
 
     def test_markdown_is_stripped_before_streaming(self):
-        self.svc.speak(self.sess, "**Bold** `code`.")
+        self.svc.speak(self.sess, "**Bold** `code`.", NEVER_LEFT)
         self.assertEqual(self.log[1], ("stream_start", "Bold code."))
 
     def test_empty_text_raises_before_any_audio(self):
         with self.assertRaisesRegex(ValueError, "empty text"):
-            self.svc.speak(self.sess, "**`")
+            self.svc.speak(self.sess, "**`", NEVER_LEFT)
         self.assertEqual(self.log, [])
 
     def test_converse_listens_and_transcribes_only_after_the_whole_speech(self):
-        result = self.svc.converse(self.sess, "One. Two.", 120, 2.0, 45)
-        self.assertEqual(result, {"text": "hi Angie"})
+        result = self.svc.converse(self.sess, "One. Two.", 120, 2.0, 45, NEVER_LEFT)
+        self.assertEqual(result, {"text": "hi Angie", "held_seconds": 0.0})
         names = self.names()
         self.assertLess(names.index("stream_done"), names.index("record"))
         self.assertLess(names.index("record"), names.index("transcribe"))
@@ -144,14 +150,14 @@ class ServiceCase(unittest.TestCase):
         self.link.drop_during_stream = True
         self.sess.expect("x")   # the session talked on this call
         with self.assertRaisesRegex(d.CallEndedError, "ended during converse"):
-            self.svc.converse(self.sess, "One. Two.", 120, 2.0, 45)
+            self.svc.converse(self.sess, "One. Two.", 120, 2.0, 45, NEVER_LEFT)
         self.assertNotIn("record", self.names())
         self.assertNotIn("transcribe", self.names())
 
     def test_a_synthesis_error_mid_stream_propagates_while_connected(self):
         self.engines.fail_after = 1
         with self.assertRaisesRegex(RuntimeError, "kokoro failed"):
-            self.svc.speak(self.sess, "One. Two.")
+            self.svc.speak(self.sess, "One. Two.", NEVER_LEFT)
         self.assertNotIn("stream_done", self.names())
 
 
@@ -177,9 +183,9 @@ class TestEnginesStream(unittest.TestCase):
 
         def kokoro(text, voice, speed, split_pattern):
             seen.append((text, voice, speed, split_pattern))
-            for c in chunks:
+            for i, c in enumerate(chunks):
                 seen.append("made")
-                yield types.SimpleNamespace(audio=FakeAudio(c))
+                yield types.SimpleNamespace(audio=FakeAudio(c), text_index=i)
 
         e._kokoro = kokoro
         return e
@@ -222,7 +228,7 @@ class ListenCues(ServiceCase):
         self.assertEqual(self.log, [("record", EAR_OPEN), ("transcribe",), ("play", CHIME)])
 
     def test_converse_chimes_only_after_whisper(self):
-        self.svc.converse(self.sess, "One. Two.", 120, 2.0, 45)
+        self.svc.converse(self.sess, "One. Two.", 120, 2.0, 45, NEVER_LEFT)
         after = self.log[self.names().index("record") + 1:]
         self.assertEqual(after, [("transcribe",), ("play", CHIME)])
         self.assertEqual(self.names().count("stream_done"), 1)   # no spoken ack

@@ -39,6 +39,7 @@ daemon before the port is bound, and every failure raises.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import faulthandler
 import json
@@ -64,7 +65,7 @@ import numpy as np
 
 import speak_protocol as proto
 import speak_telegram as tg
-from speak_engines import STT_RATE, TTS_RATE, WHISPER_DEVICE, Engines
+from speak_engines import STT_RATE, TTS_RATE, WHISPER_DEVICE, Engines, split_sentences
 from speak_tone import chime_pcm, cue_pcm
 
 log = logging.getLogger("speak.daemon")
@@ -75,7 +76,7 @@ MAX_DEBUG_LINES = 1000
 DEBUG_LOGGERS = ("speak", "pytgcalls", "ntgcalls", "telethon")   # ntgcalls' native C++ log has no Python hook
 REQUIRED_TELEGRAM_ENV = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_CALL_TARGET")
 REQUIRED_SPEAK_ENV = ("SPEAK_KOKORO_MODEL", "SPEAK_VOICE", "SPEAK_SPEED", "SPEAK_WHISPER_MODEL",
-                      "SPEAK_LANGUAGE", "SPEAK_QUIET_HOURS", "TZ")
+                      "SPEAK_LANGUAGE", "SPEAK_QUIET_HOURS", "SPEAK_HOLD_PHRASE", "SPEAK_RESUME_PHRASE", "TZ")
 BIND_HOST = "0.0.0.0"   # open to the LAN by design (owner decision 4); no auth, no TLS
 WHISPER_HTTP_PORT = 9000   # the retired whisper-service's port, so its clients need no change
 TRANSCRIBE_TOOL = "transcribe"   # how status names an HTTP transcription holding the audio lock
@@ -125,6 +126,26 @@ def in_quiet_hours(window: tuple[int, int], now: datetime.time) -> bool:
     return t >= start or t < end  # wraps midnight
 
 
+def normalize_phrase(text: str) -> str:
+    """For the hold/resume match (docs/DESIGN_INTERRUPT.md section 4.2): lowercase, every
+    character but letters, digits and apostrophes becomes a space, spaces collapse. Whisper's
+    "Hold on." and the setting "hold on" both become "hold on"."""
+    return " ".join(re.sub(r"[^a-z0-9']+", " ", text.lower()).split())
+
+
+def parse_phrases(hold: str, resume: str) -> dict[str, str]:
+    """SPEAK_HOLD_PHRASE / SPEAK_RESUME_PHRASE -> {normalized phrase: command}. Both must
+    still say something once normalized, and they must differ."""
+    norm = {proto.CMD_HOLD: normalize_phrase(hold), proto.CMD_RESUME: normalize_phrase(resume)}
+    for name, raw, value in (("SPEAK_HOLD_PHRASE", hold, norm[proto.CMD_HOLD]),
+                             ("SPEAK_RESUME_PHRASE", resume, norm[proto.CMD_RESUME])):
+        if not value:
+            raise RuntimeError(f"{name}={raw!r} has no letters or digits")
+    if norm[proto.CMD_HOLD] == norm[proto.CMD_RESUME]:
+        raise RuntimeError(f"SPEAK_HOLD_PHRASE and SPEAK_RESUME_PHRASE are the same phrase ({norm[proto.CMD_HOLD]!r})")
+    return {phrase: command for command, phrase in norm.items()}
+
+
 def _require_env(names: tuple[str, ...]) -> dict[str, str]:
     env = {name: os.environ.get(name, "") for name in names}
     missing = [name for name, value in env.items() if not value]
@@ -148,7 +169,8 @@ def load_settings() -> dict:
         raise RuntimeError(f"SPEAK_SPEED={env['SPEAK_SPEED']!r} is not a number") from None
     if speed <= 0:
         raise RuntimeError(f"SPEAK_SPEED={speed} must be positive")
-    return {**env, "SPEAK_SPEED": speed, "tz": tz, "quiet_window": parse_quiet_hours(env["SPEAK_QUIET_HOURS"])}
+    return {**env, "SPEAK_SPEED": speed, "tz": tz, "quiet_window": parse_quiet_hours(env["SPEAK_QUIET_HOURS"]),
+            "phrases": parse_phrases(env["SPEAK_HOLD_PHRASE"], env["SPEAK_RESUME_PHRASE"])}
 
 
 def load_env() -> dict[str, str]:
@@ -250,6 +272,56 @@ class Session:
         self.changed = True
 
 
+@dataclasses.dataclass
+class Spoken:
+    """What _speak did: the seconds of speech sent, the seconds the owner held it, and,
+    when a hold expired, the interruption for the reply (REPLY_INTERRUPTION)."""
+    seconds: float
+    held_seconds: float
+    interruption: dict | None = None
+
+
+class _Segments:
+    """Kokoro's (sentence index, audio) segments for one speech, pulled lazily and kept, so
+    resuming after a hold replays the cut sentence and anything already made without
+    synthesizing it again."""
+
+    def __init__(self, segments) -> None:
+        self._it = iter(segments)
+        self._cache: list[tuple[int, np.ndarray]] = []
+        self._done = False
+
+    def _pull(self) -> tuple[int, np.ndarray] | None:
+        if self._done:
+            return None
+        item = next(self._it, None)
+        if item is None:
+            self._done = True
+            return None
+        self._cache.append(item)
+        return item
+
+    def from_sentence(self, start: int):
+        """Every segment of sentence `start` and after, cached ones first."""
+        i = 0
+        while True:
+            if i < len(self._cache):
+                item = self._cache[i]
+            else:
+                item = self._pull()
+                if item is None:
+                    return
+            i += 1
+            if item[0] >= start:
+                yield item
+
+    def next_index(self) -> int | None:
+        """The sentence of the first segment not yet played after a cut that fell between
+        segments (everything queued had played): pulled now. None: nothing is left."""
+        item = self._pull()
+        return None if item is None else item[0]
+
+
 class SpeakService:
     """The tool logic moved from speak_server.py, now calling TelegramLink directly.
     Every method runs with the audio lock held."""
@@ -260,6 +332,7 @@ class SpeakService:
         self.quiet_hours = settings["SPEAK_QUIET_HOURS"]
         self.quiet_window = settings["quiet_window"]
         self.tz = settings["tz"]
+        self.phrases: dict[str, str] = settings["phrases"]   # normalized phrase -> CMD_HOLD / CMD_RESUME
         self.boot = secrets.token_hex(4)   # per process: generations restart at 0 after a restart
 
     def key(self, generation: int) -> str:
@@ -330,16 +403,74 @@ class SpeakService:
         text = re.sub(r"[`*_#>|]", "", text)
         return re.sub(r"[ \t]+", " ", text).strip()
 
-    def _speak(self, text: str) -> float:
+    def classify(self, audio: np.ndarray) -> tg.Classified:
+        """One watch candidate: Whisper, then an exact match of the WHOLE normalized
+        transcript against the two phrases (no names, no fuzzy match; docs/DESIGN_INTERRUPT.md section 4.2)."""
+        text = self.engines.transcribe(audio)
+        return tg.Classified(self.phrases.get(normalize_phrase(text)), text)
+
+    def _speak(self, text: str, client_left: Callable[[], bool]) -> Spoken:
         """Stream it: the first Kokoro segment starts playing as soon as it is synthesized,
         and the rest are synthesized while earlier ones play (owner decision 2026-10-16,
-        docs/DESIGN_STREAMED_SPEECH.md, superseding design section 4.6 for Kokoro during
-        speech). Returns once all of it has played, so Whisper never overlaps outgoing
-        speech. Returns the spoken seconds."""
+        docs/DESIGN_STREAMED_SPEECH.md). While it plays, the owner's audio is watched for
+        the hold phrase (docs/DESIGN_INTERRUPT.md, Release 2): "hold on" cuts the speech at
+        once and holds (silence out) until "continue", which restarts the cut sentence from
+        its beginning. The holds of one speech may add up to HOLD_MAX_SECONDS; then the hold
+        has expired and the result carries the interruption (the caller ends the call). A
+        hold whose client goes away (`client_left`) ends at once and raises
+        (_client_left_during_hold). Returns once all of it has played (or the hold expired), so the listen that follows
+        never overlaps outgoing speech."""
         text = self.plain(text)
         if not text:
             raise ValueError("speak() called with empty text")
-        return self.link.play_stream(self.engines.synthesize_stream(text), TTS_RATE)
+        pieces = split_sentences(text)
+        segments = _Segments(self.engines.synthesize_segments(text))
+        start, seconds, held = 0, 0.0, 0.0
+        while True:
+            out = self.link.play_watched(segments.from_sentence(start), TTS_RATE, self.classify, proto.CMD_HOLD)
+            seconds += out.seconds
+            if out.command is None:
+                return Spoken(seconds, held)
+            cut = out.cut_tag if out.cut_tag is not None else segments.next_index()
+            if cut is None:   # held after the last sentence had all been sent: nothing is left to say
+                log.info("hold after the whole speech had played; nothing to resume")
+                return Spoken(seconds, held)
+            t0 = time.monotonic()
+            got = self.link.watch_for(proto.HOLD_MAX_SECONDS - held, self.classify, proto.CMD_RESUME, client_left)
+            held += time.monotonic() - t0
+            if got is tg.CLIENT_LEFT:
+                self._client_left_during_hold(held)
+            if got is tg.TIMEOUT:
+                return Spoken(seconds, held, {
+                    "command": proto.INTERRUPTION_HOLD_EXPIRED, "cut_index": cut + 1,
+                    "sentence_count": len(pieces), "cut_sentence": pieces[cut],
+                    "unspoken": " ".join(pieces[cut:])})
+            log.info("resumed after %.1fs on hold, at sentence %d of %d", held, cut + 1, len(pieces))
+            start = cut
+
+    def _client_left_during_hold(self, held: float) -> None:
+        """The request's client went away while Angie was held (its tool call was cancelled
+        or its session closed): nobody waits for the reply, so the hold ends now and the lock
+        goes to the next request (the handler releases it when this raises). Owner decision
+        2026-10-16: the call is NOT hung up; it stays connected."""
+        log.warning("the client left during a hold (held %.1fs); ending the hold, the call stays up", held)
+        raise RuntimeError(f"the client left during a hold after {held:.0f}s; the hold was ended")
+
+    def _hold_expired(self, sess: Session, tool: str, spoken: Spoken, reply: dict) -> dict:
+        """Owner decision 2026-10-16: a hold that reaches HOLD_MAX_SECONDS ends the call. The
+        reply says so and carries the unspoken text; the session expects no call afterwards
+        (this is not a drop to call back on). If the hang-up itself fails, that failure is
+        recorded (hold_expire_hangup_failed) and raised, and the call may still be up."""
+        log.info("%s: hold expired after %.0fs; hanging up", tool, spoken.held_seconds)
+        try:
+            self.link.hang_up()
+        except Exception as e:
+            self.link.record_event("hold_expire_hangup_failed", tool=tool, error=tg.describe(e))
+            raise
+        finally:
+            sess.expect(None)
+        return {**reply, proto.REPLY_HELD_SECONDS: round(spoken.held_seconds, 1),
+                proto.REPLY_INTERRUPTION: spoken.interruption}
 
     def _listen(self, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
         """The ear-open beep, the capture, Whisper, then the rising two-note chime.
@@ -367,9 +498,13 @@ class SpeakService:
 
     # -- tool ops (lock held)
 
-    def speak(self, sess: Session, text: str) -> dict:
+    def speak(self, sess: Session, text: str, client_left: Callable[[], bool]) -> dict:
         self.require_call(sess, "speak")
-        return {"seconds": self.guard_call(sess, "speak", lambda: self._speak(text))}
+        spoken = self.guard_call(sess, "speak", lambda: self._speak(text, client_left))
+        reply = {"seconds": round(spoken.seconds, 3)}
+        if spoken.interruption is not None:
+            return self._hold_expired(sess, "speak", spoken, reply)
+        return {**reply, proto.REPLY_HELD_SECONDS: round(spoken.held_seconds, 1)}
 
     def listen(self, sess: Session, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> dict:
         self.require_call(sess, "listen")
@@ -377,14 +512,22 @@ class SpeakService:
                                         lambda: self._listen(max_seconds, silence_seconds, start_timeout_seconds))}
 
     def converse(self, sess: Session, text: str, max_seconds: float, silence_seconds: float,
-                 start_timeout_seconds: float) -> dict:
+                 start_timeout_seconds: float, client_left: Callable[[], bool]) -> dict:
         self.require_call(sess, "converse")
 
-        def round_trip() -> str:
-            self._speak(text)
+        box: dict[str, Spoken] = {}
+
+        def round_trip() -> str | None:
+            box["spoken"] = spoken = self._speak(text, client_left)
+            if spoken.interruption is not None:
+                return None   # owner decision 2026-10-16: no listen after an expired hold
             return self._listen(max_seconds, silence_seconds, start_timeout_seconds)
 
-        return {"text": self.guard_call(sess, "converse", round_trip)}
+        heard = self.guard_call(sess, "converse", round_trip)
+        spoken = box["spoken"]
+        if spoken.interruption is not None:
+            return self._hold_expired(sess, "converse", spoken, {})
+        return {"text": heard, proto.REPLY_HELD_SECONDS: round(spoken.held_seconds, 1)}
 
     def call(self, sess: Session, greeting: str, override_quiet_hours: bool, max_seconds: float,
              silence_seconds: float, start_timeout_seconds: float) -> dict:
@@ -507,9 +650,16 @@ class _Handler(socketserver.BaseRequestHandler):
             log.warning("request from %s could not be read: %s", peer, e)
             return
         op = req.get("op")
+        if op not in proto.VERSIONLESS_OPS and (op in proto.QUICK_OPS or op in proto.LOCKED_OPS):
+            try:
+                _check_protocol(req)
+            except ValueError as e:
+                log.warning("%s from %s refused: %s", op, peer, e)
+                self._send(peer, _error_reply(e))
+                return
         if op in proto.QUICK_OPS:
             try:
-                reply = {"ok": True, **daemon.quick(op, req)}
+                reply = {"ok": True, proto.FIELD_PROTOCOL: proto.PROTOCOL_VERSION, **daemon.quick(op, req)}
             except Exception as e:
                 reply = _error_reply(e)
             self._send(peer, reply)
@@ -533,7 +683,7 @@ class _Handler(socketserver.BaseRequestHandler):
                     log.warning("%s from %s: the client left while queued (%s); skipped", op, peer, e)
                     return
                 log.info("%s from %s: started", op, peer)
-                reply = daemon.run_locked(op, req)
+                reply = daemon.run_locked(op, req, lambda: _peer_left(self.request))
                 if op == proto.OP_CALL and reply.get("ok") and proto.is_audio_failure(reply["outcome"]):
                     restart_reason = reply["outcome"]
                     daemon.closing.set()   # before the release: no queued op reaches the link
@@ -553,8 +703,20 @@ class _Handler(socketserver.BaseRequestHandler):
             log.warning("could not send the reply to %s: %s", peer, e)
 
 
+def _check_protocol(req: dict) -> None:
+    """Raises ValueError unless the request carries this daemon's PROTOCOL_VERSION: an older
+    or newer client would misread the replies (docs: CLAUDE.md "Deploying a protocol change")."""
+    if proto.FIELD_PROTOCOL not in req:
+        raise ValueError(f"speak client sent no protocol version (a client older than protocol "
+                         f"{proto.PROTOCOL_VERSION}); update the client (git pull) and reconnect /mcp")
+    version = req[proto.FIELD_PROTOCOL]
+    if version != proto.PROTOCOL_VERSION:
+        raise ValueError(f"speak client protocol {version} does not match daemon protocol "
+                         f"{proto.PROTOCOL_VERSION}; update the client (git pull) and reconnect /mcp")
+
+
 def _peer_left(sock: socket.socket) -> bool:
-    """True when the client closed its end while its request was queued. A client sends one
+    """True when the client closed its end while its request was queued or held. A client sends one
     request and then only reads, so a readable socket here means EOF, a reset, or a socket
     error such as keepalive's ETIMEDOUT or EHOSTUNREACH: in every case the peer is gone."""
     readable, _, _ = select.select([sock], [], [], 0)
@@ -819,9 +981,10 @@ class SpeakDaemon:
             return {"daemon": "running", "debug": self.debug.enabled}
         raise ValueError(f"unknown op {op!r}")
 
-    def run_locked(self, op: str, req: dict) -> dict:
+    def run_locked(self, op: str, req: dict, client_left: Callable[[], bool]) -> dict:
         """One tool op with the lock held. The reply carries "expect" when the session's
-        call expectation changed (an int, or null to clear)."""
+        call expectation changed (an int, or null to clear). `client_left` says whether the
+        request's client has gone away; a hold polls it (speak, converse)."""
         svc = self.service
         sess: Session | None = None
         try:
@@ -831,11 +994,11 @@ class SpeakDaemon:
             else:
                 sess = Session(_generation(req))
                 if op == proto.OP_SPEAK:
-                    result = svc.speak(sess, _text(req, "text"))
+                    result = svc.speak(sess, _text(req, "text"), client_left)
                 elif op == proto.OP_LISTEN:
                     result = svc.listen(sess, *_listen_args(req))
                 elif op == proto.OP_CONVERSE:
-                    result = svc.converse(sess, _text(req, "text"), *_listen_args(req))
+                    result = svc.converse(sess, _text(req, "text"), *_listen_args(req), client_left)
                 elif op == proto.OP_CALL:
                     result = svc.call(sess, _text(req, "greeting"), _flag(req, "override_quiet_hours"),
                                       *_listen_args(req))

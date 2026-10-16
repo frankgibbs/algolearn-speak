@@ -13,6 +13,7 @@ dtype fails the load.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Iterator
 
@@ -25,6 +26,16 @@ STT_RATE = 16_000              # Whisper input rate
 SENTENCE_SPLIT = r"(?<=[.!?])\s+"
 WHISPER_COMPUTE_TYPE = "float32"
 WHISPER_DEVICE = "cuda"        # also reported by the daemon's GET /health (port 9000)
+
+
+def split_sentences(text: str) -> list[str]:
+    """`text` split into the sentences Kokoro synthesizes one by one: the same
+    re.split(SENTENCE_SPLIT, text.strip()) KPipeline does (kokoro 0.9.4 pipeline.py:366),
+    so Result.text_index indexes this list. Raises on text with nothing to say."""
+    pieces = re.split(SENTENCE_SPLIT, text.strip())
+    if not all(p.strip() for p in pieces):
+        raise ValueError(f"text has an empty sentence: {text!r}")
+    return pieces
 
 
 class Engines:
@@ -76,6 +87,22 @@ class Engines:
         for result in self._kokoro(text, voice=self.voice, speed=self.speed, split_pattern=SENTENCE_SPLIT):
             produced = True
             yield result.audio.detach().cpu().numpy().astype(np.float32).reshape(-1)
+        if not produced:
+            raise RuntimeError(f"Kokoro produced no audio for {text!r}")
+
+    def synthesize_segments(self, text: str) -> Iterator[tuple[int, np.ndarray]]:
+        """As synthesize_stream, but each Kokoro segment comes with the index of its sentence
+        in split_sentences(text): Kokoro's Result.text_index, the index into its own
+        re.split(SENTENCE_SPLIT, text.strip()), which split_sentences repeats exactly. A
+        sentence over 510 phonemes gives several segments with the same index; a sentence
+        with no phonemes gives none. speak uses the index to cut and resume at a sentence
+        (docs/DESIGN_INTERRUPT.md, Release 2). Raises if Kokoro yields nothing."""
+        produced = False
+        for result in self._kokoro(text, voice=self.voice, speed=self.speed, split_pattern=SENTENCE_SPLIT):
+            if result.text_index is None:
+                raise RuntimeError("Kokoro returned a segment without its text_index")
+            produced = True
+            yield result.text_index, result.audio.detach().cpu().numpy().astype(np.float32).reshape(-1)
         if not produced:
             raise RuntimeError(f"Kokoro produced no audio for {text!r}")
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import dataclasses
 import datetime
 import logging
 import os
@@ -65,6 +66,15 @@ NATIVE_BLOCK = VAD_BLOCK * CALL_RATE // VAD_RATE     # 1536 samples at 48 kHz
 OPENER_TAIL_SECONDS = 1.0  # wait after the opener file before switching to raw frames
 PUMP_MAX_LAG = 0.05        # behind by more than this -> reset the clock instead of bursting
 PRE_ROLL_SECONDS = 0.5     # audio kept from just before speech starts
+# Watching the owner's audio while Angie speaks or is held (docs/DESIGN_INTERRUPT.md
+# section 4.4, Release 2). Only a short utterance after a pause is a command candidate.
+WATCH_SILENCE_SECONDS = 0.4           # end of a command utterance (listen uses 2.0 s)
+WATCH_LEADING_SILENCE_SECONDS = 0.8   # non-speech required before a candidate
+WATCH_MIN_UTTERANCE_SECONDS = 0.3     # shorter is a click or a cough
+WATCH_MAX_UTTERANCE_SECONDS = 2.0     # longer is conversation: dropped untranscribed
+VAD_BLOCK_SECONDS = VAD_BLOCK / VAD_RATE   # 0.032
+WATCH_POLL_SECONDS = 0.05             # how often the watch looks at the queue while nothing else runs
+WATCH_DRAIN_GRACE_SECONDS = 30.0      # play_watched: the drain may run this long past the audio queued
 HANG_UP_TIMEOUT = 8.0      # leave_call; with disconnect, stays inside compose's stop_grace_period
 DISCONNECT_TIMEOUT = 5.0
 EVENT_BUFFER_SIZE = 500
@@ -74,7 +84,8 @@ STATS_SLOW_INTERVAL = 10.0   # ... then every 10 s
 MAX_LAG_EVENTS = 20   # pump_stall events per call, so a stalled call cannot flood the buffer
 STREAM_STEP_TIMEOUT = 5.0   # play_stream: one loop round-trip to open, queue into, or stop a stream
 
-TIMEOUT = object()   # record(): nobody spoke within start_timeout_seconds
+TIMEOUT = object()   # record(): nobody spoke within start_timeout_seconds; watch_for(): no command in time
+CLIENT_LEFT = object()   # watch_for(): the request's client went away during the hold
 
 
 class CallEnded(RuntimeError):
@@ -94,6 +105,151 @@ class _Stream:
         self.resume_segment = 0      # the segment queued into an empty buffer after audio started
         self.underruns = 0
         self.underrun_frames = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class Classified:
+    """What the daemon's classify made of one watch candidate."""
+    phrase: str | None   # the command whose phrase the whole transcript matched exactly, else None
+    text: str            # Whisper's transcript (in events only while debug is on)
+
+
+@dataclasses.dataclass(frozen=True)
+class PlayOutcome:
+    """play_watched's result. `command` is None when everything played."""
+    command: str | None
+    played_bytes: int        # call PCM sent before the cut (all of it when completed)
+    cut_tag: object | None   # tag of the segment that was playing at the cut; None when completed, or
+                             # when the cut fell between segments (nothing queued was left unsent)
+    seconds: float           # seconds of audio sent
+
+
+@dataclasses.dataclass(frozen=True)
+class _Hit:
+    command: str
+    utterance_end: float   # monotonic arrival time of the frame that ended the utterance
+
+
+class _VadFeed:
+    """48 kHz stereo s16 call frames -> 32 ms 16 kHz blocks, each with the VAD's event.
+    Shared by the listen capture and the watch (docs/DESIGN_INTERRUPT.md section 4.5)."""
+
+    def __init__(self, vad: Callable) -> None:
+        self.vad = vad
+        self.native = np.zeros(0, dtype=np.float32)
+
+    def blocks(self, raw: bytes):
+        s16 = np.frombuffer(raw, dtype=np.int16).reshape(-1, CALL_CHANNELS).mean(axis=1)
+        self.native = np.concatenate([self.native, (s16 / 32768.0).astype(np.float32)])
+        while len(self.native) >= NATIVE_BLOCK:
+            block = resample_poly(self.native[:NATIVE_BLOCK], VAD_RATE, CALL_RATE).astype(np.float32)
+            self.native = self.native[NATIVE_BLOCK:]
+            yield block, self.vad(block)
+
+
+class _Watcher:
+    """The owner's audio while Angie speaks or is held, cut into utterances by the VAD
+    (end after WATCH_SILENCE_SECONDS of quiet). An utterance is a candidate only when at
+    least WATCH_LEADING_SILENCE_SECONDS of non-speech came before it and it lasted from
+    WATCH_MIN_UTTERANCE_SECONDS to WATCH_MAX_UTTERANCE_SECONDS; anything else is dropped
+    untranscribed. Each candidate goes to `classify` (Whisper and the phrase match, in the
+    daemon). Every utterance is recorded as a watch_candidate event; the transcript is in
+    it only while debug is on (link.audio_stats). Runs on the request thread."""
+
+    def __init__(self, link: "TelegramLink", classify: Callable[[np.ndarray], Classified], accept: str,
+                 mode: str) -> None:
+        self.link = link
+        self.classify = classify
+        self.accept = accept   # the one command this state acts on (hold while playing, resume while held)
+        self.mode = mode       # "playing" or "held", for the events
+        self.feed = _VadFeed(link._vad_factory(WATCH_SILENCE_SECONDS))
+        self.pre_roll: collections.deque[np.ndarray] = collections.deque(
+            maxlen=int(PRE_ROLL_SECONDS * VAD_RATE / VAD_BLOCK))
+        self.quiet_blocks = 0     # non-speech blocks since the last utterance ended (or the watch began)
+        self.after_utterance = False   # an utterance has ended: its end already took WATCH_SILENCE_SECONDS
+        self.speaking = False
+        self.utterance: list[np.ndarray] = []
+        self.utterance_blocks = 0
+        self.too_long = False
+        self.leading_s = 0.0
+
+    def poll(self, timeout: float) -> _Hit | None:
+        """Process the frames queued now, waiting up to `timeout` for the first one. Returns
+        the first candidate that classify turned into a command, or None."""
+        q = self.link._incoming
+        try:
+            item = q.get(timeout=timeout) if timeout > 0 else q.get_nowait()
+        except queue.Empty:
+            return None
+        more = q.qsize()   # only what is queued now, so a steady stream cannot keep poll from returning
+        while True:
+            t, raw = item
+            for block, event in self.feed.blocks(raw):
+                hit = self._block(block, event, t)
+                if hit is not None:
+                    return hit
+            if more <= 0:
+                return None
+            more -= 1
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
+                return None
+
+    def _block(self, block: np.ndarray, event: dict | None, t: float) -> _Hit | None:
+        if not self.speaking:
+            if event and "start" in event:
+                self.speaking = True
+                self.leading_s = self.quiet_blocks * VAD_BLOCK_SECONDS + (
+                    WATCH_SILENCE_SECONDS if self.after_utterance else 0.0)
+                self.utterance = [*self.pre_roll, block]
+                self.utterance_blocks = 1
+                self.too_long = False
+                self.pre_roll.clear()
+            else:
+                self.quiet_blocks += 1
+                self.pre_roll.append(block)
+            return None
+        self.utterance_blocks += 1
+        if not self.too_long:
+            self.utterance.append(block)
+            if self.utterance_blocks * VAD_BLOCK_SECONDS > WATCH_MAX_UTTERANCE_SECONDS + WATCH_SILENCE_SECONDS:
+                self.too_long = True   # conversation: stop keeping it, it will not be transcribed
+                self.utterance = []
+        if event and "end" in event:
+            self.speaking = False
+            self.quiet_blocks = 0
+            self.after_utterance = True
+            return self._candidate(t)
+        return None
+
+    def _candidate(self, t_end: float) -> _Hit | None:
+        length = self.utterance_blocks * VAD_BLOCK_SECONDS - WATCH_SILENCE_SECONDS
+        fields = {"mode": self.mode, "length_ms": round(length * 1000),
+                  "leading_silence_ms": round(self.leading_s * 1000)}
+        if self.leading_s < WATCH_LEADING_SILENCE_SECONDS:
+            reason = "no_leading_pause"
+        elif length < WATCH_MIN_UTTERANCE_SECONDS:
+            reason = "too_short"
+        elif self.too_long or length > WATCH_MAX_UTTERANCE_SECONDS:
+            reason = "too_long"
+        else:
+            reason = None
+        if reason is not None:
+            self.utterance = []
+            self.link._event("watch_candidate", result="dropped", reason=reason, **fields)
+            return None
+        audio = np.concatenate(self.utterance)
+        self.utterance = []
+        t0 = time.monotonic()
+        c = self.classify(audio)
+        acted = c.phrase is not None and c.phrase == self.accept
+        fields.update(result="transcribed", transcribe_ms=round((time.monotonic() - t0) * 1000),
+                      matched=c.phrase, acted=acted)
+        if self.link.audio_stats:   # privacy: the transcript only while debug is on (design 4.7)
+            fields["text"] = c.text
+        self.link._event("watch_candidate", **fields)
+        return _Hit(c.phrase, t_end) if acted else None
 
 
 def describe(error: BaseException) -> str:
@@ -261,8 +417,9 @@ class TelegramLink:
         self._drained: asyncio.Event | None = None
         self._pump_task: asyncio.Task | None = None
         self._ring_task: asyncio.Task | None = None
-        self._incoming: queue.Queue[bytes] = queue.Queue()
+        self._incoming: queue.Queue[tuple[float, bytes]] = queue.Queue()   # (monotonic arrival, frame)
         self._listening = False
+        self._watching = False   # play_watched / watch_for: the owner's frames are queued during playback too
         self.events = CallEventLog()
         self._incoming_seen = False
         self._call_id: str | None = None
@@ -292,12 +449,20 @@ class TelegramLink:
             fields["elapsed_s"] = round(time.monotonic() - self._call_t0, 3)
         self.events.record(self._call_id, event, **fields)
 
+    def record_event(self, event: str, **fields) -> None:
+        """A call event recorded by the daemon's tool logic (e.g. hold_expire_hangup_failed)."""
+        self._event(event, **fields)
+
     # ------------------------------------------------------------ lifecycle
 
     def start(self) -> None:
-        self._vad_preload()   # a load failure fails start; never load a model during a call
-        self._thread.start()
-        self._run(self._start(), 60.0, "connecting to Telegram")
+        try:
+            self._vad_preload()   # a load failure fails start; never load a model during a call
+            self._thread.start()
+            self._run(self._start(), 60.0, "connecting to Telegram")
+        except BaseException:
+            self._close_loop()
+            raise
         log.info("telegram link ready (target %s, user id %s)", self.target, self._user_id)
 
     async def _start(self) -> None:
@@ -315,12 +480,13 @@ class TelegramLink:
                     if self._state == CONNECTED:
                         for f in update.frames:
                             self._in_stats.add(f.frame)
-                    if self._listening:
+                    if self._listening or self._watching:
                         if not self._incoming_seen:
                             self._incoming_seen = True
-                            self._event("first_incoming_frame")
+                            self._event("first_incoming_frame", during="listen" if self._listening else "watch")
+                        now = time.monotonic()
                         for f in update.frames:
-                            self._incoming.put(f.frame)
+                            self._incoming.put((now, f.frame))
                 elif update.chat_id == self._user_id and update.direction & Direction.OUTGOING \
                         and update.device & Device.MICROPHONE and self._state == CONNECTED and self._phase == "opener":
                     # Probe: does ntgcalls report the frames of the opener FILE? (audio_opener_out says.)
@@ -364,8 +530,19 @@ class TelegramLink:
             if self._state != NONE:
                 self.hang_up()
         finally:
-            self._run(self._disconnect(), DISCONNECT_TIMEOUT, "disconnecting from Telegram")
+            try:
+                self._run(self._disconnect(), DISCONNECT_TIMEOUT, "disconnecting from Telegram")
+            finally:
+                self._close_loop()
+
+    def _close_loop(self) -> None:
+        """Stop the loop thread and close the loop. Raises if the thread does not stop."""
+        if self._thread.is_alive():
             self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(DISCONNECT_TIMEOUT)
+            if self._thread.is_alive():
+                raise RuntimeError(f"Telegram link: the loop thread did not stop within {DISCONNECT_TIMEOUT:.0f}s")
+        self._loop.close()
 
     async def _disconnect(self) -> None:
         # Telethon's disconnect() is a coroutine when called on its running loop (here),
@@ -400,6 +577,7 @@ class TelegramLink:
         self._event("ended", reason=reason, duration_s=round(time.monotonic() - self._call_t0, 3))
         self._ended.set()
         self._listening = False
+        self._watching = False
         self._stop_stats()
         self._outgoing.clear()
         self._drained.set()
@@ -786,7 +964,7 @@ class TelegramLink:
         self._drained.set()
         self._stream_done(aborted=True, error=error)
 
-    def _stream_done(self, aborted: bool, error: str | None = None) -> None:
+    def _stream_done(self, aborted: bool, error: str | None = None, cut: str | None = None) -> None:
         """One speech_stream_done summary per streamed utterance, debug on or off."""
         st = self._stream
         if st is None:   # already summarized: the failure came after a completed finish
@@ -798,7 +976,131 @@ class TelegramLink:
                   "pump_stalls": self._lag_stalls, "aborted": aborted}
         if error is not None:
             fields["error"] = error
+        if cut is not None:
+            fields["cut"] = cut
         self._event("speech_stream_done", **fields)
+
+    # ------------------------------------------------------------ watched audio out (hold on / continue)
+
+    def play_watched(self, segments: Iterable[tuple[object, np.ndarray]], rate: int,
+                     classify: Callable[[np.ndarray], Classified], accept: str) -> PlayOutcome:
+        """play_stream, while watching the owner's audio for the `accept` command
+        (docs/DESIGN_INTERRUPT.md, Release 2). `segments` yields (tag, audio); the tag of
+        the segment playing at a cut comes back in the outcome. The watch runs between
+        segments (while Kokoro makes the next one it pauses; the frames wait in the queue)
+        and every WATCH_POLL_SECONDS while the last ones drain.
+
+        On the command, what is still queued is dropped at once (the cut), a playback_cut
+        event records how much had played and the command latency, and the outcome names
+        the command. Otherwise everything plays and the outcome's command is None.
+        Raises CallEnded on a drop; any failure clears what is queued, records an aborted
+        speech_stream_done and propagates, as play_stream."""
+        self._run(self._stream_begin(), STREAM_STEP_TIMEOUT, "starting watched playback")
+        marks: list[tuple[object, int]] = []   # (tag, cumulative call-PCM bytes at its end)
+        total = 0
+        queued_seconds = 0.0
+        while not self._incoming.empty():   # stale frames from before this speech
+            self._incoming.get_nowait()
+        self._watching = True
+        try:
+            watcher = _Watcher(self, classify, accept, "playing")
+            it = iter(segments)
+            while True:
+                t0 = time.monotonic()
+                item = next(it, None)
+                if item is None:
+                    break
+                tag, audio = item
+                produce_s = time.monotonic() - t0
+                pcm = to_call_pcm(audio, rate)
+                total += len(pcm)
+                marks.append((tag, total))
+                queued_seconds += len(pcm) / (FRAME_BYTES * 100)
+                self._run(self._stream_add(pcm, produce_s), STREAM_STEP_TIMEOUT, "queueing streamed audio")
+                hit = watcher.poll(0)
+                if hit is not None:
+                    return self._cut(hit, marks, total)
+            if total == 0:
+                raise RuntimeError("streamed playback got no audio")
+            deadline = time.monotonic() + queued_seconds + WATCH_DRAIN_GRACE_SECONDS
+            while not self._drained.is_set():
+                if self._ended.is_set():
+                    raise CallEnded("the Telegram call ended during playback")
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"Telegram link: playing watched audio did not finish within "
+                                       f"{queued_seconds + WATCH_DRAIN_GRACE_SECONDS:.0f}s")
+                hit = watcher.poll(WATCH_POLL_SECONDS)
+                if hit is not None:
+                    return self._cut(hit, marks, total)
+            self._run(self._stream_finish(), STREAM_STEP_TIMEOUT, "finishing watched playback")
+            return PlayOutcome(None, total, None, total / (FRAME_BYTES * 100))
+        except BaseException as e:
+            self._run(self._stream_abort(describe(e)), STREAM_STEP_TIMEOUT, "stopping streamed playback")
+            raise
+        finally:
+            self._watching = False
+
+    def _cut(self, hit: _Hit, marks: list[tuple[object, int]], total: int) -> PlayOutcome:
+        remaining = self._run(self._stream_cut(hit.command, hit.utterance_end), STREAM_STEP_TIMEOUT,
+                              "cutting playback")
+        played = total - remaining
+        cut_tag = next((tag for tag, end in marks if end > played), None)
+        return PlayOutcome(hit.command, played, cut_tag, played / (FRAME_BYTES * 100))
+
+    async def _stream_cut(self, command: str, utterance_end: float) -> int:
+        """On the loop: drop what is queued (the pump sends silence from its next frame)."""
+        if self._ended.is_set():
+            raise CallEnded("the Telegram call ended during playback")
+        remaining = len(self._outgoing)
+        self._outgoing.clear()
+        self._drained.set()
+        st = self._stream
+        played_ms = round((st.audio_bytes - remaining) / (FRAME_BYTES * 100) * 1000) if st is not None else None
+        self._stream_done(aborted=False, cut=command)
+        self._event("playback_cut", command=command, played_ms=played_ms,
+                    dropped_ms=round(remaining / (FRAME_BYTES * 100) * 1000),
+                    command_latency_ms=round((time.monotonic() - utterance_end) * 1000))
+        return remaining
+
+    def watch_for(self, timeout_s: float, classify: Callable[[np.ndarray], Classified], accept: str,
+                  client_left: Callable[[], bool]):
+        """The hold: silence goes out (the pump idles) while the owner's audio is watched
+        for the `accept` command. Returns that command, TIMEOUT after `timeout_s`, or
+        CLIENT_LEFT as soon as `client_left()` is true (the request's client went away, so
+        nobody waits for the reply). Raises CallEnded if the call ends meanwhile; a classify
+        failure propagates. Records hold_start and hold_end (how: the command, expired,
+        call_ended, client_left or error)."""
+        if self._state != CONNECTED:
+            raise CallEnded("no connected Telegram call")
+        while not self._incoming.empty():
+            self._incoming.get_nowait()
+        t0 = time.monotonic()
+        self._event("hold_start", max_s=round(timeout_s, 1))
+        self._watching = True
+        try:
+            watcher = _Watcher(self, classify, accept, "held")
+            while True:
+                if self._ended.is_set():
+                    self._event("hold_end", how="call_ended", held_s=round(time.monotonic() - t0, 1))
+                    raise CallEnded("the Telegram call ended during the hold")
+                left = timeout_s - (time.monotonic() - t0)
+                if left <= 0:
+                    self._event("hold_end", how="expired", held_s=round(time.monotonic() - t0, 1))
+                    return TIMEOUT
+                if client_left():
+                    self._event("hold_end", how="client_left", held_s=round(time.monotonic() - t0, 1))
+                    return CLIENT_LEFT
+                try:
+                    hit = watcher.poll(min(WATCH_POLL_SECONDS, left))
+                except Exception as e:
+                    self._event("hold_end", how="error", error=describe(e), held_s=round(time.monotonic() - t0, 1))
+                    raise
+                if hit is not None:
+                    self._event("hold_end", how=hit.command, held_s=round(time.monotonic() - t0, 1),
+                                command_latency_ms=round((time.monotonic() - hit.utterance_end) * 1000))
+                    return hit.command
+        finally:
+            self._watching = False
 
     # ------------------------------------------------------------ audio in
 
@@ -820,8 +1122,7 @@ class TelegramLink:
             self._listening = False
 
     def _capture(self, max_seconds: float, silence_seconds: float, start_timeout_seconds: float):
-        vad = self._vad_factory(silence_seconds)
-        native = np.zeros(0, dtype=np.float32)
+        feed = _VadFeed(self._vad_factory(silence_seconds))
         blocks: list[np.ndarray] = []
         speaking = False
         t_open = time.monotonic()
@@ -829,17 +1130,11 @@ class TelegramLink:
             if self._ended.is_set():
                 raise CallEnded("the Telegram call ended during listen")
             try:
-                raw = self._incoming.get(timeout=0.5)
+                _t, raw = self._incoming.get(timeout=0.5)
             except queue.Empty:
                 raw = None
-            if raw is not None:
-                s16 = np.frombuffer(raw, dtype=np.int16).reshape(-1, CALL_CHANNELS).mean(axis=1)
-                native = np.concatenate([native, (s16 / 32768.0).astype(np.float32)])
-            while len(native) >= NATIVE_BLOCK:
-                block = resample_poly(native[:NATIVE_BLOCK], VAD_RATE, CALL_RATE).astype(np.float32)
-                native = native[NATIVE_BLOCK:]
+            for block, event in (feed.blocks(raw) if raw is not None else ()):
                 blocks.append(block)
-                event = vad(block)
                 if event and "start" in event and not speaking:
                     speaking = True
                     blocks = blocks[-int(PRE_ROLL_SECONDS * VAD_RATE / VAD_BLOCK):]

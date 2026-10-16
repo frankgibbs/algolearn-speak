@@ -331,7 +331,14 @@ depend on the transport. It moves to `speak_protocol.py` unchanged, and
 - **A client that disconnects mid-request** (a closed session, a cancelled
   tool) does not cancel the daemon's work. The op finishes and its reply is
   discarded. This is today's behavior too: the worker thread in `_run`
-  cannot be cancelled (`speak_server.py:565-570`).
+  cannot be cancelled (`speak_server.py:565-570`). Exception added in
+  Release 2 (docs/DESIGN_INTERRUPT.md section 5.2): a cancelled tool call
+  closes its socket, and a hold whose client has left ends at once and
+  releases the lock; the call stays connected (owner decision 2026-10-16).
+- **Protocol version (added in Release 2):** every request carries
+  `protocol` = `PROTOCOL_VERSION`; the daemon refuses `ping` and tool ops
+  with a missing or different version and serves `status`, `debug` and
+  `set_debug` to any client (CLAUDE.md, Protocol).
 
 ### 4.3 The audio lock lives in the daemon
 
@@ -427,6 +434,16 @@ order as a rule.
 synthesizes each segment while earlier ones play; the greeting is still
 synthesized whole, and Whisper still never overlaps outgoing speech. See
 `docs/DESIGN_STREAMED_SPEECH.md`.
+
+**Amended again for Silero and Whisper (owner decision 2026-10-16, Release 2
+of `docs/DESIGN_INTERRUPT.md`, built in the working tree, not deployed):**
+while speak plays, and while the owner holds it, the daemon watches the
+owner's audio for "hold on" and "continue". Silero VAD runs during playback,
+and Whisper runs during playback on short candidate utterances only (2 s or
+less, after a pause). Verified locally on the Mac (CPU, not patrick's CUDA):
+CTranslate2 releases the GIL while it transcribes; the live pump-stall check
+is section 8.2 of that document. The greeting, the cues and `listen` are
+unchanged.
 
 Silero VAD stays on the CPU (Owner decision 9). It runs during capture, when
 the pump is sending silence, as it does on the Mac today. Section 9 re-tests
