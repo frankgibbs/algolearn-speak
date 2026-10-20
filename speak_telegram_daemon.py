@@ -66,7 +66,7 @@ import numpy as np
 import speak_protocol as proto
 import speak_telegram as tg
 from speak_engines import STT_RATE, TTS_RATE, WHISPER_DEVICE, Engines, split_sentences
-from speak_tone import chime_pcm, cue_pcm
+from speak_tone import chime_pcm, cue_pcm, switch_pcm
 
 log = logging.getLogger("speak.daemon")
 
@@ -80,6 +80,7 @@ REQUIRED_SPEAK_ENV = ("SPEAK_KOKORO_MODEL", "SPEAK_VOICE", "SPEAK_SPEED", "SPEAK
 BIND_HOST = "0.0.0.0"   # open to the LAN by design (owner decision 4); no auth, no TLS
 WHISPER_HTTP_PORT = 9000   # the retired whisper-service's port, so its clients need no change
 TRANSCRIBE_TOOL = "transcribe"   # how status names an HTTP transcription holding the audio lock
+SESSION_SWITCH_EVENT = "session_switch"   # call_debug: a switch of session was announced on the call
 MAX_TRANSCRIBE_SECONDS = 15 * 60   # owner decision 2026-10-16: the longest audio port 9000 accepts
 MAX_BODY_BYTES = MAX_TRANSCRIBE_SECONDS * STT_RATE * np.dtype(np.int16).itemsize   # 28,800,000: mono int16 PCM
 # Port 9000's per-recv socket timeout. A LAN upload's gaps are milliseconds, and the
@@ -257,15 +258,28 @@ class AudioLock:
 
 # ------------------------------------------------------------------ the tools
 
+@dataclasses.dataclass(frozen=True)
+class Speaker:
+    """The client session a tool op comes from (protocol 3, owner decision 2026-10-20): a
+    session id the client generates once per process, and its project, the basename of the
+    client's working folder."""
+    session_id: str
+    project: str
+
+
 class Session:
     """One request's view of the client session's call expectation (design section 4.4).
     `generation` is the call the session expects, as "<boot>:<link generation>" (None: no
     expectation); the boot id makes a key from before a daemon restart never match a call
-    placed after it. `changed` says whether the reply must carry the new value back."""
+    placed after it. `changed` says whether the reply must carry the new value back.
+    `speaker` is who sent the request; `switched_from` is set to the previous session's
+    project once a switch of session has been announced (the reply then carries it)."""
 
-    def __init__(self, generation: str | None) -> None:
+    def __init__(self, generation: str | None, speaker: Speaker) -> None:
         self.generation = generation
         self.changed = False
+        self.speaker = speaker
+        self.switched_from: str | None = None
 
     def expect(self, generation: str | None) -> None:
         self.generation = generation
@@ -334,6 +348,11 @@ class SpeakService:
         self.tz = settings["tz"]
         self.phrases: dict[str, str] = settings["phrases"]   # normalized phrase -> CMD_HOLD / CMD_RESUME
         self.boot = secrets.token_hex(4)   # per process: generations restart at 0 after a restart
+        # Who played audio to the owner last, and on which call: (call key, Speaker), or None
+        # before the first call. Owner decision 2026-10-20: tied to the call, so a new call
+        # starts from the session that placed it (its greeting introduced it) and a session's
+        # turn on an earlier call is never compared with one on the current call.
+        self._turn: tuple[str, Speaker] | None = None
 
     def key(self, generation: int) -> str:
         return f"{self.boot}:{generation}"
@@ -390,6 +409,30 @@ class SpeakService:
                 return
             raise
 
+    # -- session switch (owner decisions 2026-10-20)
+
+    def _take_turn(self, sess: Session, tool: str) -> None:
+        """Before a speak/listen/converse plays anything: when the previous audio on this call
+        came from another session, announce the switch (the switch cue, then this session's
+        project name, spoken), record SESSION_SWITCH_EVENT and set sess.switched_from to the
+        previous session's project. The first audio on a call from the session that placed it
+        is not a switch (call() makes it the call's first turn). The announcement is one plain
+        play, like the greeting and the cues: it cannot be held. A call that drops during it
+        raises "call ended" and leaves the turn unchanged."""
+        key = self.key(self.link.info()["generation"])
+        previous = self._turn
+        if previous is not None and previous[0] == key and previous[1].session_id != sess.speaker.session_id:
+            name = proto.speakable_name(sess.speaker.project)
+            audio = np.concatenate([switch_pcm(), self.engines.synthesize(name)])
+            self.guard_call(sess, tool, lambda: self.link.play(audio, TTS_RATE))
+            self.link.record_event(SESSION_SWITCH_EVENT, tool=tool, from_project=previous[1].project,
+                                   to_project=sess.speaker.project, spoken=name,
+                                   announce_s=round(len(audio) / TTS_RATE, 2))
+            log.info("%s: session switch on call %s, %r -> %r announced", tool, key, previous[1].project,
+                     sess.speaker.project)
+            sess.switched_from = previous[1].project
+        self._turn = (key, sess.speaker)
+
     # -- audio
 
     def _cue(self, freq_hz: float, seconds: float = 0.12, volume: float = 0.2, lead_silence: float = 0.0) -> None:
@@ -420,9 +463,7 @@ class SpeakService:
         hold whose client goes away (`client_left`) ends at once and raises
         (_client_left_during_hold). Returns once all of it has played (or the hold expired), so the listen that follows
         never overlaps outgoing speech."""
-        text = self.plain(text)
-        if not text:
-            raise ValueError("speak() called with empty text")
+        text = self._spoken_text(text)
         pieces = split_sentences(text)
         segments = _Segments(self.engines.synthesize_segments(text))
         start, seconds, held = 0, 0.0, 0.0
@@ -447,6 +488,14 @@ class SpeakService:
                     "unspoken": " ".join(pieces[cut:])})
             log.info("resumed after %.1fs on hold, at sentence %d of %d", held, cut + 1, len(pieces))
             start = cut
+
+    def _spoken_text(self, text: str) -> str:
+        """`text` without markdown; raises ValueError when nothing is left to say. Checked
+        before a switch announcement too, so an empty speak announces nothing."""
+        text = self.plain(text)
+        if not text:
+            raise ValueError("speak() called with empty text")
+        return text
 
     def _client_left_during_hold(self, held: float) -> None:
         """The request's client went away while Angie was held (its tool call was cancelled
@@ -500,6 +549,8 @@ class SpeakService:
 
     def speak(self, sess: Session, text: str, client_left: Callable[[], bool]) -> dict:
         self.require_call(sess, "speak")
+        self._spoken_text(text)
+        self._take_turn(sess, "speak")
         spoken = self.guard_call(sess, "speak", lambda: self._speak(text, client_left))
         reply = {"seconds": round(spoken.seconds, 3)}
         if spoken.interruption is not None:
@@ -508,12 +559,15 @@ class SpeakService:
 
     def listen(self, sess: Session, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> dict:
         self.require_call(sess, "listen")
+        self._take_turn(sess, "listen")
         return {"text": self.guard_call(sess, "listen",
                                         lambda: self._listen(max_seconds, silence_seconds, start_timeout_seconds))}
 
     def converse(self, sess: Session, text: str, max_seconds: float, silence_seconds: float,
                  start_timeout_seconds: float, client_left: Callable[[], bool]) -> dict:
         self.require_call(sess, "converse")
+        self._spoken_text(text)
+        self._take_turn(sess, "converse")
 
         box: dict[str, Spoken] = {}
 
@@ -560,6 +614,8 @@ class SpeakService:
             sess.expect(None)
         if outcome != tg.ANSWERED:
             return {"outcome": outcome}
+        # The greeting is this call's first turn: the caller's next speak is not a switch.
+        self._turn = (self.key(self.link.info()["generation"]), sess.speaker)
         # Answered: the greeting has played; listen for the owner's reply under the same lock
         # hold (as converse does) so no other session slips in between. A listen timeout or a
         # drop raises, exactly as in listen; on a timeout the call stays connected.
@@ -605,6 +661,23 @@ def _generation(req: dict) -> str | None:
     if value is not None and not isinstance(value, str):
         raise ValueError(f"expect_generation must be a string or null, got {value!r}")
     return value
+
+
+def _speaker(req: dict) -> Speaker:
+    """The client's identity on a tool op (protocol 3). Missing, not a string or empty is
+    refused like a missing protocol version; so is a project with no letter or digit (it
+    would announce nothing)."""
+    values = {}
+    for key in (proto.FIELD_SESSION_ID, proto.FIELD_PROJECT):
+        value = req.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"speak client sent no {key} (got {value!r}); every tool op of protocol "
+                             f"{proto.PROTOCOL_VERSION} carries a non-empty {proto.FIELD_SESSION_ID} and "
+                             f"{proto.FIELD_PROJECT}; update the client (git pull) and reconnect /mcp")
+        values[key] = value
+    if not proto.speakable_name(values[proto.FIELD_PROJECT]):
+        raise ValueError(f"{proto.FIELD_PROJECT} {values[proto.FIELD_PROJECT]!r} has no letters or digits to speak")
+    return Speaker(values[proto.FIELD_SESSION_ID], values[proto.FIELD_PROJECT])
 
 
 def _debug_lines(req: dict) -> int:
@@ -653,6 +726,8 @@ class _Handler(socketserver.BaseRequestHandler):
         if op not in proto.VERSIONLESS_OPS and (op in proto.QUICK_OPS or op in proto.LOCKED_OPS):
             try:
                 _check_protocol(req)
+                if op in proto.LOCKED_OPS:
+                    _speaker(req)
             except ValueError as e:
                 log.warning("%s from %s refused: %s", op, peer, e)
                 self._send(peer, _error_reply(e))
@@ -983,16 +1058,17 @@ class SpeakDaemon:
 
     def run_locked(self, op: str, req: dict, client_left: Callable[[], bool]) -> dict:
         """One tool op with the lock held. The reply carries "expect" when the session's
-        call expectation changed (an int, or null to clear). `client_left` says whether the
-        request's client has gone away; a hold polls it (speak, converse)."""
+        call expectation changed (an int, or null to clear), and REPLY_SWITCHED_FROM when a
+        switch of session was announced before the op's audio. `client_left` says whether
+        the request's client has gone away; a hold polls it (speak, converse)."""
         svc = self.service
         sess: Session | None = None
         try:
             if op == proto.OP_HANG_UP:
-                sess = Session(None)
+                sess = Session(None, _speaker(req))
                 result = svc.hang_up(sess)
             else:
-                sess = Session(_generation(req))
+                sess = Session(_generation(req), _speaker(req))
                 if op == proto.OP_SPEAK:
                     result = svc.speak(sess, _text(req, "text"), client_left)
                 elif op == proto.OP_LISTEN:
@@ -1009,6 +1085,8 @@ class SpeakDaemon:
             reply = _error_reply(e)
         if sess is not None and sess.changed:
             reply["expect"] = sess.generation
+        if sess is not None and sess.switched_from is not None:
+            reply[proto.REPLY_SWITCHED_FROM] = sess.switched_from   # on a failure too: the owner heard it
         return reply
 
     def request_restart(self, reason: str) -> None:

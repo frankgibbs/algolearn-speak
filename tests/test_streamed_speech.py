@@ -105,7 +105,7 @@ class ServiceCase(unittest.TestCase):
         self.engines = FakeEngines(self.log)
         self.link = FakeLink(self.log)
         self.svc = d.SpeakService(self.link, self.engines, SETTINGS)
-        self.sess = d.Session(None)
+        self.sess = d.Session(None, d.Speaker("s-test", "algolearn-speak"))
 
     def names(self):
         return [e[0] for e in self.log]

@@ -1,8 +1,10 @@
 """Tone synthesis for algolearn-speak's cues (the ear-open beep, the rising
-"captured" chime and the no-speech timeout beep), played into the Telegram
-call by the speak daemon (speak_telegram_daemon.py). Owner decisions
-2026-10-16: the ear-closed beep and the spoken ack are gone; the rising chime
-stays, played after Whisper has the transcript.
+"captured" chime, the no-speech timeout beep and the session-switch double
+beep), played into the Telegram call by the speak daemon
+(speak_telegram_daemon.py). Owner decisions 2026-10-16: the ear-closed beep
+and the spoken ack are gone; the rising chime stays, played after Whisper has
+the transcript. Owner decision 2026-10-20: a switch of session on the call is
+announced with a cue and the new session's project name.
 
 No hardware access here: this module only does numpy math.
 """
@@ -35,3 +37,13 @@ def chime_pcm() -> np.ndarray:
     """The rising two-note chime (660 Hz then 990 Hz): the owner's words were captured.
     Distinct from the single-tone ear-open and timeout beeps."""
     return np.concatenate([tone(660.0, 0.10), tone(990.0, 0.14)])
+
+
+def switch_pcm() -> np.ndarray:
+    """The session-switch cue: two short 523 Hz beeps (80 ms each, 60 ms apart), then 150 ms
+    of silence before the project name is spoken. Distinct from the single-tone ear-open
+    (880 Hz) and timeout (330 Hz) beeps and from the rising chime."""
+    beep = tone(523.0, 0.08)
+    gap = np.zeros(int(TONE_RATE * 0.06), dtype=np.float32)
+    tail = np.zeros(int(TONE_RATE * 0.15), dtype=np.float32)
+    return np.concatenate([beep, gap, beep, tail])

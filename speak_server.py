@@ -27,6 +27,12 @@ The one thing this process remembers is the session's call expectation
 (design section 4.4): the generation of the call this session talked on. It is
 sent with every tool op, and the daemon's reply says how it changes, so a later
 drop raises "call ended ... call back" in every session that used the call.
+
+Every tool op also carries this client's identity (protocol 3, owner decision
+2026-10-20): a session id generated once per process and the project, the
+basename of the working folder at startup. The daemon uses it to announce a
+switch of session on the shared call; a result that follows a switch starts
+with a "[took over the call from ...]" line.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from __future__ import annotations
 import contextvars
 import logging
 import os
+import secrets
 import socket
 import sys
 import threading
@@ -51,8 +58,14 @@ log = logging.getLogger("speak")
 CONNECT_TIMEOUT_SECONDS = 5.0
 QUICK_REPLY_TIMEOUT_SECONDS = 20.0
 MAX_DEBUG_LINES = 1000
+# Extra budget after "started" for a session-switch announcement (synthesis, the cue and the
+# spoken project name), plus len(project) / 5 s as the other budgets count text.
+ANNOUNCE_BUDGET_SECONDS = 10.0
 
 _daemon: tuple[str, int] | None = None   # set in main() from SPEAK_DAEMON
+# This client's identity on every tool op: {FIELD_SESSION_ID, FIELD_PROJECT}. Set once per
+# process by init_identity() (main(), or scripts/drive_daemon.py).
+_identity: dict[str, str] | None = None
 
 # The session's call expectation: the daemon's generation of the call this session
 # expects, or None. Updated only from a reply's "expect" key.
@@ -106,6 +119,25 @@ def _address() -> str:
     return f"{_daemon[0]}:{_daemon[1]}"
 
 
+def init_identity(cwd: str) -> dict[str, str]:
+    """Generate this process's session id and take the project from `cwd` (the working
+    folder at startup). A folder whose name has no letter or digit (e.g. "/") is refused:
+    there would be nothing to announce."""
+    global _identity
+    project = os.path.basename(os.path.normpath(cwd))
+    if not proto.speakable_name(project):
+        raise RuntimeError(f"the speak client's working folder {cwd!r} has no name to announce (its basename "
+                           f"{project!r} has no letters or digits); start Claude Code in a project folder")
+    _identity = {proto.FIELD_SESSION_ID: secrets.token_hex(8), proto.FIELD_PROJECT: project}
+    return _identity
+
+
+def _identity_fields() -> dict[str, str]:
+    if _identity is None:
+        raise RuntimeError("the speak client's identity was not set; main() calls init_identity at startup")
+    return _identity
+
+
 def _apply_expect(reply: dict) -> None:
     global _call_generation
     if "expect" in reply:
@@ -125,6 +157,8 @@ def _request(op: str, fields: dict, budget: float) -> dict:
     names; a stalled daemon raises RuntimeError, never TimeoutError, so it is never mistaken
     for "no speech detected"."""
     addr = _address()
+    if op in proto.LOCKED_OPS:
+        fields = {**_identity_fields(), **fields}
     try:
         sock = socket.create_connection(_daemon, timeout=CONNECT_TIMEOUT_SECONDS)
     except OSError as e:
@@ -156,6 +190,8 @@ def _request(op: str, fields: dict, budget: float) -> dict:
     _apply_expect(reply)
     if not reply.get("ok"):
         message = reply.get("error") or f"speak daemon reported an error without a message: {reply!r}"
+        if proto.REPLY_SWITCHED_FROM in reply:   # the owner heard the announcement before the failure
+            message = f"{_switch_line(reply)}{message}"
         kind = reply.get("kind")
         if kind == proto.KIND_TIMEOUT:
             raise TimeoutError(message)
@@ -177,12 +213,26 @@ def _listen_budget(max_seconds: float, start_timeout_seconds: float) -> float:
     return start_timeout_seconds + max_seconds + 60.0
 
 
+def _announce_budget() -> float:
+    return ANNOUNCE_BUDGET_SECONDS + len(_identity_fields()[proto.FIELD_PROJECT]) / 5
+
+
 def _listen_fields(max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> dict:
     return {"max_seconds": max_seconds, "silence_seconds": silence_seconds,
             "start_timeout_seconds": start_timeout_seconds}
 
 
 # ---------------------------------------------------------------- sync bodies (worker thread)
+
+def _switch_line(reply: dict) -> str:
+    """'[took over the call from "<project>"; ...]\n' when the daemon announced a switch of
+    session before this op's audio (the previous audio on the call came from another
+    session); "" otherwise. Always the result's first line."""
+    if proto.REPLY_SWITCHED_FROM not in reply:
+        return ""
+    return (f"[took over the call from \"{reply[proto.REPLY_SWITCHED_FROM]}\"; the owner heard the switch "
+            f"cue and this project's name first]\n")
+
 
 def _held_prefix(reply: dict) -> str:
     """"[held 42s, then resumed]\n" when the owner held Angie and she finished; "" otherwise."""
@@ -202,19 +252,23 @@ def _expired_result(reply: dict) -> str:
 
 def _speak_result(reply: dict) -> str:
     if proto.REPLY_INTERRUPTION in reply:
-        return _expired_result(reply)
-    return f"{_held_prefix(reply)}spoke for {reply['seconds']:.1f}s{AUDIO_NOTE}"
+        return _switch_line(reply) + _expired_result(reply)
+    return f"{_switch_line(reply)}{_held_prefix(reply)}spoke for {reply['seconds']:.1f}s{AUDIO_NOTE}"
 
 
 def _converse_result(reply: dict) -> str:
     if proto.REPLY_INTERRUPTION in reply:
-        return _expired_result(reply)
-    return f"{_held_prefix(reply)}{reply['text']}{AUDIO_NOTE}"
+        return _switch_line(reply) + _expired_result(reply)
+    return f"{_switch_line(reply)}{_held_prefix(reply)}{reply['text']}{AUDIO_NOTE}"
+
+
+def _listen_result(reply: dict) -> str:
+    return f"{_switch_line(reply)}{reply['text']}"
 
 
 def _speak_sync(text: str) -> str:
     reply = _request(proto.OP_SPEAK, {"text": text, "expect_generation": _current_generation()},
-                     _speak_budget(text))
+                     _speak_budget(text) + _announce_budget())
     return _speak_result(reply)
 
 
@@ -222,15 +276,15 @@ def _listen_sync(max_seconds: float, silence_seconds: float, start_timeout_secon
     reply = _request(proto.OP_LISTEN,
                      {**_listen_fields(max_seconds, silence_seconds, start_timeout_seconds),
                       "expect_generation": _current_generation()},
-                     _listen_budget(max_seconds, start_timeout_seconds))
-    return reply["text"]
+                     _listen_budget(max_seconds, start_timeout_seconds) + _announce_budget())
+    return _listen_result(reply)
 
 
 def _converse_sync(text: str, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> str:
     reply = _request(proto.OP_CONVERSE,
                      {"text": text, **_listen_fields(max_seconds, silence_seconds, start_timeout_seconds),
                       "expect_generation": _current_generation()},
-                     _speak_budget(text) + _listen_budget(max_seconds, start_timeout_seconds))
+                     _speak_budget(text) + _listen_budget(max_seconds, start_timeout_seconds) + _announce_budget())
     return _converse_result(reply)
 
 
@@ -338,6 +392,13 @@ Voice tools for talking with the owner (Frank) over a Telegram call. Owner conve
   calls work.
 - There is one call, shared by every session on every computer; tools queue for it.
   The owner may also be reading this terminal.
+- When your speak/listen/converse is the first audio on the call after another
+  session's, the daemon first plays a double beep and speaks your project's name, and
+  your result's first line is '[took over the call from "<other project>"; ...]'. The
+  owner was just talking with that other session, and your words (written before you
+  knew) followed the announcement. In your next spoken turn, open with ONE sentence that
+  recaps where you left off and your last question (unless the owner's reply already
+  answers it), then carry on.
 """
 
 mcp = MCPServer("algolearn-speak", instructions=_INSTRUCTIONS)
@@ -374,6 +435,13 @@ _QUEUE_NOTE = """
     progress anywhere, this one queues and waits for it to finish, then
     proceeds; it is never rejected. Use `status()` to see what is running and
     how many calls are waiting.
+
+    Switch of session: if the previous audio on the call came from another
+    session (the greeting counts as the calling session's), the daemon first
+    plays a double beep and speaks this project's name, and the result (or the
+    error) starts with the line '[took over the call from "<other project>";
+    the owner heard the switch cue and this project's name first]'. Recap where
+    you left off and your last question in one sentence in your next turn.
 """
 
 
@@ -627,6 +695,7 @@ def main() -> None:
     if not value:
         raise RuntimeError("SPEAK_DAEMON is required (host:port of the speak daemon, e.g. 192.168.86.31:8765)")
     _daemon = proto.parse_address(value)
+    init_identity(os.getcwd())   # the project is the folder Claude Code started this client in
     mcp.run()
 
 

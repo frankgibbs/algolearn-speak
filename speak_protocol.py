@@ -25,11 +25,20 @@ and every tool op whose version is missing or differs (a `value` error telling t
 session to update its client and reconnect /mcp). `status`, `debug` and `set_debug`
 are served to any client and carry the daemon's version in their reply, so an old
 client can still see what is wrong.
+
+Every tool op also carries the client's identity (protocol 3, owner decision 2026-10-20):
+FIELD_SESSION_ID (generated once per client process) and FIELD_PROJECT (the basename of
+the client's working folder). The daemon refuses a tool op whose identity is missing,
+not a string, empty, or (project) has no letter or digit, before the lock, like a
+missing version. A speak/listen/converse reply (success or failure) carries
+REPLY_SWITCHED_FROM, the previous session's project, when the daemon announced a switch
+of session before the op's own audio; when the key is absent there was no switch.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import socket
 import struct
 import time
@@ -40,9 +49,18 @@ MAX_PAYLOAD_BYTES = 1 << 20   # text only crosses the wire
 
 # The wire version. Bump it whenever a request or reply changes in a way an older peer
 # would misread. The unversioned protocol before it counts as 1; 2 is Release 2 of
-# docs/DESIGN_INTERRUPT.md (hold replies, longer speak budgets).
-PROTOCOL_VERSION = 2
+# docs/DESIGN_INTERRUPT.md (hold replies, longer speak budgets); 3 adds the client's
+# identity to every tool op and the session-switch reply field (owner decision 2026-10-20).
+PROTOCOL_VERSION = 3
 FIELD_PROTOCOL = "protocol"
+
+# The client's identity on every tool op, and the session-switch announcement (owner
+# decisions 2026-10-20). When a speak/listen/converse on the connected call comes from
+# another session than the previous audio on that call (the greeting counts as the calling
+# session's), the daemon plays the switch cue and speaks this op's project name first, and
+# the reply carries REPLY_SWITCHED_FROM = the previous session's project.
+FIELD_SESSION_ID, FIELD_PROJECT = "session_id", "project"
+REPLY_SWITCHED_FROM = "switched_from"
 
 # ops
 OP_PING, OP_STATUS, OP_DEBUG, OP_SET_DEBUG = "ping", "status", "debug", "set_debug"
@@ -92,6 +110,13 @@ INTERRUPTION_HOLD_EXPIRED = "hold_expired"
 REPLY_HELD_SECONDS, REPLY_INTERRUPTION = "held_seconds", "interruption"
 
 AUDIO_NOTE = "\n(audio: telegram)"   # ends every speak/listen/converse result and an answered call()
+
+
+def speakable_name(project: str) -> str:
+    """A project (folder) name as it is spoken: every run of characters that are not letters or
+    digits becomes one space ("algolearn-speak" -> "algolearn speak"). "" when nothing is left,
+    which the client refuses at startup and the daemon refuses in a request."""
+    return " ".join(re.sub(r"[\W_]+", " ", project).split())
 
 
 def is_audio_failure(outcome: str) -> bool:

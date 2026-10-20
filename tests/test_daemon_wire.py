@@ -1,5 +1,6 @@
 """The wire between the thin client and a real SpeakDaemon (fake link and engines; no CUDA,
-no Telegram): the protocol version check, and a hold that outlives its client (the client's
+no Telegram): the protocol version check, the client's identity (protocol 3), the
+session-switch announcement end to end, and a hold that outlives its client (the client's
 cancelled tool call closes its socket; the daemon ends the hold and frees the lock).
 """
 
@@ -25,6 +26,9 @@ import speak_server as client  # noqa: E402
 import speak_telegram as tg  # noqa: E402
 import speak_telegram_daemon as d  # noqa: E402
 from test_hold import SETTINGS, FakeEngines  # noqa: E402
+
+ID_A = {proto.FIELD_SESSION_ID: "session-a", proto.FIELD_PROJECT: "algolearn-speak"}
+ID_B = {proto.FIELD_SESSION_ID: "session-b", proto.FIELD_PROJECT: "algolearn-hedge"}
 
 
 class HoldingLink:
@@ -174,7 +178,7 @@ class TestHoldOutlivingItsClient(DaemonCase):
     def test_a_client_that_closes_during_the_hold_frees_the_lock_without_hanging_up(self):
         s = socket.create_connection(self.addr, timeout=10)
         proto.send_msg(s, {"op": proto.OP_SPEAK, proto.FIELD_PROTOCOL: proto.PROTOCOL_VERSION,
-                           "text": "One. Two.", "expect_generation": None})
+                           **ID_A, "text": "One. Two.", "expect_generation": None})
         started, _ = proto.recv_msg(s)
         self.assertEqual(started["phase"], proto.PHASE_STARTED)
         self.assertTrue(self.link.held.wait(5))
@@ -194,7 +198,7 @@ class TestHoldOutlivingItsClient(DaemonCase):
         # On its own thread: anyio.run on the main thread would replace (and orphan, unclosed)
         # the main-thread loop pytgcalls creates at import (pytgcalls/sync.py, get_event_loop).
         got: list[bool] = []
-        with mock.patch.object(client, "_daemon", self.addr):
+        with mock.patch.object(client, "_daemon", self.addr), mock.patch.object(client, "_identity", ID_A):
             t = threading.Thread(target=lambda: got.append(anyio.run(cancelled_converse)))
             t.start()
             t.join(10)
@@ -207,12 +211,172 @@ class TestHoldOutlivingItsClient(DaemonCase):
         s = socket.create_connection(self.addr, timeout=10)
         self.addCleanup(s.close)
         proto.send_msg(s, {"op": proto.OP_SPEAK, proto.FIELD_PROTOCOL: proto.PROTOCOL_VERSION,
-                           "text": "One. Two.", "expect_generation": None})
+                           **ID_A, "text": "One. Two.", "expect_generation": None})
         proto.recv_msg(s)
         self.assertTrue(self.link.held.wait(5))
         time.sleep(0.3)
         self.assertIsNone(self.link.hold_result)
         self.assertTrue(self.daemon.lock.snapshot()[0])
+
+
+class TestIdentity(DaemonCase):
+    """Protocol 3: every tool op names its session and project; a missing, empty or
+    unspeakable one is refused before the lock, as a missing protocol version is."""
+    V = {proto.FIELD_PROTOCOL: proto.PROTOCOL_VERSION}
+
+    def refused(self, header: dict) -> str:
+        reply = self.exchange(header)
+        self.assertIs(reply["ok"], False, header)
+        self.assertEqual(reply["kind"], proto.KIND_VALUE, header)
+        self.assertFalse(self.link.held.is_set())
+        self.assertEqual(self.daemon.lock.snapshot(), (False, None, 0))
+        return reply["error"]
+
+    def test_a_tool_op_without_a_session_id_is_refused_before_the_lock(self):
+        error = self.refused({"op": proto.OP_SPEAK, **self.V, proto.FIELD_PROJECT: "algolearn-speak",
+                              "text": "One.", "expect_generation": None})
+        self.assertEqual(error, f"speak client sent no session_id (got None); every tool op of protocol "
+                                f"{proto.PROTOCOL_VERSION} carries a non-empty session_id and project; "
+                                "update the client (git pull) and reconnect /mcp")
+
+    def test_an_empty_or_missing_project_is_refused(self):
+        for project in ("", "   ", None, 5):
+            header = {"op": proto.OP_CONVERSE, **self.V, proto.FIELD_SESSION_ID: "s", "text": "One.",
+                      "expect_generation": None}
+            if project is not None:
+                header[proto.FIELD_PROJECT] = project
+            self.assertIn("speak client sent no project", self.refused(header), project)
+
+    def test_a_project_with_nothing_to_speak_is_refused(self):
+        error = self.refused({"op": proto.OP_LISTEN, **self.V, proto.FIELD_SESSION_ID: "s",
+                              proto.FIELD_PROJECT: "--", "expect_generation": None})
+        self.assertEqual(error, "project '--' has no letters or digits to speak")
+
+    def test_every_tool_op_needs_it_but_the_quick_ops_do_not(self):
+        for op in proto.LOCKED_OPS:
+            self.assertIn("session_id", self.refused({"op": op, **self.V}), op)
+        self.assertIs(self.exchange({"op": proto.OP_PING, **self.V})["ok"], True)
+
+    def test_the_client_sends_its_identity_on_every_tool_op(self):
+        seen = []
+        real = proto.send_msg
+
+        def spy(sock, header, payload=b""):
+            seen.append(header)
+            return real(sock, header, payload)
+        with mock.patch.object(client, "_daemon", self.addr), mock.patch.object(client, "_identity", ID_A), \
+                mock.patch.object(proto, "send_msg", spy):
+            client._request(proto.OP_PING, {}, 5)
+            client._hang_up_sync()
+        ping, hang_up = (h for h in seen if "op" in h)
+        self.assertNotIn(proto.FIELD_SESSION_ID, ping)
+        self.assertEqual({k: hang_up[k] for k in ID_A}, ID_A)
+
+
+class TurnLink:
+    """A call that plays everything and hears the owner each listen (or nobody, `silent`).
+    call() connects a new generation; every played buffer is logged."""
+
+    def __init__(self) -> None:
+        self._state = tg.NONE
+        self.generation = 0
+        self.log: list = []
+        self.silent = False
+        self.events = tg.CallEventLog()
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def info(self) -> dict:
+        return {"state": self._state, "generation": self.generation, "end_reason": None}
+
+    def state(self) -> str:
+        return self._state
+
+    def record_event(self, event: str, **fields) -> None:
+        self.events.record(None, event, **fields)
+
+    def call(self, audio, rate) -> str:
+        self.generation += 1
+        self._state = tg.CONNECTED
+        self.log.append("greeting")
+        return tg.ANSWERED
+
+    def play(self, audio, rate) -> None:
+        self.log.append(("play", len(audio)))
+
+    def play_watched(self, segments, rate, classify, accept):
+        n = sum(len(a) for _tag, a in segments)
+        self.log.append("speech")
+        return tg.PlayOutcome(None, n, None, n / rate)
+
+    def record(self, max_seconds, silence_seconds, start_timeout_seconds, cue, rate):
+        self.log.append("record")
+        return tg.TIMEOUT if self.silent else np.zeros(16000, dtype=np.float32)
+
+    def hang_up(self) -> str:
+        self._state = tg.NONE
+        return tg.HUNG_UP
+
+
+class TestSessionSwitchOverTheWire(unittest.TestCase):
+    """Two client sessions on one call, through the real daemon and the client's own code."""
+
+    def setUp(self):
+        self.link = TurnLink()
+        self.engines = FakeEngines([])
+        self.daemon = d.SpeakDaemon(self.link, self.engines, SETTINGS, d.DebugControl(), port=0, http_port=0)
+        self.daemon.start()
+        self.addCleanup(self.daemon.stop)
+        p = mock.patch.object(client, "_daemon", ("127.0.0.1", self.daemon._server.server_address[1]))
+        p.start()
+        self.addCleanup(p.stop)
+        self.generation = None
+
+    def as_session(self, ident: dict, fn, *args):
+        """Run a client sync body as one session (its identity and call expectation)."""
+        with mock.patch.object(client, "_identity", ident), mock.patch.object(client, "_call_generation",
+                                                                              ident.get("_expect")):
+            try:
+                return fn(*args)
+            finally:
+                ident["_expect"] = client._call_generation
+
+    def test_the_session_that_called_talks_on_then_another_takes_over(self):
+        a, b = dict(ID_A), dict(ID_B)
+        self.assertTrue(self.as_session(a, client._call_sync, "Hi Frank, it's Angie.", True, 120, 2.0, 45)
+                        .startswith(proto.ANSWERED))
+        self.assertEqual(self.as_session(a, client._converse_sync, "One.", 120, 2.0, 45),
+                         "hi Angie" + proto.AUDIO_NOTE)   # the greeting introduced it: no switch
+        self.assertEqual(self.engines.log.count(("synthesize", "algolearn hedge")), 0)
+        got = self.as_session(b, client._converse_sync, "Two.", 120, 2.0, 45)
+        self.assertEqual(got, '[took over the call from "algolearn-speak"; the owner heard the switch cue and '
+                              "this project's name first]\nhi Angie" + proto.AUDIO_NOTE)
+        self.assertIn(("synthesize", "algolearn hedge"), self.engines.log)
+        self.assertEqual(self.as_session(b, client._speak_sync, "Three."), "spoke for 0.5s" + proto.AUDIO_NOTE)
+        got = self.as_session(a, client._listen_sync, 120, 2.0, 45)
+        self.assertEqual(got, '[took over the call from "algolearn-hedge"; the owner heard the switch cue and '
+                              "this project's name first]\nhi Angie")
+        (first, second) = [e for e in self.link.events.recent(50) if e["event"] == d.SESSION_SWITCH_EVENT]
+        self.assertEqual((first["from_project"], first["to_project"], first["tool"], first["spoken"]),
+                         ("algolearn-speak", "algolearn-hedge", "converse", "algolearn hedge"))
+        self.assertEqual((second["from_project"], second["to_project"], second["tool"]),
+                         ("algolearn-hedge", "algolearn-speak", "listen"))
+
+    def test_a_failure_after_the_announcement_still_says_who_took_over(self):
+        a, b = dict(ID_A), dict(ID_B)
+        self.as_session(a, client._call_sync, "Hi Frank, it's Angie.", True, 120, 2.0, 45)
+        self.link.silent = True
+        with self.assertRaises(TimeoutError) as cm:
+            self.as_session(b, client._listen_sync, 120, 2.0, 45)
+        self.assertEqual(str(cm.exception), '[took over the call from "algolearn-speak"; the owner heard the switch '
+                                            "cue and this project's name first]\nno speech detected within 45s")
+        with self.assertRaises(TimeoutError) as cm:   # the owner already heard it: no second announcement
+            self.as_session(b, client._listen_sync, 120, 2.0, 45)
+        self.assertEqual(str(cm.exception), "no speech detected within 45s")
 
 
 class TestAbort(unittest.TestCase):

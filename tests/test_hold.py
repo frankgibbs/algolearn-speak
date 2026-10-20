@@ -368,6 +368,11 @@ class FakeEngines:
                 self.log.append(("synth", i))
                 yield i, np.full(RATE // 2, 0.1, dtype=np.float32)
 
+    def synthesize(self, text: str) -> np.ndarray:
+        """Whole synthesis (the greeting, a switch announcement): 7 s, over the opener minimum."""
+        self.log.append(("synthesize", text))
+        return np.zeros(RATE * 7, dtype=np.float32)
+
     def transcribe(self, audio: np.ndarray) -> str:
         self.log.append(("transcribe",))
         return self.heard
@@ -448,7 +453,7 @@ class HoldServiceCase(unittest.TestCase):
         self.engines = FakeEngines(self.log)
         self.link = ScriptedLink(self.log, self.clock)
         self.svc = d.SpeakService(self.link, self.engines, SETTINGS)
-        self.sess = d.Session(None)
+        self.sess = d.Session(None, d.Speaker("s-test", "algolearn-speak"))
 
     def plays(self):
         return [e[1] for e in self.log if e[0] == "play"]

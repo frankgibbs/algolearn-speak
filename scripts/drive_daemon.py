@@ -1,8 +1,9 @@
 """Drive the speak daemon over TCP without MCP: the same request code the thin client's
 tools run (speak_server's sync bodies), so a new daemon can be tried without an MCP reconnect.
 
-Steps run in order in one process, so the session's call expectation carries from one step
-to the next, as it does in a Claude Code session. Each step prints its result or its error;
+Steps run in order in one process, so the session's call expectation and identity (session
+id, project = the working folder's name) carry from one step to the next, as they do in a
+Claude Code session. Each step prints its result or its error;
 the first error stops the run.
 
     .venv/bin/python scripts/drive_daemon.py --daemon 192.168.86.31:8765 status
@@ -61,6 +62,7 @@ def main() -> int:
     parser.add_argument("steps", nargs="+")
     args = parser.parse_args()
     client._daemon = proto.parse_address(args.daemon)
+    client.init_identity(os.getcwd())   # as the MCP client does: the project is the working folder
     steps, i = [], 0
     while i < len(args.steps):
         step = args.steps[i]

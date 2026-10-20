@@ -339,6 +339,15 @@ depend on the transport. It moves to `speak_protocol.py` unchanged, and
   `protocol` = `PROTOCOL_VERSION`; the daemon refuses `ping` and tool ops
   with a missing or different version and serves `status`, `debug` and
   `set_debug` to any client (CLAUDE.md, Protocol).
+- **Identity and the switch of session (protocol 3, owner decisions
+  2026-10-20):** every tool op also carries `session_id` (generated once per
+  client process) and `project` (the basename of the client's working folder
+  at startup); a missing or empty one is refused before the lock like a
+  missing version. The daemon keeps the last session that played audio on
+  the current call; a `speak`, `listen` or `converse` from another session
+  is preceded by a two-beep switch cue and the project name, spoken, and its
+  reply carries `switched_from`. The call's caller is its first turn, and a
+  new call starts fresh. CLAUDE.md, "Switch of session", has the rules.
 
 ### 4.3 The audio lock lives in the daemon
 
