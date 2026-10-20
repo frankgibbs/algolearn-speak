@@ -363,8 +363,9 @@ class TestSessionSwitchOverTheWire(unittest.TestCase):
         (first, second) = [e for e in self.link.events.recent(50) if e["event"] == d.SESSION_SWITCH_EVENT]
         self.assertEqual((first["from_project"], first["to_project"], first["tool"], first["spoken"]),
                          ("algolearn-speak", "algolearn-hedge", "converse", "algolearn hedge"))
-        self.assertEqual((second["from_project"], second["to_project"], second["tool"]),
-                         ("algolearn-hedge", "algolearn-speak", "listen"))
+        self.assertEqual((second["from_project"], second["to_project"], second["tool"], second["spoken"]),
+                         ("algolearn-hedge", "algolearn-speak", "listen", "algolearn speak, still listening"))
+        self.assertIn(("synthesize", "algolearn speak, still listening"), self.engines.log)
 
     def test_a_failure_after_the_announcement_still_says_who_took_over(self):
         a, b = dict(ID_A), dict(ID_B)

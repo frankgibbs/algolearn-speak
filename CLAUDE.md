@@ -33,7 +33,7 @@ owner and hold a spoken conversation.
 | Tool | What it does |
 |---|---|
 | `speak(text)` | The daemon synthesizes `text` with Kokoro-82M one segment (a sentence) at a time and plays each into the connected call as soon as it is made, synthesizing the next while earlier ones play (owner decision 2026-10-16). Returns once all of it has played, with the spoken duration. While it plays the owner can hold it (see "Hold on / continue" below): `[held Ns, then resumed]` on its own line comes first when it was held; an expired hold returns the expired form instead. A `[took over the call from "<project>"; ...]` line comes before all of that when this session took the call over (see "Switch of session" below). |
-| `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep (the ear is open), then records the owner's call audio until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech), then Whisper large-v3-turbo transcribes. Once text is in hand, a rising two-note chime tells the owner their words were captured (owner decision 2026-10-16). No ear-closed beep and no spoken acknowledgement. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. After a switch of session the switch cue and the project name come before the ear-open beep, and the result (or the `TimeoutError` message) starts with the `[took over the call from ...]` line. |
+| `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep (the ear is open), then records the owner's call audio until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech), then Whisper large-v3-turbo transcribes. Once text is in hand, a rising two-note chime tells the owner their words were captured (owner decision 2026-10-16). No ear-closed beep and no spoken acknowledgement. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. After a switch of session the switch cue and "<project name>, still listening" come before the ear-open beep, and the result (or the `TimeoutError` message) starts with the `[took over the call from ...]` line. |
 | `converse(text, ...)` | `speak` then `listen` under one lock hold. Returns the user's words, after a `[held Ns, then resumed]` line when the speech was held. After an expired hold it does not listen and returns the expired form. The `[took over the call from ...]` line comes first after a switch of session. |
 | `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is the whole opening, spoken the moment they answer: who is calling, why, and the context, ending with a question or invitation. It must be at least 6 s when spoken (measured on the synthesized audio); a shorter one raises `ValueError` BEFORE dialing (phone never rings; owner decision 2026-10-12) telling the model to add the context of why it is calling, or, on a fresh conversation with nothing to report, to open with something playful (a joke, something funny or flirty). Never padded. Once answered, `call` immediately does the `listen` (ear-open beep, VAD, Whisper, rising chime) under the same lock hold and returns the owner's words; listen parameters and defaults match `converse`, and a listen timeout or a drop raises as in `listen` (the call stays connected on a timeout). Returns `answered\n<their words>\n(audio: telegram)`, `already connected` (greeting not spoken, no listen), `not answered (declined or no answer)`, `busy (the owner's Telegram reports a call in progress)` (Telegram discarded it as busy; the phone did not ring), `answered, then hung up during the greeting` (the owner picked up and ended it before the greeting finished; one call back right away is allowed, then the one-hour rule), `hung up` (another session's `hang_up` ended it during the greeting), `answered but audio failed to connect: <error>` (the owner picked up but media failed; the daemon container restarts itself) or `not called: quiet hours (...)`. Check order: quiet hours, already connected, then the greeting length, then the wait until 10 s have passed since the last call ended, then the dial. |
 | `hang_up()` | End that call (only when the owner asks). Always clears the session's call expectation. |
@@ -94,7 +94,9 @@ been run.
 
 ## Switch of session (owner decisions 2026-10-20)
 
-Built in the working tree, not deployed; no live call has been made with it.
+Deployed in commit 84c2740 and tested live on 2026-10-20 (the bare-listen
+finding below came from that test). The bare-listen "still listening"
+announcement is built in the working tree, not deployed yet.
 
 - **The daemon announces the switch, not the agents.** Every client sends a
   session id (`secrets.token_hex(8)`, generated once per client process,
@@ -105,9 +107,17 @@ Built in the working tree, not deployed; no live call has been made with it.
   the previous audio op on the same call is preceded by the switch cue (two
   short 523 Hz beeps, `switch_pcm` in `speak_tone.py`) and then the project
   name made speakable (`speakable_name`: runs of non-alphanumerics become one
-  space, so `algolearn-speak` is spoken "algolearn speak"). Nothing else is
-  said. The announcement is synthesized whole and played as one plain play:
-  like the greeting and the cues, it cannot be held.
+  space, so `algolearn-speak` is spoken "algolearn speak"). For a `speak` or
+  `converse` nothing else is said. The announcement is synthesized whole and
+  played as one plain play: like the greeting and the cues, it cannot be held.
+- **A bare `listen` (owner decision 2026-10-20):** when the op that causes
+  the switch is `listen`, the announcement after the cue is "<speakable
+  project name>, still listening" (`SWITCH_LISTEN_SUFFIX` in
+  `speak_telegram_daemon.py`), still one clip synthesized whole, then the ear
+  opens as usual. The live test that led to it: a session waiting in a bare
+  `listen` got the turn after another session's converse, and the owner heard
+  a name with no context before the ear-open beep. `speak` and `converse`
+  switches are unchanged. Daemon only: no protocol change.
 - **What "previous" means (the turn):** the daemon keeps one turn, the call's
   key (`"<boot id>:<generation>"`) and the last session that played audio on
   it. An answered `call` makes the calling session the call's first turn (its
@@ -129,9 +139,12 @@ Built in the working tree, not deployed; no live call has been made with it.
   heard another project; open the next turn with one sentence recapping where
   you left off and your last question, unless his reply already answers it.
 - Event (`call_debug`): `session_switch` (`tool`, `from_project`,
-  `to_project`, `spoken`, `announce_s`).
+  `to_project`, `spoken` (the full text spoken, the "still listening" suffix
+  included), `announce_s`).
 - The client adds `10 + len(project)/5` s to the speak, listen and converse
-  budgets for the announcement.
+  budgets for the announcement; that covers the longer listen announcement
+  too (about 3 s of audio for `algolearn-speak` against 13 s added, on top of
+  the listen budget's own 60 s margin).
 
 Without a connected call, `speak`/`listen`/`converse` raise `<tool> needs a
 connected Telegram call (call state is ...); place one with the call tool`.

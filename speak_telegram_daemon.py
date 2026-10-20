@@ -81,6 +81,9 @@ BIND_HOST = "0.0.0.0"   # open to the LAN by design (owner decision 4); no auth,
 WHISPER_HTTP_PORT = 9000   # the retired whisper-service's port, so its clients need no change
 TRANSCRIBE_TOOL = "transcribe"   # how status names an HTTP transcription holding the audio lock
 SESSION_SWITCH_EVENT = "session_switch"   # call_debug: a switch of session was announced on the call
+# A switch caused by a bare listen says this after the project name (owner decision 2026-10-20):
+# the ear opens right after, so a name alone would give the owner no context.
+SWITCH_LISTEN_SUFFIX = ", still listening"
 MAX_TRANSCRIBE_SECONDS = 15 * 60   # owner decision 2026-10-16: the longest audio port 9000 accepts
 MAX_BODY_BYTES = MAX_TRANSCRIBE_SECONDS * STT_RATE * np.dtype(np.int16).itemsize   # 28,800,000: mono int16 PCM
 # Port 9000's per-recv socket timeout. A LAN upload's gaps are milliseconds, and the
@@ -414,19 +417,22 @@ class SpeakService:
     def _take_turn(self, sess: Session, tool: str) -> None:
         """Before a speak/listen/converse plays anything: when the previous audio on this call
         came from another session, announce the switch (the switch cue, then this session's
-        project name, spoken), record SESSION_SWITCH_EVENT and set sess.switched_from to the
-        previous session's project. The first audio on a call from the session that placed it
-        is not a switch (call() makes it the call's first turn). The announcement is one plain
-        play, like the greeting and the cues: it cannot be held. A call that drops during it
+        project name, spoken; for a bare listen "<name>, still listening"), record
+        SESSION_SWITCH_EVENT and set sess.switched_from to the previous session's project. The
+        first audio on a call from the session that placed it is not a switch (call() makes it
+        the call's first turn). The announcement is one plain play, like the greeting and the
+        cues: it cannot be held. A call that drops during it
         raises "call ended" and leaves the turn unchanged."""
         key = self.key(self.link.info()["generation"])
         previous = self._turn
         if previous is not None and previous[0] == key and previous[1].session_id != sess.speaker.session_id:
-            name = proto.speakable_name(sess.speaker.project)
-            audio = np.concatenate([switch_pcm(), self.engines.synthesize(name)])
+            spoken = proto.speakable_name(sess.speaker.project)
+            if tool == "listen":
+                spoken += SWITCH_LISTEN_SUFFIX
+            audio = np.concatenate([switch_pcm(), self.engines.synthesize(spoken)])
             self.guard_call(sess, tool, lambda: self.link.play(audio, TTS_RATE))
             self.link.record_event(SESSION_SWITCH_EVENT, tool=tool, from_project=previous[1].project,
-                                   to_project=sess.speaker.project, spoken=name,
+                                   to_project=sess.speaker.project, spoken=spoken,
                                    announce_s=round(len(audio) / TTS_RATE, 2))
             log.info("%s: session switch on call %s, %r -> %r announced", tool, key, previous[1].project,
                      sess.speaker.project)

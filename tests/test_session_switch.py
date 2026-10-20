@@ -125,7 +125,18 @@ class TestSwitch(SwitchCase):
         self.assertEqual(s.switched_from, "algolearn-speak")
         kinds = [e[0] for e in self.log]
         self.assertLess(kinds.index("cue"), kinds.index("record"))
-        self.assertEqual(self.switches()[0]["tool"], "listen")
+        # owner decision 2026-10-20: a bare listen says it is still listening after the name
+        self.assertEqual(self.announcements(), ["algolearn hedge, still listening"])
+        (event,) = self.switches()
+        self.assertEqual((event["tool"], event["spoken"]), ("listen", "algolearn hedge, still listening"))
+
+    def test_speak_and_converse_switches_say_only_the_name(self):
+        self.placed_by(A)
+        self.svc.converse(self.req_sess(B), self.TEXT, 120, 2.0, 45, NEVER_LEFT)
+        self.svc.speak(self.req_sess(A), self.TEXT, NEVER_LEFT)
+        self.assertEqual(self.announcements(), ["algolearn hedge", "algolearn speak"])
+        self.assertEqual([(e["tool"], e["spoken"]) for e in self.switches()],
+                         [("converse", "algolearn hedge"), ("speak", "algolearn speak")])
 
     def test_a_new_call_starts_fresh(self):
         self.placed_by(A)
