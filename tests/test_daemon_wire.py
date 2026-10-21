@@ -31,6 +31,12 @@ ID_A = {proto.FIELD_SESSION_ID: "session-a", proto.FIELD_PROJECT: "algolearn-spe
 ID_B = {proto.FIELD_SESSION_ID: "session-b", proto.FIELD_PROJECT: "algolearn-hedge"}
 
 
+def short_floor(daemon: d.SpeakDaemon, link, idle_seconds: float) -> None:
+    """Before start(): the daemon's lock (and its service's) with a floor idle time of
+    `idle_seconds` instead of FLOOR_IDLE_SECONDS, so a test does not wait 45 s for a lapse."""
+    daemon.lock = daemon.service.lock = d.AudioLock(link.record_event, idle_seconds=idle_seconds)
+
+
 class HoldingLink:
     """A connected call. play_watched is cut by "hold on" in its first segment; watch_for
     then holds until the request's client leaves (or 10 s, which fails the test)."""
@@ -329,6 +335,7 @@ class TestSessionSwitchOverTheWire(unittest.TestCase):
         self.link = TurnLink()
         self.engines = FakeEngines([])
         self.daemon = d.SpeakDaemon(self.link, self.engines, SETTINGS, d.DebugControl(), port=0, http_port=0)
+        short_floor(self.daemon, self.link, 0.2)   # B's ops wait out A's floor (docs/DESIGN_FLOOR.md)
         self.daemon.start()
         self.addCleanup(self.daemon.stop)
         p = mock.patch.object(client, "_daemon", ("127.0.0.1", self.daemon._server.server_address[1]))

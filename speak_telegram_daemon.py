@@ -81,6 +81,11 @@ BIND_HOST = "0.0.0.0"   # open to the LAN by design (owner decision 4); no auth,
 WHISPER_HTTP_PORT = 9000   # the retired whisper-service's port, so its clients need no change
 TRANSCRIBE_TOOL = "transcribe"   # how status names an HTTP transcription holding the audio lock
 SESSION_SWITCH_EVENT = "session_switch"   # call_debug: a switch of session was announced on the call
+# The floor (docs/DESIGN_FLOOR.md, owner decisions 2026-10-20): call_debug events and the
+# floor_release reasons.
+FLOOR_TAKE_EVENT, FLOOR_RELEASE_EVENT = "floor_take", "floor_release"
+FLOOR_SPEAK, FLOOR_IDLE, FLOOR_HANG_UP = "speak", "idle", "hang_up"
+FLOOR_HOLD_EXPIRED, FLOOR_CLIENT_LEFT = "hold_expired", "client_left"
 # A switch caused by a bare listen says this after the project name (owner decision 2026-10-20):
 # the ear opens right after, so a name alone would give the owner no context.
 SWITCH_LISTEN_SUFFIX = ", still listening"
@@ -227,36 +232,156 @@ class DebugControl:
 
 # ------------------------------------------------------------------ the audio lock
 
-class AudioLock:
-    """FIFO ticket lock (design section 4.3): every tool op from every session on every
-    computer queues here, in arrival order, and never gets rejected."""
+class _Ticket:
+    """One queued acquire: the session id of its op, or None for an HTTP transcription.
+    Compared by identity (deque.remove)."""
 
-    def __init__(self) -> None:
+    __slots__ = ("session_id",)
+
+    def __init__(self, session_id: str | None) -> None:
+        self.session_id = session_id
+
+
+class AudioLock:
+    """Ticket lock (design section 4.3): every tool op from every session on every computer
+    queues here and never gets rejected, with the floor (docs/DESIGN_FLOOR.md, owner
+    decisions 2026-10-20). The session that last played audio on the call holds the floor;
+    while the floor is live, the free lock goes only to its ops (and to HTTP transcriptions,
+    which carry no session), in arrival order; every other session keeps waiting. Without a
+    live floor: plain FIFO. The floor lapses `idle_seconds` after the holder's last op
+    released the lock; no timer thread: a waiter that is not eligible waits until that
+    deadline, and the first thread that finds it past records the lapse and wakes the rest.
+    `record_event` is the call's event log (link.record_event): FLOOR_TAKE_EVENT and
+    FLOOR_RELEASE_EVENT."""
+
+    def __init__(self, record_event: Callable[..., None], idle_seconds: float = proto.FLOOR_IDLE_SECONDS) -> None:
         self._cond = threading.Condition()
-        self._queue: deque[object] = deque()
+        self._queue: deque[_Ticket] = deque()
         self._held = False
         self._current: str | None = None
+        self._record_event = record_event
+        self._idle_seconds = idle_seconds
+        self._floor: Speaker | None = None
+        self._floor_since = 0.0
+        self._idle_deadline: float | None = None   # None while the holder's op runs
+        self._current_session: str | None = None   # the session of the op holding the lock
+        self._closed = False   # close(): the daemon is going away, plain FIFO from then on
 
-    def acquire(self, tool: str, peer: str) -> None:
-        ticket = object()
+    def acquire(self, tool: str, peer: str, speaker: Speaker | None) -> None:
+        """`speaker` is the tool op's validated identity; None only for an HTTP transcription
+        (owner decision 8: it skips the floor and waits only for the op holding the lock)."""
+        ticket = _Ticket(None if speaker is None else speaker.session_id)
         with self._cond:
+            self._lapse_if_due()
             self._queue.append(ticket)
-            self._cond.wait_for(lambda: not self._held and self._queue[0] is ticket)
-            self._queue.popleft()
+            if self._floor is not None and ticket.session_id == self._floor.session_id:
+                # The holder is active from the moment its op arrives, not when it gets the
+                # lock: an op holding the lock past the deadline (a long transcription) must
+                # not let the floor lapse under the holder's queued op.
+                self._idle_deadline = None
+            try:
+                while True:
+                    self._lapse_if_due()
+                    if not self._held and self._first_eligible() is ticket:
+                        break
+                    if self._floor is not None and self._idle_deadline is not None:
+                        self._cond.wait(self._idle_deadline - time.monotonic())
+                    else:
+                        self._cond.wait()
+            except BaseException:
+                self._queue.remove(ticket)   # never strand a ticket that would block the queue
+                floor = self._floor
+                if (floor is not None and ticket.session_id == floor.session_id
+                        and self._current_session != floor.session_id
+                        and not any(t.session_id == floor.session_id for t in self._queue)):
+                    # Its arrival stopped the idle count; with no other op of the holder's
+                    # queued or running, nothing would restart it and the floor would stick.
+                    self._idle_deadline = time.monotonic() + self._idle_seconds
+                self._cond.notify_all()
+                raise
+            self._queue.remove(ticket)
             self._held = True
             self._current = f"{tool} ({peer})"
+            self._current_session = ticket.session_id
+            if self._floor is not None and ticket.session_id == self._floor.session_id:
+                self._idle_deadline = None   # the holder is active again
 
     def release(self) -> None:
+        """The holder's op releasing starts the idle count; a transcription's (no session)
+        or another session's leaves the deadline as it was."""
         with self._cond:
             if not self._held:
                 raise RuntimeError("audio lock released while not held")
+            if self._floor is not None and self._current_session == self._floor.session_id:
+                self._idle_deadline = time.monotonic() + self._idle_seconds
             self._held = False
             self._current = None
+            self._current_session = None
+            self._cond.notify_all()
+
+    def take_floor(self, speaker: Speaker) -> None:
+        """The session that just played audio on the call (SpeakService._take_turn, an
+        answered call) holds the floor. By the current holder: no change, no event. Only the
+        op holding the lock may take it, as `speaker`."""
+        with self._cond:
+            if not self._held or self._current_session != speaker.session_id:
+                raise RuntimeError(f"take_floor by {speaker.project!r} without holding the audio lock as that session")
+            self._lapse_if_due()
+            if self._floor is not None and self._floor.session_id == speaker.session_id:
+                return
+            previous = self._floor
+            self._floor = speaker
+            self._floor_since = time.monotonic()
+            self._idle_deadline = None
+            self._record_event(FLOOR_TAKE_EVENT, project=speaker.project,
+                               from_project=None if previous is None else previous.project)
+            log.info("floor: %r takes it (from %r)", speaker.project, None if previous is None else previous.project)
+
+    def yield_floor(self, speaker: Speaker, reason: str) -> None:
+        """Clears the floor when `speaker` holds it; the release() that follows then wakes
+        the queue in plain FIFO order. Not the holder (or no floor): nothing to yield."""
+        with self._cond:
+            if self._floor is None or self._floor.session_id != speaker.session_id:
+                return
+            self._clear_floor(reason)
+
+    def close(self) -> None:
+        """The daemon is restarting or stopping: the floor no longer orders the queue, so
+        every queued op reaches the lock in arrival order and gets the "restarting" refusal
+        at once instead of waiting out the idle time. No floor event: nothing yields it."""
+        with self._cond:
+            self._closed = True
             self._cond.notify_all()
 
     def snapshot(self) -> tuple[bool, str | None, int]:
         with self._cond:
             return self._held, self._current, len(self._queue)
+
+    # -- under self._cond
+
+    def _first_eligible(self) -> _Ticket | None:
+        """The first ticket that may take the free lock: with a live floor, the holder's own
+        and every transcription's; without one, or once closed, the head of the queue."""
+        for ticket in self._queue:
+            if self._closed or self._floor is None or ticket.session_id is None or ticket.session_id == self._floor.session_id:
+                return ticket
+        return None
+
+    def _lapse_if_due(self) -> None:
+        """A floor past its idle deadline lapses here, observed by whichever thread looks
+        first (a waiter woken by its timed wait, a later acquire or take_floor)."""
+        if (self._floor is not None and self._idle_deadline is not None
+                and time.monotonic() >= self._idle_deadline):
+            self._clear_floor(FLOOR_IDLE)
+            self._cond.notify_all()
+
+    def _clear_floor(self, reason: str) -> None:
+        floor = self._floor
+        self._floor = None
+        self._idle_deadline = None
+        self._record_event(FLOOR_RELEASE_EVENT, project=floor.project, reason=reason,
+                           held_s=round(time.monotonic() - self._floor_since, 1), waiting=len(self._queue))
+        log.info("floor: %r releases it (%s), %d waiting", floor.project, reason, len(self._queue))
 
 
 # ------------------------------------------------------------------ the tools
@@ -341,11 +466,13 @@ class _Segments:
 
 class SpeakService:
     """The tool logic moved from speak_server.py, now calling TelegramLink directly.
-    Every method runs with the audio lock held."""
+    Every method runs with the audio lock held; `lock` is that AudioLock, for the floor
+    (take_floor where the turn moves, yield_floor where an op gives the floor up)."""
 
-    def __init__(self, link, engines: Engines, settings: dict) -> None:
+    def __init__(self, link, engines: Engines, settings: dict, lock: AudioLock) -> None:
         self.link = link
         self.engines = engines
+        self.lock = lock
         self.quiet_hours = settings["SPEAK_QUIET_HOURS"]
         self.quiet_window = settings["quiet_window"]
         self.tz = settings["tz"]
@@ -438,6 +565,7 @@ class SpeakService:
                      sess.speaker.project)
             sess.switched_from = previous[1].project
         self._turn = (key, sess.speaker)
+        self.lock.take_floor(sess.speaker)   # the floor moves with the turn
 
     # -- audio
 
@@ -458,7 +586,7 @@ class SpeakService:
         text = self.engines.transcribe(audio)
         return tg.Classified(self.phrases.get(normalize_phrase(text)), text)
 
-    def _speak(self, text: str, client_left: Callable[[], bool]) -> Spoken:
+    def _speak(self, speaker: Speaker, text: str, client_left: Callable[[], bool]) -> Spoken:
         """Stream it: the first Kokoro segment starts playing as soon as it is synthesized,
         and the rest are synthesized while earlier ones play (owner decision 2026-10-16,
         docs/DESIGN_STREAMED_SPEECH.md). While it plays, the owner's audio is watched for
@@ -486,7 +614,7 @@ class SpeakService:
             got = self.link.watch_for(proto.HOLD_MAX_SECONDS - held, self.classify, proto.CMD_RESUME, client_left)
             held += time.monotonic() - t0
             if got is tg.CLIENT_LEFT:
-                self._client_left_during_hold(held)
+                self._client_left_during_hold(speaker, held)
             if got is tg.TIMEOUT:
                 return Spoken(seconds, held, {
                     "command": proto.INTERRUPTION_HOLD_EXPIRED, "cut_index": cut + 1,
@@ -503,11 +631,13 @@ class SpeakService:
             raise ValueError("speak() called with empty text")
         return text
 
-    def _client_left_during_hold(self, held: float) -> None:
+    def _client_left_during_hold(self, speaker: Speaker, held: float) -> None:
         """The request's client went away while Angie was held (its tool call was cancelled
         or its session closed): nobody waits for the reply, so the hold ends now and the lock
         goes to the next request (the handler releases it when this raises). Owner decision
-        2026-10-16: the call is NOT hung up; it stays connected."""
+        2026-10-16: the call is NOT hung up; it stays connected. Owner decision 2026-10-20:
+        the floor is released at once (FLOOR_CLIENT_LEFT), so the head of the queue goes."""
+        self.lock.yield_floor(speaker, FLOOR_CLIENT_LEFT)
         log.warning("the client left during a hold (held %.1fs); ending the hold, the call stays up", held)
         raise RuntimeError(f"the client left during a hold after {held:.0f}s; the hold was ended")
 
@@ -515,7 +645,8 @@ class SpeakService:
         """Owner decision 2026-10-16: a hold that reaches HOLD_MAX_SECONDS ends the call. The
         reply says so and carries the unspoken text; the session expects no call afterwards
         (this is not a drop to call back on). If the hang-up itself fails, that failure is
-        recorded (hold_expire_hangup_failed) and raised, and the call may still be up."""
+        recorded (hold_expire_hangup_failed) and raised, and the call may still be up. Either
+        way the floor is released (FLOOR_HOLD_EXPIRED, owner decision 2026-10-20)."""
         log.info("%s: hold expired after %.0fs; hanging up", tool, spoken.held_seconds)
         try:
             self.link.hang_up()
@@ -524,6 +655,7 @@ class SpeakService:
             raise
         finally:
             sess.expect(None)
+            self.lock.yield_floor(sess.speaker, FLOOR_HOLD_EXPIRED)
         return {**reply, proto.REPLY_HELD_SECONDS: round(spoken.held_seconds, 1),
                 proto.REPLY_INTERRUPTION: spoken.interruption}
 
@@ -557,11 +689,22 @@ class SpeakService:
         self.require_call(sess, "speak")
         self._spoken_text(text)
         self._take_turn(sess, "speak")
-        spoken = self.guard_call(sess, "speak", lambda: self._speak(text, client_left))
-        reply = {"seconds": round(spoken.seconds, 3)}
-        if spoken.interruption is not None:
-            return self._hold_expired(sess, "speak", spoken, reply)
-        return {**reply, proto.REPLY_HELD_SECONDS: round(spoken.held_seconds, 1)}
+        # Owner decision 2026-10-20: a speak gives up the floor when it ends, however it ends,
+        # except when the call ended under it: then the floor stays with this session for the
+        # idle window, so it can call back first.
+        call_ended = False
+        try:
+            spoken = self.guard_call(sess, "speak", lambda: self._speak(sess.speaker, text, client_left))
+            reply = {"seconds": round(spoken.seconds, 3)}
+            if spoken.interruption is not None:
+                return self._hold_expired(sess, "speak", spoken, reply)
+            return {**reply, proto.REPLY_HELD_SECONDS: round(spoken.held_seconds, 1)}
+        except CallEndedError:
+            call_ended = True
+            raise
+        finally:
+            if not call_ended:
+                self.lock.yield_floor(sess.speaker, FLOOR_SPEAK)
 
     def listen(self, sess: Session, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> dict:
         self.require_call(sess, "listen")
@@ -578,7 +721,7 @@ class SpeakService:
         box: dict[str, Spoken] = {}
 
         def round_trip() -> str | None:
-            box["spoken"] = spoken = self._speak(text, client_left)
+            box["spoken"] = spoken = self._speak(sess.speaker, text, client_left)
             if spoken.interruption is not None:
                 return None   # owner decision 2026-10-16: no listen after an expired hold
             return self._listen(max_seconds, silence_seconds, start_timeout_seconds)
@@ -622,6 +765,7 @@ class SpeakService:
             return {"outcome": outcome}
         # The greeting is this call's first turn: the caller's next speak is not a switch.
         self._turn = (self.key(self.link.info()["generation"]), sess.speaker)
+        self.lock.take_floor(sess.speaker)   # owner decision 2026-10-20: an answered call gives the caller the floor
         # Answered: the greeting has played; listen for the owner's reply under the same lock
         # hold (as converse does) so no other session slips in between. A listen timeout or a
         # drop raises, exactly as in listen; on a timeout the call stays connected.
@@ -634,6 +778,7 @@ class SpeakService:
             return {"outcome": self.link.hang_up()}
         finally:
             sess.expect(None)   # the owner asked to hang up: never a call-back, even if this raised
+            self.lock.yield_floor(sess.speaker, FLOOR_HANG_UP)   # a deliberate end (owner decision 2026-10-20)
 
 
 # ------------------------------------------------------------------ request validation
@@ -749,7 +894,7 @@ class _Handler(socketserver.BaseRequestHandler):
             self._send(peer, _error_reply(ValueError(f"unknown op {op!r}")))
             return
         restart_reason: str | None = None
-        daemon.lock.acquire(op, peer)
+        daemon.lock.acquire(op, peer, _speaker(req))   # validated above; the floor orders the queue by it
         try:
             if _peer_left(self.request):
                 log.warning("%s from %s: the client left while queued; skipped", op, peer)
@@ -768,6 +913,7 @@ class _Handler(socketserver.BaseRequestHandler):
                 if op == proto.OP_CALL and reply.get("ok") and proto.is_audio_failure(reply["outcome"]):
                     restart_reason = reply["outcome"]
                     daemon.closing.set()   # before the release: no queued op reaches the link
+                    daemon.lock.close()    # and every queued op reaches its refusal at once
         finally:
             daemon.lock.release()
         self._send(peer, reply)
@@ -989,8 +1135,8 @@ class SpeakDaemon:
     def __init__(self, link, engines: Engines, settings: dict, debug: DebugControl, port: int = proto.DAEMON_PORT,
                  on_restart: Callable[[str], None] | None = None, http_port: int = WHISPER_HTTP_PORT) -> None:
         self.link = link
-        self.service = SpeakService(link, engines, settings)
-        self.lock = AudioLock()
+        self.lock = AudioLock(link.record_event)
+        self.service = SpeakService(link, engines, settings, self.lock)
         self.port = port
         self.http_port = http_port
         self.on_restart = on_restart   # main(): exit 1 so compose restarts the container
@@ -1028,7 +1174,7 @@ class SpeakDaemon:
         at EOF; httpx does not pipeline, so nothing else is readable) raises ClientLeft, and
         a restart or stop under way raises DaemonClosing; neither runs inference."""
         audio = np.frombuffer(body, dtype=np.int16).astype(np.float32) / 32768.0
-        self.lock.acquire(TRANSCRIBE_TOOL, peer)
+        self.lock.acquire(TRANSCRIBE_TOOL, peer, None)   # no session: skips the floor (owner decision 8)
         try:
             if _peer_left(sock):
                 raise ClientLeft(f"http transcribe from {peer}: the client left while queued")
@@ -1103,6 +1249,7 @@ class SpeakDaemon:
 
     def stop(self) -> None:
         self.closing.set()
+        self.lock.close()
         for server in (self._server, self._http):
             if server is not None:
                 server.shutdown()

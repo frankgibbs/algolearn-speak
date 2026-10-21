@@ -441,6 +441,40 @@ class ScriptedLink:
         return tg.HUNG_UP
 
 
+class ServiceLock(d.AudioLock):
+    """The service tests' audio lock: plain FIFO, the floor never orders it. They run one op
+    at a time, some as a session that would wait out another's floor in the daemon; the
+    floor's ordering is AudioLock's own tests' (test_floor). The floor's state and events
+    are the real ones."""
+
+    def _first_eligible(self):
+        return self._queue[0] if self._queue else None
+
+
+class LockedService(d.SpeakService):
+    """SpeakService whose tool ops run under the audio lock as their request's session, as
+    the daemon's handler runs them (AudioLock.take_floor refuses a session without it)."""
+
+
+def _locked(name: str):
+    def op(self, sess, *args, **kwargs):
+        self.lock.acquire(name, "test", sess.speaker)
+        try:
+            return getattr(d.SpeakService, name)(self, sess, *args, **kwargs)
+        finally:
+            self.lock.release()
+    op.__name__ = name
+    return op
+
+
+for _name in ("speak", "listen", "converse", "call", "hang_up"):
+    setattr(LockedService, _name, _locked(_name))
+
+
+def locked_service(link, engines, settings: dict, record_event) -> LockedService:
+    return LockedService(link, engines, settings, ServiceLock(record_event))
+
+
 class HoldServiceCase(unittest.TestCase):
     TEXT = "One. Two. Three."
 
@@ -452,7 +486,7 @@ class HoldServiceCase(unittest.TestCase):
         self.addCleanup(p.stop)
         self.engines = FakeEngines(self.log)
         self.link = ScriptedLink(self.log, self.clock)
-        self.svc = d.SpeakService(self.link, self.engines, SETTINGS)
+        self.svc = locked_service(self.link, self.engines, SETTINGS, self.link.record_event)
         self.sess = d.Session(None, d.Speaker("s-test", "algolearn-speak"))
 
     def plays(self):
@@ -513,8 +547,9 @@ class TestHoldLoop(HoldServiceCase):
         self.link.fail_hang_up = RuntimeError("leave_call failed")
         with self.assertRaisesRegex(RuntimeError, "leave_call failed"):
             self.svc.speak(self.sess, self.TEXT, NEVER_LEFT)
-        self.assertEqual(self.link.events, [("hold_expire_hangup_failed",
-                                             {"tool": "speak", "error": "RuntimeError: leave_call failed"})])
+        events = [e for e in self.link.events if e[0] not in (d.FLOOR_TAKE_EVENT, d.FLOOR_RELEASE_EVENT)]
+        self.assertEqual(events, [("hold_expire_hangup_failed",
+                                   {"tool": "speak", "error": "RuntimeError: leave_call failed"})])
         self.assertTrue(self.sess.changed)
         self.assertIsNone(self.sess.generation)   # cleared even though the call may still be up
 

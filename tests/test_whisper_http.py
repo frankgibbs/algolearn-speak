@@ -59,7 +59,11 @@ class FakeLink:
     def state(self) -> str:
         return proto.NONE
 
+    def record_event(self, event: str, **fields) -> None:
+        pass
 
+
+OWNER_SESSION = d.Speaker("s-test", "algolearn-speak")   # the tool op these tests hold the lock with
 SETTINGS = {"SPEAK_QUIET_HOURS": "22:00-07:00", "quiet_window": (1320, 420),
             "tz": None, "phrases": {"hold on": "hold", "continue": "resume"}}
 
@@ -195,7 +199,7 @@ class TestRoutes(HttpCase):
 
 class TestAudioLock(HttpCase):
     def test_transcription_waits_for_a_tool_op_holding_the_lock(self):
-        self.daemon.lock.acquire(proto.OP_CONVERSE, "10.0.0.5")
+        self.daemon.lock.acquire(proto.OP_CONVERSE, "10.0.0.5", OWNER_SESSION)
         result: dict = {}
 
         def post():
@@ -288,7 +292,7 @@ class TestHardening(HttpCase):
         self.assertEqual(self.engines.calls, [])
 
     def test_client_that_left_while_queued_is_skipped(self):
-        self.daemon.lock.acquire(proto.OP_CONVERSE, "10.0.0.5")
+        self.daemon.lock.acquire(proto.OP_CONVERSE, "10.0.0.5", OWNER_SESSION)
         s = socket.create_connection(("127.0.0.1", self.http_port), timeout=10)
         s.sendall(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\n\x00\x00\x00\x00")
         deadline = time.time() + 5
@@ -362,7 +366,7 @@ class TestTimeouts(HttpCase):
 
     def test_request_queued_longer_than_the_timeout_still_gets_its_text(self):
         # the socket timeout covers reads from the client, not the wait for the audio lock
-        self.daemon.lock.acquire(proto.OP_CONVERSE, "10.0.0.5")
+        self.daemon.lock.acquire(proto.OP_CONVERSE, "10.0.0.5", OWNER_SESSION)
         result: dict = {}
 
         def post():

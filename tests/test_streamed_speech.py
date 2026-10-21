@@ -16,6 +16,7 @@ import numpy as np
 import speak_engines as eng
 import speak_telegram as tg
 import speak_telegram_daemon as d
+from test_hold import locked_service
 
 RATE = eng.TTS_RATE
 
@@ -104,7 +105,7 @@ class ServiceCase(unittest.TestCase):
         self.log: list = []
         self.engines = FakeEngines(self.log)
         self.link = FakeLink(self.log)
-        self.svc = d.SpeakService(self.link, self.engines, SETTINGS)
+        self.svc = locked_service(self.link, self.engines, SETTINGS, lambda event, **fields: None)
         self.sess = d.Session(None, d.Speaker("s-test", "algolearn-speak"))
 
     def names(self):

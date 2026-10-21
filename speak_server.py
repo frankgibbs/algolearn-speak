@@ -353,7 +353,9 @@ def _status_sync() -> dict:
 
 # ---------------------------------------------------------------- MCP surface
 
-_INSTRUCTIONS = """\
+_FLOOR_IDLE = f"{proto.FLOOR_IDLE_SECONDS:.0f}"   # seconds, as the instructions and docstrings say it
+
+_INSTRUCTIONS = f"""\
 Voice tools for talking with the owner (Frank) over a Telegram call. Owner conventions:
 
 - On calls and in anything spoken you are "Angie", never Claude ("Hi Frank, it's Angie").
@@ -364,8 +366,9 @@ Voice tools for talking with the owner (Frank) over a Telegram call. Owner conve
   a turn: the gap between the two calls is seconds of dead air before the ear-open beep;
   converse() opens the ear right after the last word. speak() alone only for words that
   need no reply (a last sentence before hang_up, a quick "one moment" before long silent
-  work); listen() alone only to reopen the ear after a TimeoutError or when there is
-  nothing to say first.
+  work, a wrap-up line); it also hands the call to the next waiting session (see "the
+  floor" below). listen() alone only to reopen the ear after a TimeoutError or when
+  there is nothing to say first.
 - A listen/converse TimeoutError means nobody spoke in time; the call is still up.
   Reopen the ear with listen(). Do not assume the owner left, do not hang up.
 - Go straight into the answer. Never prefix a reply with "heard you" or a restatement;
@@ -392,6 +395,24 @@ Voice tools for talking with the owner (Frank) over a Telegram call. Owner conve
   calls work.
 - There is one call, shared by every session on every computer; tools queue for it.
   The owner may also be reading this terminal.
+- The floor: other sessions may be waiting for the call right now. The session that
+  last played audio holds the floor, and its next speak/listen/converse goes ahead of
+  every other session's, so the owner hears one conversation at a time. converse() and
+  listen() keep the floor. A speak() gives it up when it finishes. If you send nothing
+  for {_FLOOR_IDLE} seconds after your last tool call ends, the floor lapses and the next waiting
+  session gets the call.
+- So when you reach a stopping point (the topic is wrapped up, or you are going off to
+  do background work), end with ONE speak(), not a converse(): for example "Will do,
+  talk soon." A converse() there keeps the floor and holds every other session off the
+  call while the owner has nothing left to say to you.
+- A short pause is not a stopping point: for work you will finish within {_FLOOR_IDLE} seconds, do
+  not speak "one moment" (any speak() gives up the floor); say nothing and reply with
+  converse() when you are ready.
+- Do not ask "do you want me to call you back when that's done?". Say you will come
+  back with the result. When the work is done, check status() first: its call field
+  says whether the call is still connected. If it is, just converse() with the result;
+  it waits its turn, gets the floor when it is free, and the owner hears the switch cue
+  and your project's name before it. Use call() only if the call has ended.
 - When your speak/listen/converse is the first audio on the call after another
   session's, the daemon first plays a double beep and speaks your project's name, and
   your result's first line is '[took over the call from "<other project>"; ...]'. The
@@ -428,13 +449,17 @@ async def _run(fn, *args):
         _abort_var.reset(token)
 
 
-_QUEUE_NOTE = """
-    Status: speak/listen/converse/call/hang_up are serialized through one FIFO
+_QUEUE_NOTE = f"""
+    Status: speak/listen/converse/call/hang_up are serialized through one
     lock in the speak daemon, shared by every Claude Code session on every
     computer -- there is only one Telegram call. If another tool call is in
-    progress anywhere, this one queues and waits for it to finish, then
-    proceeds; it is never rejected. Use `status()` to see what is running and
-    how many calls are waiting.
+    progress anywhere, this one queues and waits; it is never rejected. The
+    session that last played audio holds the floor: its calls go ahead of
+    every other session's until it ends with a speak(), or sends nothing for
+    {_FLOOR_IDLE} s after its last call ends; the other sessions wait. Use `status()`
+    to see what is running and how many calls are waiting; `busy` false with
+    `waiting` above 0 means a floor is held and those calls wait for its
+    session.
 
     Switch of session: if the previous audio on the call came from another
     session (the greeting counts as the calling session's), the daemon first
@@ -486,9 +511,15 @@ _CALL_NOTE = """
     Write it as spoken prose: plain sentences, no markdown, no code. Returns the spoken duration.
 
     Only for words that need no reply (a last sentence before hang_up, a quick "one
-    moment" before long silent work). For a conversational turn use `converse(text)`,
-    never speak() then listen(): the gap between the two calls is seconds of dead air
-    before the ear-open beep.
+    moment" before long silent work, a wrap-up such as "Will do, talk soon"). For a
+    conversational turn use `converse(text)`, never speak() then listen(): the gap
+    between the two calls is seconds of dead air before the ear-open beep.
+
+    speak() gives up the floor when it finishes: the next waiting session (if any)
+    gets the call. End with it whenever you reach a stopping point -- the topic is
+    wrapped up, or you are going off to do background work. If the call is still
+    connected when that work is done, come back with converse(); use call() only if
+    the call has ended.
 """ + _HOLD_NOTE + _QUEUE_NOTE + _CALL_NOTE)
 async def speak(text: str) -> str:
     return await _run(_speak_sync, text)
@@ -514,7 +545,7 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 2.0, start
 
 
 @mcp.tool()
-@_doc("""Say `text` over the connected Telegram call, then listen for the reply. One spoken round trip; returns the owner's words.
+@_doc(f"""Say `text` over the connected Telegram call, then listen for the reply. One spoken round trip; returns the owner's words.
 
     Every conversational turn is ONE converse call: speak and listen run under one lock
     hold, so the ear-open beep follows the last word at once (speak() then listen() leaves
@@ -522,6 +553,10 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 2.0, start
     parameters and raises TimeoutError as listen does if nobody speaks within
     `start_timeout_seconds`; the call is still up, so reopen the ear with `listen()`; do
     not assume the owner left and do not hang up.
+
+    converse() keeps the floor: other sessions waiting for the call stay queued until you
+    end with a speak() or send nothing for {_FLOOR_IDLE} s. Do not end a finished topic, or a
+    hand-off to background work, with a converse(); end it with speak().
 """ + _HOLD_NOTE + _QUEUE_NOTE + _CALL_NOTE)
 async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float = 2.0, start_timeout_seconds: float = 45.0) -> str:
     return await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)

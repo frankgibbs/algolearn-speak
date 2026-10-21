@@ -105,6 +105,11 @@ OPENER_MIN_SECONDS = 6.0     # 2 s failed, 6 s worked (2026-10-09). The one defi
 # Owner decision 2026-10-16: a hold that reaches HOLD_MAX_SECONDS (the holds of one op added
 # up) ends the call. The client's speak/converse budgets include it.
 HOLD_MAX_SECONDS = 300.0
+# The floor (docs/DESIGN_FLOOR.md, owner decisions 2026-10-20): the session that last played
+# audio on the call goes ahead of every other session until it ends with a speak, or sends no
+# op for this long after its last op ended. Not a wire field: the client's instruction text
+# and the daemon's AudioLock use the same number.
+FLOOR_IDLE_SECONDS = 45.0
 CMD_HOLD, CMD_RESUME = "hold", "resume"
 INTERRUPTION_HOLD_EXPIRED = "hold_expired"
 REPLY_HELD_SECONDS, REPLY_INTERRUPTION = "held_seconds", "interruption"

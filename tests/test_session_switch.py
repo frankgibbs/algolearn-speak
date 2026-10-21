@@ -24,7 +24,7 @@ import speak_server as client  # noqa: E402
 import speak_telegram as tg  # noqa: E402
 import speak_telegram_daemon as d  # noqa: E402
 import speak_tone  # noqa: E402
-from test_hold import NEVER_LEFT, SETTINGS, HoldServiceCase, ScriptedLink  # noqa: E402
+from test_hold import NEVER_LEFT, SETTINGS, HoldServiceCase, ScriptedLink, locked_service  # noqa: E402
 
 A = d.Speaker("session-a", "algolearn-speak")
 B = d.Speaker("session-b", "algolearn-hedge")
@@ -54,7 +54,7 @@ class SwitchCase(HoldServiceCase):
     def setUp(self):
         super().setUp()
         self.link = CallLink(self.log, self.clock)
-        self.svc = d.SpeakService(self.link, self.engines, SETTINGS)
+        self.svc = locked_service(self.link, self.engines, SETTINGS, self.link.record_event)
 
     def placed_by(self, speaker: d.Speaker) -> None:
         """What call() does once answered: the caller's greeting is the call's first turn."""
