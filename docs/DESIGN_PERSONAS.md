@@ -1,6 +1,6 @@
 # Design: personas (a name, a voice and a personality per project)
 
-Status: built, not deployed (2026-10-22). Repo HEAD at the time of writing: 0058457.
+Status: deployed 2026-10-22 10:08 PDT in commit 6a9fcbe; tested live the same day.
 Build note: `Engines.load_voices` loads each pack with `torch.load(weights_only=True,
 map_location="cpu").float()` from the snapshot, as `KPipeline.load_single_voice` does for a
 `.pt` path, instead of calling `load_single_voice` (which makes one hub call per voice).

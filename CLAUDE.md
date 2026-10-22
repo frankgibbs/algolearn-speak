@@ -165,7 +165,7 @@ announcement is built in the working tree, not deployed yet.
 
 ## Personas (owner decisions 2026-10-22)
 
-Design: `docs/DESIGN_PERSONAS.md`. Built in the working tree, not deployed.
+Design: `docs/DESIGN_PERSONAS.md`. Deployed in commit 6a9fcbe on 2026-10-22 and tested live.
 Protocol 4.
 
 - **What a persona is (owner decisions):** a name (one word of 2 to 12
