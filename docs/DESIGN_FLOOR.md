@@ -1,6 +1,7 @@
 # Design: the floor (one conversation at a time on the shared call)
 
-Status: design, written 2026-10-20; built in the working tree, not deployed.
+Status: design, written 2026-10-20; deployed in commit `b5cd149` on 2026-10-22.
+The client text (section 6) was rewritten by owner decision 2026-10-22.
 Every build, restart and stop of `speak-telegram` remains an owner action,
 approved per change.
 
@@ -66,7 +67,8 @@ stopping point.
    done?" becomes "I'll come back with the result": if the call is still
    connected when the work is done, the agent just runs `converse` (it
    queues, gets the floor when it is free, and the switch cue announces the
-   project); it uses `call` only if the call has ended.
+   project); it uses `call` only if the call has ended. **Amended by owner
+   decision 2026-10-22:** the etiquette as it now reads is in section 6.
 6. **No new cue.** The existing switch-of-session cue and project-name
    announcement is what tells the owner the floor changed hands.
 7. **An answered `call` gives the caller the floor** right away.
@@ -380,95 +382,74 @@ No protocol bump (owner decision 9). Verified reasons it is not needed:
 
 ## 6. Client text (`speak_server.py`)
 
-The text as built. Wherever it says 45, the build composes the number from
-`proto.FLOOR_IDLE_SECONDS` (`_FLOOR_IDLE` in `speak_server.py`, used in the
-f-strings), so the text and the daemon cannot disagree. The short-pause
-bullet, the `status()` check before coming back, and the `_QUEUE_NOTE`
-sentence about `busy` false with `waiting` above 0 are **Design (build
-review, 2026-10-20)**.
+**Owner decision 2026-10-22** (made on a call), replacing the text built on
+2026-10-20:
+- The floor etiquette is stated once, in `_INSTRUCTIONS`. Each of `speak`,
+  `listen` and `converse` gets one plain line about its own floor effect.
+  `_QUEUE_NOTE` keeps only its queue and `status` content.
+- The 45 s idle timeout is not mentioned anywhere agent-facing: agents never
+  reason about silence. (`FLOOR_IDLE_SECONDS` still drives the daemon; the
+  client no longer composes it into text.)
+- No "one moment" before work: `speak` is only the final sign-off.
+- Stay in `converse` while the topic is alive, including while an agent you
+  started researches for a few minutes; ask whether the owner has anything
+  else before leaving; sign off with one `speak` only when the topic has
+  closed, the owner has nothing else, and the remaining work is long (around
+  15 minutes or more).
 
 ### 6.1 `_INSTRUCTIONS`
 
-Replace the bullet at `speak_server.py:363-368` with:
+The turn bullet ends:
 
 ```
-- Every conversational turn is ONE converse(text) call. Never speak() then listen() for
-  a turn: the gap between the two calls is seconds of dead air before the ear-open beep;
-  converse() opens the ear right after the last word. speak() alone only for words that
-  need no reply (a last sentence before hang_up, a quick "one moment" before long silent
-  work, a wrap-up line); it also hands the call to the next waiting session (see "the
-  floor" below). listen() alone only to reopen the ear after a TimeoutError or when
-  there is nothing to say first.
+  converse() opens the ear right after the last word. listen() alone only to reopen the
+  ear after a TimeoutError or when there is nothing to say first. speak() alone only for
+  the final sign-off (see "the floor" below).
 ```
 
-Replace the bullet at `speak_server.py:393-394` with:
+After the bullet "There is one call, shared by every session on every
+computer; tools queue for it.":
 
 ```
-- There is one call, shared by every session on every computer; tools queue for it.
-  The owner may also be reading this terminal.
-- The floor: other sessions may be waiting for the call right now. The session that
-  last played audio holds the floor, and its next speak/listen/converse goes ahead of
-  every other session's, so the owner hears one conversation at a time. converse() and
-  listen() keep the floor. A speak() gives it up when it finishes. If you send nothing
-  for 45 seconds after your last tool call ends, the floor lapses and the next waiting
-  session gets the call.
-- So when you reach a stopping point (the topic is wrapped up, or you are going off to
-  do background work), end with ONE speak(), not a converse(): for example "Will do,
-  talk soon." A converse() there keeps the floor and holds every other session off the
-  call while the owner has nothing left to say to you.
-- A short pause is not a stopping point: for work you will finish within 45 seconds, do
-  not speak "one moment" (any speak() gives up the floor); say nothing and reply with
-  converse() when you are ready.
-- Do not ask "do you want me to call you back when that's done?". Say you will come
-  back with the result. When the work is done, check status() first: its call field
-  says whether the call is still connected. If it is, just converse() with the result;
-  it waits its turn, gets the floor when it is free, and the owner hears the switch cue
-  and your project's name before it. Use call() only if the call has ended.
+- The floor: other sessions may be waiting for the call. The session that last played
+  audio holds the floor, so the owner hears one conversation at a time. converse() and
+  listen() keep the floor; speak() gives it up.
+- Stay in converse() as long as the topic is alive, including while an agent you started
+  does a few minutes of research: tell the owner what you started and keep the
+  conversation going. He will likely have more questions, or a related thread on the
+  same topic.
+- Before leaving, ask whether he has anything else.
+- End with ONE speak() sign-off (for example "Will do, talk soon.") only when the topic
+  has closed, the owner has said he has nothing else, and the remaining work is long
+  (around 15 minutes or more). Never use speak() for a quick check or a short task.
+- Do not offer to call back; say you will come back with the result. When the work is
+  done, check status(): if its call field says the call is still connected, converse()
+  with the result (it waits its turn, and the owner hears the switch cue and your
+  project's name first). Use call() only if the call has ended.
 ```
 
 ### 6.2 `_QUEUE_NOTE`
 
-Replace the first paragraph (`speak_server.py:432-437`) with:
+The first paragraph:
 
 ```
     Status: speak/listen/converse/call/hang_up are serialized through one
     lock in the speak daemon, shared by every Claude Code session on every
     computer -- there is only one Telegram call. If another tool call is in
-    progress anywhere, this one queues and waits; it is never rejected. The
-    session that last played audio holds the floor: its calls go ahead of
-    every other session's until it ends with a speak(), or sends nothing for
-    45 s after its last call ends; the other sessions wait. Use `status()`
-    to see what is running and how many calls are waiting; `busy` false with
-    `waiting` above 0 means a floor is held and those calls wait for its
-    session.
+    progress anywhere, this one queues and waits; it is never rejected. Use
+    `status()` to see what is running and how many calls are waiting; `busy`
+    false with `waiting` above 0 means another session holds the floor.
 ```
 
-The switch paragraph (`speak_server.py:439-444`) stays.
+The switch paragraph is unchanged.
 
 ### 6.3 Docstrings
 
-`speak` (`speak_server.py:488-491`) becomes:
-
-```
-    Only for words that need no reply (a last sentence before hang_up, a quick "one
-    moment" before long silent work, a wrap-up such as "Will do, talk soon"). For a
-    conversational turn use `converse(text)`, never speak() then listen(): the gap
-    between the two calls is seconds of dead air before the ear-open beep.
-
-    speak() gives up the floor when it finishes: the next waiting session (if any)
-    gets the call. End with it whenever you reach a stopping point -- the topic is
-    wrapped up, or you are going off to do background work. If the call is still
-    connected when that work is done, come back with converse(); use call() only if
-    the call has ended.
-```
-
-`converse` (`speak_server.py:519-524`) gains, after its first paragraph:
-
-```
-    converse() keeps the floor: other sessions waiting for the call stay queued until you
-    end with a speak() or send nothing for 45 s. Do not end a finished topic, or a
-    hand-off to background work, with a converse(); end it with speak().
-```
+- `speak`: "speak() gives up the floor; use it only for the final sign-off."
+  followed by the existing sentence that a conversational turn is
+  `converse(text)`, never speak() then listen().
+- `listen`: "listen() keeps the floor."
+- `converse`: "converse() keeps the floor."
 
 ## 7. Code changes
 

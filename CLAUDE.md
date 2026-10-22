@@ -150,7 +150,7 @@ announcement is built in the working tree, not deployed yet.
 
 ## The floor (owner decisions 2026-10-20)
 
-Design: `docs/DESIGN_FLOOR.md`. Built in the working tree, not deployed.
+Design: `docs/DESIGN_FLOOR.md`. Deployed in commit b5cd149 on 2026-10-22.
 No protocol change: the protocol stays 3.
 
 - **The floor:** the session that last played audio on the call holds it
@@ -207,17 +207,25 @@ No protocol change: the protocol stays 3.
   queued then). `status` is unchanged, so `busy` can be false while
   `waiting` is non-zero (the lock is free and the waiters are not eligible).
   No tool reply tells the holder that others wait (owner decision).
-- **Etiquette in the client** (server instructions, `_QUEUE_NOTE`, the
-  `speak` and `converse` docstrings; the 45 is composed from
-  `FLOOR_IDLE_SECONDS`): at a stopping point (topic wrapped up, or going off
-  to background work) end with one `speak` ("Will do, talk soon"), not a
-  `converse`; instead of offering to call back, say you will come back with
-  the result, check `status()` for the call state, then `converse` if the
-  call is still up (it queues and gets the floor when free), `call` only if
-  it has ended. For a short pause (under the idle time) do not speak "one
-  moment" (any `speak` gives up the floor); just `converse` when ready.
-  `_QUEUE_NOTE` explains `busy` false with `waiting` above 0. Running
-  sessions get the new text after `/mcp` reconnect.
+- **Etiquette in the client (owner decision 2026-10-22):** stated once, in
+  the server instructions; `speak`, `listen` and `converse` each carry one
+  line on their own floor effect (`converse` and `listen` keep it, `speak`
+  gives it up and is only for the final sign-off), and `_QUEUE_NOTE` keeps
+  only the queue and `status` content (`busy` false with `waiting` above 0
+  means another session holds the floor). The rules: the session that last
+  played audio holds the floor; every turn is one `converse`; stay in
+  `converse` while the topic is alive, including while an agent you started
+  researches for a few minutes (tell the owner what you started and keep
+  talking); ask whether he has anything else before leaving; end with one
+  `speak` sign-off ("Will do, talk soon.") only when the topic has closed,
+  he has nothing else, and the remaining work is long (around 15 minutes or
+  more), never for a quick check or a short task; do not offer to call back,
+  say you will come back with the result, then check `status()` and
+  `converse` if the call is still up (it waits its turn behind the switch
+  cue), `call` only if it has ended; `listen` alone only to reopen the ear
+  after a `TimeoutError` or with nothing to say first. No "one moment"
+  before work, and the idle timeout is not mentioned to agents at all.
+  Running sessions get the new text after `/mcp` reconnect.
 
 Without a connected call, `speak`/`listen`/`converse` raise `<tool> needs a
 connected Telegram call (call state is ...); place one with the call tool`.
