@@ -10,8 +10,17 @@ speak_protocol.py. Only text crosses the wire; audio never leaves this process.
 
 Tool ops (`speak`, `listen`, `converse`, `call`, `hang_up`) wait in a FIFO for the
 audio lock, get `{"ok": true, "phase": "started"}` the moment they hold it, then
-their final reply. Quick ops (`ping`, `status`, `debug`, `set_debug`) never
-touch the lock, so they answer while a call is ringing or connected.
+their final reply. Quick ops (`ping`, `status`, `debug`, `set_debug`, and the
+persona ops) never touch the lock, so they answer while a call is ringing or connected.
+
+Personas (docs/DESIGN_PERSONAS.md, owner decisions 2026-10-22): every project speaks as
+a persona (a name, a voice blend, a speed and a personality) kept in the PersonaStore
+(speak_personas.py, the file SPEAK_PERSONAS_FILE on the speak_state volume). Before the
+lock, a project with no persona is assigned to the house persona, and a speak, converse
+or call whose persona_seen is stale (the project moved to another persona, or its
+persona's name or personality changed) is refused with the persona block, so nothing is
+spoken or dialed in words written for another persona. A voice or speed change never
+refuses a turn: it is applied per sentence.
 
 A second listener on HTTP 0.0.0.0:9000 replaces the retired whisper-service with
 its API (owner decision 2026-10-16): `POST /` takes raw 16 kHz mono int16 PCM and
@@ -31,7 +40,7 @@ A native crash (SIGSEGV, SIGABRT, ...) in ntgcalls, torch or ctranslate2 dumps e
 Python thread's stack to stderr before the process dies with the signal (exit
 139 for SIGSEGV), so `docker logs speak-telegram` shows what each thread was
 doing: the telegram-loop thread (pump, record, play) or a request thread inside
-Engines.synthesize_stream/synthesize/transcribe or the Silero VAD.
+Engines.synthesize_segments/synthesize/transcribe or the Silero VAD.
 
 No fallbacks: every setting is required, a model or login failure stops the
 daemon before the port is bound, and every failure raises.
@@ -65,7 +74,8 @@ import numpy as np
 
 import speak_protocol as proto
 import speak_telegram as tg
-from speak_engines import STT_RATE, TTS_RATE, WHISPER_DEVICE, Engines, split_sentences
+from speak_engines import STT_RATE, TTS_RATE, WHISPER_DEVICE, Engines, Voice, split_sentences
+from speak_personas import PersonaStore
 from speak_tone import chime_pcm, cue_pcm, switch_pcm
 
 log = logging.getLogger("speak.daemon")
@@ -76,11 +86,13 @@ MAX_DEBUG_LINES = 1000
 DEBUG_LOGGERS = ("speak", "pytgcalls", "ntgcalls", "telethon")   # ntgcalls' native C++ log has no Python hook
 REQUIRED_TELEGRAM_ENV = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_CALL_TARGET")
 REQUIRED_SPEAK_ENV = ("SPEAK_KOKORO_MODEL", "SPEAK_VOICE", "SPEAK_SPEED", "SPEAK_WHISPER_MODEL",
-                      "SPEAK_LANGUAGE", "SPEAK_QUIET_HOURS", "SPEAK_HOLD_PHRASE", "SPEAK_RESUME_PHRASE", "TZ")
+                      "SPEAK_LANGUAGE", "SPEAK_QUIET_HOURS", "SPEAK_HOLD_PHRASE", "SPEAK_RESUME_PHRASE",
+                      "SPEAK_PERSONAS_FILE", "TZ")
 BIND_HOST = "0.0.0.0"   # open to the LAN by design (owner decision 4); no auth, no TLS
 WHISPER_HTTP_PORT = 9000   # the retired whisper-service's port, so its clients need no change
 TRANSCRIBE_TOOL = "transcribe"   # how status names an HTTP transcription holding the audio lock
 SESSION_SWITCH_EVENT = "session_switch"   # call_debug: a switch of session was announced on the call
+PERSONA_REFUSED_EVENT = "persona_refused"   # call_debug: a stale persona_seen was refused before the lock
 # The floor (docs/DESIGN_FLOOR.md, owner decisions 2026-10-20): call_debug events and the
 # floor_release reasons.
 FLOOR_TAKE_EVENT, FLOOR_RELEASE_EVENT = "floor_take", "floor_release"
@@ -106,6 +118,17 @@ class NoSpeech(TimeoutError):
 
 class CallEndedError(RuntimeError):
     """The call this session was using is no longer connected: call back. Sent as KIND_CALL_ENDED."""
+
+
+class PersonaRefused(ValueError):
+    """speak, converse or call from a session that has not seen its project's current persona,
+    name and personality (the key "<id>:<words_revision>", docs/DESIGN_PERSONAS.md 4.7):
+    refused before the lock, nothing spoken or dialed. Sent as
+    KIND_VALUE with the persona block (REPLY_PERSONA)."""
+
+    def __init__(self, message: str, block: dict) -> None:
+        super().__init__(message)
+        self.block = block
 
 
 # ------------------------------------------------------------------ settings
@@ -176,8 +199,8 @@ def load_settings() -> dict:
         speed = float(env["SPEAK_SPEED"])
     except ValueError:
         raise RuntimeError(f"SPEAK_SPEED={env['SPEAK_SPEED']!r} is not a number") from None
-    if speed <= 0:
-        raise RuntimeError(f"SPEAK_SPEED={speed} must be positive")
+    if not proto.PERSONA_SPEED_MIN <= speed <= proto.PERSONA_SPEED_MAX:   # the speed every new persona starts with
+        raise RuntimeError(f"SPEAK_SPEED={speed} must be from {proto.PERSONA_SPEED_MIN} to {proto.PERSONA_SPEED_MAX}")
     return {**env, "SPEAK_SPEED": speed, "tz": tz, "quiet_window": parse_quiet_hours(env["SPEAK_QUIET_HOURS"]),
             "phrases": parse_phrases(env["SPEAK_HOLD_PHRASE"], env["SPEAK_RESUME_PHRASE"])}
 
@@ -469,9 +492,10 @@ class SpeakService:
     Every method runs with the audio lock held; `lock` is that AudioLock, for the floor
     (take_floor where the turn moves, yield_floor where an op gives the floor up)."""
 
-    def __init__(self, link, engines: Engines, settings: dict, lock: AudioLock) -> None:
+    def __init__(self, link, engines: Engines, personas: PersonaStore, settings: dict, lock: AudioLock) -> None:
         self.link = link
         self.engines = engines
+        self.personas = personas
         self.lock = lock
         self.quiet_hours = settings["SPEAK_QUIET_HOURS"]
         self.quiet_window = settings["quiet_window"]
@@ -539,12 +563,21 @@ class SpeakService:
                 return
             raise
 
+    # -- personas (docs/DESIGN_PERSONAS.md)
+
+    def _voice(self, project: str) -> Voice:
+        """The project's persona's voice now: read for each sentence of a speech, so a persona
+        change lands on the next sentence synthesized (owner decision 7)."""
+        persona = self.personas.persona_of(project)
+        return Voice(self.engines.voice_pack(persona.voice), persona.speed)
+
     # -- session switch (owner decisions 2026-10-20)
 
     def _take_turn(self, sess: Session, tool: str) -> None:
         """Before a speak/listen/converse plays anything: when the previous audio on this call
-        came from another session, announce the switch (the switch cue, then this session's
-        project name, spoken; for a bare listen "<name>, still listening"), record
+        came from another session, announce the switch (the switch cue, then "<persona name>,
+        <project name>" in the incoming persona's voice, owner decisions 6 and 13 of
+        docs/DESIGN_PERSONAS.md; for a bare listen "..., still listening"), record
         SESSION_SWITCH_EVENT and set sess.switched_from to the previous session's project. The
         first audio on a call from the session that placed it is not a switch (call() makes it
         the call's first turn). The announcement is one plain play, like the greeting and the
@@ -553,13 +586,15 @@ class SpeakService:
         key = self.key(self.link.info()["generation"])
         previous = self._turn
         if previous is not None and previous[0] == key and previous[1].session_id != sess.speaker.session_id:
-            spoken = proto.speakable_name(sess.speaker.project)
+            persona = self.personas.persona_of(sess.speaker.project)
+            spoken = f"{persona.name}, {proto.speakable_name(sess.speaker.project)}"
             if tool == "listen":
                 spoken += SWITCH_LISTEN_SUFFIX
-            audio = np.concatenate([switch_pcm(), self.engines.synthesize(spoken)])
+            voice = Voice(self.engines.voice_pack(persona.voice), persona.speed)
+            audio = np.concatenate([switch_pcm(), self.engines.synthesize(spoken, voice)])
             self.guard_call(sess, tool, lambda: self.link.play(audio, TTS_RATE))
             self.link.record_event(SESSION_SWITCH_EVENT, tool=tool, from_project=previous[1].project,
-                                   to_project=sess.speaker.project, spoken=spoken,
+                                   to_project=sess.speaker.project, to_persona=persona.name, spoken=spoken,
                                    announce_s=round(len(audio) / TTS_RATE, 2))
             log.info("%s: session switch on call %s, %r -> %r announced", tool, key, previous[1].project,
                      sess.speaker.project)
@@ -599,7 +634,9 @@ class SpeakService:
         never overlaps outgoing speech."""
         text = self._spoken_text(text)
         pieces = split_sentences(text)
-        segments = _Segments(self.engines.synthesize_segments(text))
+        # The voice is asked per sentence: a persona change lands on the next sentence, and a
+        # sentence replayed after "continue" comes from the cache in the voice it was made in.
+        segments = _Segments(self.engines.synthesize_segments(text, lambda: self._voice(speaker.project)))
         start, seconds, held = 0, 0.0, 0.0
         while True:
             out = self.link.play_watched(segments.from_sentence(start), TTS_RATE, self.classify, proto.CMD_HOLD)
@@ -632,7 +669,7 @@ class SpeakService:
         return text
 
     def _client_left_during_hold(self, speaker: Speaker, held: float) -> None:
-        """The request's client went away while Angie was held (its tool call was cancelled
+        """The request's client went away while the speech was held (its tool call was cancelled
         or its session closed): nobody waits for the reply, so the hold ends now and the lock
         goes to the next request (the handler releases it when this raises). Owner decision
         2026-10-16: the call is NOT hung up; it stays connected. Owner decision 2026-10-20:
@@ -747,7 +784,7 @@ class SpeakService:
         text = self.plain(greeting)
         if not text:
             raise ValueError("call() needs a non-empty greeting")
-        audio = self.engines.synthesize(text)
+        audio = self.engines.synthesize(text, self._voice(sess.speaker.project))   # the caller's persona
         seconds = len(audio) / TTS_RATE
         if seconds < tg.OPENER_MIN_SECONDS:
             raise ValueError(
@@ -831,6 +868,17 @@ def _speaker(req: dict) -> Speaker:
     return Speaker(values[proto.FIELD_SESSION_ID], values[proto.FIELD_PROJECT])
 
 
+def _persona_seen(req: dict) -> str | None:
+    """FIELD_PERSONA_SEEN on a tool op (protocol 4): required, null or a string."""
+    if proto.FIELD_PERSONA_SEEN not in req:
+        raise ValueError(f"speak client sent no {proto.FIELD_PERSONA_SEEN}; every tool op of protocol "
+                         f"{proto.PROTOCOL_VERSION} carries it; update the client (git pull) and reconnect /mcp")
+    value = req[proto.FIELD_PERSONA_SEEN]
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{proto.FIELD_PERSONA_SEEN} must be a string or null, got {value!r}")
+    return value
+
+
 def _debug_lines(req: dict) -> int:
     lines = req.get("lines")
     if not isinstance(lines, int) or isinstance(lines, bool) or not 1 <= lines <= MAX_DEBUG_LINES:
@@ -856,7 +904,10 @@ def _error_reply(e: BaseException) -> dict:
     else:   # reported to the caller with its type, never swallowed
         log.error("request failed", exc_info=e)
         message = f"{type(e).__name__}: {e}"
-    return {"ok": False, "error": message, "kind": kind}
+    reply = {"ok": False, "error": message, "kind": kind}
+    if isinstance(e, PersonaRefused):
+        reply[proto.REPLY_PERSONA] = e.block
+    return reply
 
 
 # ------------------------------------------------------------------ TCP server
@@ -876,10 +927,8 @@ class _Handler(socketserver.BaseRequestHandler):
         op = req.get("op")
         if op not in proto.VERSIONLESS_OPS and (op in proto.QUICK_OPS or op in proto.LOCKED_OPS):
             try:
-                _check_protocol(req)
-                if op in proto.LOCKED_OPS:
-                    _speaker(req)
-            except ValueError as e:
+                daemon.admit(op, req)
+            except Exception as e:   # a refusal, or a failed persona write: sent, never swallowed
                 log.warning("%s from %s refused: %s", op, peer, e)
                 self._send(peer, _error_reply(e))
                 return
@@ -1132,11 +1181,13 @@ class _WhisperHTTPServer(ThreadingHTTPServer):
 class SpeakDaemon:
     """Owns the link, the engines, the audio lock, the TCP server and the HTTP whisper API."""
 
-    def __init__(self, link, engines: Engines, settings: dict, debug: DebugControl, port: int = proto.DAEMON_PORT,
-                 on_restart: Callable[[str], None] | None = None, http_port: int = WHISPER_HTTP_PORT) -> None:
+    def __init__(self, link, engines: Engines, personas: PersonaStore, settings: dict, debug: DebugControl,
+                 port: int = proto.DAEMON_PORT, on_restart: Callable[[str], None] | None = None,
+                 http_port: int = WHISPER_HTTP_PORT) -> None:
         self.link = link
+        self.personas = personas
         self.lock = AudioLock(link.record_event)
-        self.service = SpeakService(link, engines, settings, self.lock)
+        self.service = SpeakService(link, engines, personas, settings, self.lock)
         self.port = port
         self.http_port = http_port
         self.on_restart = on_restart   # main(): exit 1 so compose restarts the container
@@ -1188,8 +1239,43 @@ class SpeakDaemon:
                  time.time() - t0, text)
         return text
 
+    def admit(self, op: str, req: dict) -> None:
+        """Before the lock, for every versioned op: the protocol version; the identity (tool
+        ops and persona ops); persona_seen (tool ops); the automatic assignment of a new
+        project to the house persona (owner decision 12); and the refusal of a speak, converse
+        or call whose persona_seen is not the project's current "<id>:<words_revision>"
+        (PersonaRefused: nothing is spoken or dialed). A voice or speed change does not change
+        that key, so it refuses nobody (Design 2026-10-22). listen and hang_up carry no words and are never refused
+        for it. Raises; the handler sends the error."""
+        _check_protocol(req)
+        if op not in proto.LOCKED_OPS and op not in proto.PERSONA_OPS:
+            return
+        speaker = _speaker(req)
+        seen = _persona_seen(req) if op in proto.LOCKED_OPS else None
+        self.personas.ensure(speaker.project)
+        if op not in proto.VOICED_OPS:
+            return
+        current = self.personas.key(speaker.project)
+        if seen != current:
+            block = self.personas.block(speaker.project)
+            self.link.record_event(PERSONA_REFUSED_EVENT, tool=op, project=speaker.project, seen=seen,
+                                   current=current)
+            raise PersonaRefused(f"your persona is {block['name']} and you have not seen it yet "
+                                 f"(persona_seen {seen!r}, current {current!r})", block)
+
     def quick(self, op: str, req: dict) -> dict:
         link = self.link
+        if op in proto.PERSONA_OPS:
+            project = _speaker(req).project   # validated in admit
+            if op == proto.OP_PERSONA:
+                return self.personas.overview(project)
+            if op == proto.OP_PERSONA_NEW:
+                return {proto.REPLY_PERSONA: self.personas.new(project)}
+            if op == proto.OP_PERSONA_SET:
+                return {proto.REPLY_PERSONA: self.personas.set(
+                    project, name=req.get("name"), voice=req.get("voice"), speed=req.get("speed"),
+                    personality=req.get("personality"))}
+            return {proto.REPLY_PERSONA: self.personas.add(project, req.get("note"))}
         if op == proto.OP_PING:
             return {}
         if op == proto.OP_STATUS:
@@ -1210,8 +1296,11 @@ class SpeakDaemon:
 
     def run_locked(self, op: str, req: dict, client_left: Callable[[], bool]) -> dict:
         """One tool op with the lock held. The reply carries "expect" when the session's
-        call expectation changed (an int, or null to clear), and REPLY_SWITCHED_FROM when a
-        switch of session was announced before the op's audio. `client_left` says whether
+        call expectation changed (an int, or null to clear), REPLY_SWITCHED_FROM when a
+        switch of session was announced before the op's audio, and REPLY_PERSONA when the
+        project's "<id>:<words_revision>" is not the one the request's persona_seen names
+        (another persona, or its name or personality changed while the op was queued or
+        playing). `client_left` says whether
         the request's client has gone away; a hold polls it (speak, converse)."""
         svc = self.service
         sess: Session | None = None
@@ -1239,6 +1328,9 @@ class SpeakDaemon:
             reply["expect"] = sess.generation
         if sess is not None and sess.switched_from is not None:
             reply[proto.REPLY_SWITCHED_FROM] = sess.switched_from   # on a failure too: the owner heard it
+        project = _speaker(req).project   # validated in admit, as is persona_seen
+        if _persona_seen(req) != self.personas.key(project):
+            reply[proto.REPLY_PERSONA] = self.personas.block(project)
         return reply
 
     def request_restart(self, reason: str) -> None:
@@ -1301,11 +1393,16 @@ def main() -> None:
         log.info("quiet hours %s in %s (local time now %s)", settings["SPEAK_QUIET_HOURS"], settings["TZ"],
                  datetime.datetime.now(settings["tz"]).strftime("%Y-%m-%d %H:%M %Z"))
         telegram_env = load_env()
-        # Startup order (design section 6.2): engines, then Silero + Telegram (link.start), then the binds.
-        engines = Engines(settings["SPEAK_KOKORO_MODEL"], settings["SPEAK_VOICE"], settings["SPEAK_SPEED"],
-                          settings["SPEAK_WHISPER_MODEL"], settings["SPEAK_LANGUAGE"])
-        engines.load()
-        daemon = SpeakDaemon(build_link(telegram_env), engines, settings, debug, on_restart=restart)
+        # Startup order (docs/DESIGN_REMOTE_DAEMON.md 6.2, docs/DESIGN_PERSONAS.md 4.2): the personas directory, engines (with the voice
+        # list), the persona file (validated against that list), then Silero + Telegram
+        # (link.start), then the binds.
+        PersonaStore.check_dir(settings["SPEAK_PERSONAS_FILE"])
+        engines = Engines(settings["SPEAK_KOKORO_MODEL"], settings["SPEAK_WHISPER_MODEL"], settings["SPEAK_LANGUAGE"])
+        engines.load(settings["SPEAK_VOICE"], settings["SPEAK_SPEED"])
+        link = build_link(telegram_env)
+        personas = PersonaStore.open(settings["SPEAK_PERSONAS_FILE"], engines.voices, settings["SPEAK_VOICE"],
+                                     settings["SPEAK_SPEED"], settings["tz"], link.record_event)
+        daemon = SpeakDaemon(link, engines, personas, settings, debug, on_restart=restart)
         daemon.start()
         stop.wait()
         daemon.stop()

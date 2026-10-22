@@ -24,10 +24,12 @@ services:
       SPEAK_WHISPER_MODEL: large-v3-turbo
       SPEAK_LANGUAGE: en
       SPEAK_QUIET_HOURS: "22:00-07:00"
-      SPEAK_HOLD_PHRASE: "hold on"       # said alone while Angie speaks: she stops and holds
-      SPEAK_RESUME_PHRASE: "continue"    # said alone while held: she restarts the cut sentence
+      SPEAK_HOLD_PHRASE: "hold on"       # said alone while a persona speaks: it stops and holds
+      SPEAK_RESUME_PHRASE: "continue"    # said alone while held: it restarts the cut sentence
+      SPEAK_PERSONAS_FILE: /var/lib/speak/personas.json   # docs/DESIGN_PERSONAS.md; seeded with Angie when missing
     volumes:
       - speak_models:/root/.cache/huggingface   # models download once, not on every rebuild
+      - speak_state:/var/lib/speak              # the persona registry survives rebuilds
     stop_grace_period: 30s            # a hang-up (<= 10 s) and the disconnect (<= 5 s) finish first
     deploy:
       resources:
@@ -39,3 +41,4 @@ services:
 
 volumes:
   speak_models:
+  speak_state:

@@ -84,14 +84,15 @@ class TestSwitch(SwitchCase):
         s = self.req_sess(B)
         self.svc.speak(s, self.TEXT, NEVER_LEFT)
         self.assertEqual(s.switched_from, "algolearn-speak")
-        self.assertEqual(self.announcements(), ["algolearn hedge"])
+        self.assertEqual(self.announcements(), ["Angie, algolearn hedge"])
         kinds = [e[0] for e in self.log]
         self.assertLess(kinds.index("cue"), kinds.index("play"))   # announcement, then the speech
         cue_len = [e[1] for e in self.log if e[0] == "cue"][0]
         self.assertEqual(cue_len, len(speak_tone.switch_pcm()) + d.TTS_RATE * 7)
         (event,) = self.switches()
         self.assertEqual(event, {"tool": "speak", "from_project": "algolearn-speak",
-                                 "to_project": "algolearn-hedge", "spoken": "algolearn hedge",
+                                 "to_project": "algolearn-hedge", "to_persona": "Angie",
+                                 "spoken": "Angie, algolearn hedge",
                                  "announce_s": round(cue_len / d.TTS_RATE, 2)})
 
     def test_the_same_session_again_is_not_a_switch(self):
@@ -106,7 +107,8 @@ class TestSwitch(SwitchCase):
         self.placed_by(A)
         for speaker in (B, A, A, B):
             self.svc.speak(self.req_sess(speaker), self.TEXT, NEVER_LEFT)
-        self.assertEqual(self.announcements(), ["algolearn hedge", "algolearn speak", "algolearn hedge"])
+        self.assertEqual(self.announcements(), ["Angie, algolearn hedge", "Angie, algolearn speak",
+                                                 "Angie, algolearn hedge"])
         self.assertEqual([(e["from_project"], e["to_project"]) for e in self.switches()],
                          [("algolearn-speak", "algolearn-hedge"), ("algolearn-hedge", "algolearn-speak"),
                           ("algolearn-speak", "algolearn-hedge")])
@@ -116,7 +118,7 @@ class TestSwitch(SwitchCase):
         s = self.req_sess(d.Speaker("session-a2", "algolearn-speak"))
         self.svc.speak(s, self.TEXT, NEVER_LEFT)
         self.assertEqual(s.switched_from, "algolearn-speak")
-        self.assertEqual(self.announcements(), ["algolearn speak"])
+        self.assertEqual(self.announcements(), ["Angie, algolearn speak"])
 
     def test_listen_alone_is_announced_before_the_ear_opens(self):
         self.placed_by(A)
@@ -126,17 +128,17 @@ class TestSwitch(SwitchCase):
         kinds = [e[0] for e in self.log]
         self.assertLess(kinds.index("cue"), kinds.index("record"))
         # owner decision 2026-10-20: a bare listen says it is still listening after the name
-        self.assertEqual(self.announcements(), ["algolearn hedge, still listening"])
+        self.assertEqual(self.announcements(), ["Angie, algolearn hedge, still listening"])
         (event,) = self.switches()
-        self.assertEqual((event["tool"], event["spoken"]), ("listen", "algolearn hedge, still listening"))
+        self.assertEqual((event["tool"], event["spoken"]), ("listen", "Angie, algolearn hedge, still listening"))
 
     def test_speak_and_converse_switches_say_only_the_name(self):
         self.placed_by(A)
         self.svc.converse(self.req_sess(B), self.TEXT, 120, 2.0, 45, NEVER_LEFT)
         self.svc.speak(self.req_sess(A), self.TEXT, NEVER_LEFT)
-        self.assertEqual(self.announcements(), ["algolearn hedge", "algolearn speak"])
+        self.assertEqual(self.announcements(), ["Angie, algolearn hedge", "Angie, algolearn speak"])
         self.assertEqual([(e["tool"], e["spoken"]) for e in self.switches()],
-                         [("converse", "algolearn hedge"), ("speak", "algolearn speak")])
+                         [("converse", "Angie, algolearn hedge"), ("speak", "Angie, algolearn speak")])
 
     def test_a_new_call_starts_fresh(self):
         self.placed_by(A)
@@ -193,10 +195,14 @@ class TestRunLockedReply(SwitchCase):
         super().setUp()
         self.daemon = d.SpeakDaemon.__new__(d.SpeakDaemon)
         self.daemon.service = self.svc
+        self.daemon.personas = self.svc.personas
 
     def req(self, speaker: d.Speaker, **fields) -> dict:
+        """As admitted: the project has its persona and the request has seen it."""
+        self.svc.personas.ensure(speaker.project)
         return {proto.FIELD_SESSION_ID: speaker.session_id, proto.FIELD_PROJECT: speaker.project,
-                "expect_generation": None, **fields}
+                "expect_generation": None, proto.FIELD_PERSONA_SEEN: self.svc.personas.key(speaker.project),
+                **fields}
 
     def test_the_reply_names_the_session_it_took_over_from(self):
         self.placed_by(A)
@@ -217,6 +223,95 @@ class TestRunLockedReply(SwitchCase):
         self.assertIs(reply["ok"], False)
         self.assertEqual(reply["kind"], proto.KIND_TIMEOUT)
         self.assertEqual(reply[proto.REPLY_SWITCHED_FROM], "algolearn-speak")
+
+    def test_the_reply_carries_the_persona_only_when_it_changed(self):
+        self.placed_by(B)
+        reply = self.daemon.run_locked(proto.OP_SPEAK, self.req(B, text="One."), NEVER_LEFT)
+        self.assertNotIn(proto.REPLY_PERSONA, reply)
+        req = self.req(B, text="One.")
+        self.svc.personas.set("algolearn-hedge", speed=1.2)   # the sound changed while the op was queued
+        reply = self.daemon.run_locked(proto.OP_SPEAK, req, NEVER_LEFT)
+        self.assertIs(reply["ok"], True)
+        self.assertNotIn(proto.REPLY_PERSONA, reply)   # design 2026-10-22: not the words, so no block
+        req = self.req(B, text="One.")
+        self.svc.personas.set("algolearn-hedge", personality=["Calm."])   # the words changed
+        reply = self.daemon.run_locked(proto.OP_SPEAK, req, NEVER_LEFT)
+        self.assertEqual(reply[proto.REPLY_PERSONA]["speed"], 1.2)
+        self.assertEqual(reply[proto.REPLY_PERSONA]["words_revision"], 2)
+
+
+class TestPersonaVoices(SwitchCase):
+    """docs/DESIGN_PERSONAS.md 4.5 and 4.7: who speaks with which voice."""
+
+    def setUp(self):
+        super().setUp()
+        self.personas = self.svc.personas
+        self.personas.ensure("algolearn-hedge")
+        self.personas.new("algolearn-hedge")
+        self.personas.set("algolearn-hedge", voice={"bf_emma": 3, "am_adam": 1})
+        self.personas.set("algolearn-hedge", speed=1.3)
+        self.hedge = self.personas.persona_of("algolearn-hedge")
+
+    def whole(self) -> list[tuple]:
+        return [v[1:] for v in self.engines.voices if v[0] == "whole"]
+
+    def segments(self) -> list[tuple]:
+        return [v[1:] for v in self.engines.voices if v[0] == "segment"]
+
+    def test_the_announcement_names_and_sounds_like_the_incoming_persona(self):
+        self.placed_by(A)
+        self.svc.speak(self.req_sess(B), self.TEXT, NEVER_LEFT)
+        spoken = f"{self.hedge.name}, algolearn hedge"
+        blend = (("am_adam", 0.25), ("bf_emma", 0.75))
+        self.assertEqual(self.whole(), [(spoken, blend, 1.3)])
+        self.assertEqual(self.segments(), [(0, blend, 1.3)])
+        (event,) = self.switches()
+        self.assertEqual((event["to_persona"], event["spoken"]), (self.hedge.name, spoken))
+
+    def test_a_bare_listen_switch_keeps_the_suffix_after_the_persona(self):
+        self.placed_by(A)
+        self.svc.listen(self.req_sess(B), 120, 2.0, 45)
+        self.assertEqual(self.announcements(), [f"{self.hedge.name}, algolearn hedge, still listening"])
+
+    def test_the_greeting_is_in_the_callers_voice(self):
+        self.link._state = tg.NONE
+
+        def dial(audio, rate):   # the greeting is synthesized before the dial; stop there
+            raise RuntimeError("not dialed in this test")
+        self.link.call = dial
+        with self.assertRaisesRegex(RuntimeError, "not dialed"):
+            self.svc.call(self.req_sess(B), "Hi Frank, it's the hedge bot with news.", True, 120, 2.0, 45)
+        self.assertEqual(self.whole(), [("Hi Frank, it's the hedge bot with news.",
+                                         (("am_adam", 0.25), ("bf_emma", 0.75)), 1.3)])
+
+    def test_a_change_between_sentences_lands_on_the_next_sentence(self):
+        self.placed_by(B)
+        real = self.engines.synthesize_segments
+
+        def changing(text, voice_of):
+            for i, audio in real(text, voice_of):
+                if i == 0:   # the owner's change arrives while sentence 0 is out
+                    self.personas.set("algolearn-hedge", speed=0.9)
+                yield i, audio
+        self.engines.synthesize_segments = changing
+        self.svc.speak(self.req_sess(B), "One. Two. Three.", NEVER_LEFT)
+        self.assertEqual([speed for _i, _blend, speed in self.segments()], [1.3, 0.9, 0.9])
+
+    def test_a_continue_replays_the_cached_sentence_in_its_voice(self):
+        self.placed_by(B)
+        self.link.cuts = [(2, False)]
+        self.link.holds = [(5.0, proto.CMD_RESUME)]
+        real = self.engines.synthesize_segments
+
+        def changing(text, voice_of):
+            for i, audio in real(text, voice_of):
+                yield i, audio
+                if i == 1:   # changed while held, after sentence 1 was synthesized
+                    self.personas.set("algolearn-hedge", speed=0.9)
+        self.engines.synthesize_segments = changing
+        self.svc.speak(self.req_sess(B), "One. Two. Three.", NEVER_LEFT)
+        self.assertEqual(self.synths(), [0, 1, 2])   # "Two." replayed, not synthesized again
+        self.assertEqual([speed for _i, _blend, speed in self.segments()], [1.3, 1.3, 0.9])
 
 
 class TestPieces(unittest.TestCase):
@@ -241,7 +336,8 @@ class TestPieces(unittest.TestCase):
             client.init_identity("/")
 
     def test_the_switch_line_comes_first(self):
-        line = '[took over the call from "algolearn-speak"; the owner heard the switch cue and this project\'s name first]\n'
+        line = ('[took over the call from "algolearn-speak"; the owner heard the switch cue and your persona\'s '
+                'name and this project\'s name first]\n')
         reply = {proto.REPLY_SWITCHED_FROM: "algolearn-speak", proto.REPLY_HELD_SECONDS: 12.0, "seconds": 2.0,
                  "text": "yes"}
         self.assertEqual(client._speak_result(reply), line + "[held 12s, then resumed]\nspoke for 2.0s" + proto.AUDIO_NOTE)

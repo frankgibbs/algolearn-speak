@@ -37,15 +37,19 @@ class FakeEngines:
         self.log = log
         self.fail_after: int | None = None   # raise after this many segments
 
-    def synthesize_segments(self, text: str):
+    def voice_pack(self, blend):
+        return eng.blend_key(blend)
+
+    def synthesize_segments(self, text: str, voice_of):
         self.log.append(("stream_start", text))
         for i, sentence in enumerate(s for s in text.split(". ") if s):
             if self.fail_after is not None and i == self.fail_after:
                 raise RuntimeError("kokoro failed")
+            voice_of()
             self.log.append(("synth", i + 1))
             yield i, np.full(RATE // 2, 0.1, dtype=np.float32)
 
-    def synthesize(self, text: str) -> np.ndarray:
+    def synthesize(self, text: str, voice) -> np.ndarray:
         self.log.append(("synthesize_whole", text))
         return np.zeros(RATE * 7, dtype=np.float32)
 
@@ -178,40 +182,55 @@ class FakeAudio:
         return self.a
 
 
-class TestEnginesStream(unittest.TestCase):
-    def engines(self, chunks: list[np.ndarray], seen: list):
-        e = eng.Engines("hexgrad/Kokoro-82M", "af_heart", 1.0, "large-v3-turbo", "en")
+class TestEnginesSynthesis(unittest.TestCase):
+    """Engines.synthesize_segments / synthesize against a fake KPipeline: one Kokoro call per
+    sentence, each with the voice voice_of() gives right then (docs/DESIGN_PERSONAS.md 4.5)."""
+
+    def engines(self, chunks: dict[str, list[np.ndarray]], seen: list):
+        e = eng.Engines("hexgrad/Kokoro-82M", "large-v3-turbo", "en")
 
         def kokoro(text, voice, speed, split_pattern):
             seen.append((text, voice, speed, split_pattern))
-            for i, c in enumerate(chunks):
+            for c in chunks.get(text, []):
                 seen.append("made")
-                yield types.SimpleNamespace(audio=FakeAudio(c), text_index=i)
+                yield types.SimpleNamespace(audio=FakeAudio(c), text_index=0)
 
         e._kokoro = kokoro
         return e
 
-    def test_stream_yields_each_segment_as_kokoro_makes_it(self):
+    def test_segments_are_lazy_one_kokoro_call_per_sentence(self):
         seen: list = []
-        e = self.engines([np.ones((1, 3), dtype=np.float64), np.zeros(2, dtype=np.float32)], seen)
-        it = e.synthesize_stream("A. B.")
-        first = next(it)
-        self.assertEqual(seen.count("made"), 1)   # lazy: the second segment is not made yet
-        self.assertEqual(first.dtype, np.float32)
-        self.assertEqual(first.shape, (3,))
-        self.assertEqual(next(it).shape, (2,))
-        self.assertEqual(seen[0], ("A. B.", "af_heart", 1.0, eng.SENTENCE_SPLIT))
+        e = self.engines({"A.": [np.ones((1, 3), dtype=np.float64)], "B.": [np.zeros(2, dtype=np.float32)]}, seen)
+        it = e.synthesize_segments("A. B.", lambda: eng.Voice("pack", 1.1))
+        i, first = next(it)
+        self.assertEqual(seen.count("made"), 1)   # lazy: the second sentence is not made yet
+        self.assertEqual((i, first.dtype, first.shape), (0, np.float32, (3,)))
+        i, second = next(it)
+        self.assertEqual((i, second.shape), (1, (2,)))
+        self.assertEqual([x for x in seen if x != "made"], [("A.", "pack", 1.1, eng.SENTENCE_SPLIT),
+                                                            ("B.", "pack", 1.1, eng.SENTENCE_SPLIT)])
 
-    def test_whole_synthesis_concatenates_the_stream(self):
-        e = self.engines([np.ones(3, dtype=np.float32), np.zeros(2, dtype=np.float32)], [])
-        np.testing.assert_array_equal(e.synthesize("A. B."), np.array([1, 1, 1, 0, 0], dtype=np.float32))
+    def test_voice_of_is_asked_once_per_sentence(self):
+        seen: list = []
+        e = self.engines({"A.": [np.ones(2)], "B.": [np.ones(2), np.ones(2)], "C.": [np.ones(2)]}, seen)
+        voices = iter([eng.Voice("p1", 1.0), eng.Voice("p2", 0.9), eng.Voice("p3", 1.2)])
+        got = list(e.synthesize_segments("A. B. C.", lambda: next(voices)))
+        self.assertEqual([i for i, _ in got], [0, 1, 1, 2])
+        self.assertEqual([(x[1], x[2]) for x in seen if x != "made"], [("p1", 1.0), ("p2", 0.9), ("p3", 1.2)])
+
+    def test_whole_synthesis_concatenates_in_one_voice(self):
+        seen: list = []
+        e = self.engines({"A. B.": [np.ones(3, dtype=np.float32), np.zeros(2, dtype=np.float32)]}, seen)
+        np.testing.assert_array_equal(e.synthesize("A. B.", eng.Voice("pack", 0.8)),
+                                      np.array([1, 1, 1, 0, 0], dtype=np.float32))
+        self.assertEqual(seen[0], ("A. B.", "pack", 0.8, eng.SENTENCE_SPLIT))
 
     def test_no_audio_raises(self):
-        e = self.engines([], [])
+        e = self.engines({}, [])
         with self.assertRaisesRegex(RuntimeError, "produced no audio"):
-            list(e.synthesize_stream("..."))
+            list(e.synthesize_segments("A.", lambda: eng.Voice("pack", 1.0)))
         with self.assertRaisesRegex(RuntimeError, "produced no audio"):
-            e.synthesize("...")
+            e.synthesize("...", eng.Voice("pack", 1.0))
 
 
 class ListenCues(ServiceCase):

@@ -33,7 +33,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --extra daemon --no-install-project --python 3.12
 
 # The code. .dockerignore keeps .env, .git, .venv, tests and docs out of the build context.
-COPY speak_server.py speak_protocol.py speak_engines.py speak_telegram.py speak_telegram_daemon.py speak_tone.py README.md LICENSE ./
+COPY speak_server.py speak_protocol.py speak_engines.py speak_personas.py speak_telegram.py speak_telegram_daemon.py speak_tone.py README.md LICENSE ./
 RUN uv sync --locked --extra daemon --no-editable --python 3.12
 
 ENV PATH=/opt/venv/bin:$PATH \

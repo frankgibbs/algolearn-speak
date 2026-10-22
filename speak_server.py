@@ -15,6 +15,10 @@ Telegram call placed by that daemon; there is no local microphone or speaker.
   call(greeting)  -> Telegram voice call to the owner; speak/listen/converse need it
                      connected (docs/DESIGN_TELEGRAM_CALL.md)
   hang_up()       -> end that call
+  persona()       -> this project's persona (name, voice, speed, personality),
+                     every persona, the voice ids and speed range
+  new_persona(), set_persona(...), add_to_personality(note)
+                  -> change this project's persona (docs/DESIGN_PERSONAS.md)
   status()        -> whether the tools are busy, how many requests are queued,
                      and the call state
   call_debug()    -> the daemon's recent call events and log tail
@@ -33,6 +37,16 @@ Every tool op also carries this client's identity (protocol 3, owner decision
 basename of the working folder at startup. The daemon uses it to announce a
 switch of session on the shared call; a result that follows a switch starts
 with a "[took over the call from ...]" line.
+
+Personas (protocol 4, owner decisions 2026-10-22, docs/DESIGN_PERSONAS.md): the
+project speaks as a persona kept by the daemon. This process also remembers
+the "<id>:<words_revision>" of the persona it last saw (`_persona_seen`) and
+sends it with every tool op; a reply that carries a new persona, or one whose
+name or personality changed, puts a "[persona: ...]" line in the result, and a
+speak, converse or call sent before the session saw its persona's current name
+and personality is refused (nothing spoken or dialed) with the persona in the
+error. A voice or speed change never refuses a turn: the daemon applies it per
+sentence.
 """
 
 from __future__ import annotations
@@ -59,7 +73,8 @@ CONNECT_TIMEOUT_SECONDS = 5.0
 QUICK_REPLY_TIMEOUT_SECONDS = 20.0
 MAX_DEBUG_LINES = 1000
 # Extra budget after "started" for a session-switch announcement (synthesis, the cue and the
-# spoken project name), plus len(project) / 5 s as the other budgets count text.
+# spoken "<persona name>, <project>"), plus (longest name + 2 + len(project)) / 5 s as the
+# other budgets count text: a fixed bound, whether or not the persona has been seen yet.
 ANNOUNCE_BUDGET_SECONDS = 10.0
 
 _daemon: tuple[str, int] | None = None   # set in main() from SPEAK_DAEMON
@@ -71,6 +86,10 @@ _identity: dict[str, str] | None = None
 # expects, or None. Updated only from a reply's "expect" key.
 _expect_lock = threading.Lock()
 _call_generation: str | None = None   # opaque "<daemon boot>:<call generation>"
+# The "<persona id>:<words_revision>" of this project's persona as last reported by the daemon, or
+# None before any report. Sent as FIELD_PERSONA_SEEN on every tool op; updated from any reply
+# (or error) that carries REPLY_PERSONA.
+_persona_seen: str | None = None
 
 
 class DaemonUnreachable(RuntimeError):
@@ -150,6 +169,31 @@ def _current_generation() -> str | None:
         return _call_generation
 
 
+def _apply_persona(reply: dict) -> None:
+    """Move `_persona_seen` to the reply's persona block. A refusal for a stale persona (an error
+    reply of kind value with a block) states the daemon's current key, so it applies
+    unconditionally, even when it is lower than the key seen. An ordinary reply moves only
+    forward: a different persona id always applies; the same id only at a higher
+    words_revision, so a reply that arrives after a newer one (two requests in flight) never
+    moves it back."""
+    global _persona_seen
+    if proto.REPLY_PERSONA not in reply:
+        return
+    block = reply[proto.REPLY_PERSONA]
+    refused = not reply.get("ok") and reply.get("kind") == proto.KIND_VALUE
+    with _expect_lock:
+        if _persona_seen is not None and not refused:
+            seen_id, seen_revision = _persona_seen.rsplit(":", 1)
+            if block["id"] == seen_id and block["words_revision"] <= int(seen_revision):
+                return
+        _persona_seen = proto.persona_key(block)
+
+
+def _current_persona_seen() -> str | None:
+    with _expect_lock:
+        return _persona_seen
+
+
 def _request(op: str, fields: dict, budget: float) -> dict:
     """One request on its own connection. Tool ops wait for the daemon's "started" with no
     timeout (the queue never rejects), then for the final reply within `budget` seconds;
@@ -158,7 +202,10 @@ def _request(op: str, fields: dict, budget: float) -> dict:
     for "no speech detected"."""
     addr = _address()
     if op in proto.LOCKED_OPS:
+        fields = {**_identity_fields(), proto.FIELD_PERSONA_SEEN: _current_persona_seen(), **fields}
+    elif op in proto.PERSONA_OPS:
         fields = {**_identity_fields(), **fields}
+    started = False
     try:
         sock = socket.create_connection(_daemon, timeout=CONNECT_TIMEOUT_SECONDS)
     except OSError as e:
@@ -177,6 +224,7 @@ def _request(op: str, fields: dict, budget: float) -> dict:
                     if reply.get("phase") != proto.PHASE_STARTED:
                         raise RuntimeError(f"speak daemon at {addr} sent {reply!r} for {op!r} "
                                            "where it must send 'started' or an error")
+                    started = True
                     reply, _ = proto.recv_msg(sock, deadline=time.monotonic() + budget)
             else:
                 reply, _ = proto.recv_msg(sock, deadline=time.monotonic() + budget)
@@ -188,11 +236,21 @@ def _request(op: str, fields: dict, budget: float) -> dict:
             if abort is not None:
                 abort.detach()
     _apply_expect(reply)
+    _apply_persona(reply)
     if not reply.get("ok"):
         message = reply.get("error") or f"speak daemon reported an error without a message: {reply!r}"
-        if proto.REPLY_SWITCHED_FROM in reply:   # the owner heard the announcement before the failure
-            message = f"{_switch_line(reply)}{message}"
         kind = reply.get("kind")
+        if op in proto.PERSONA_OPS and message == f"unknown op {op!r}":
+            # A daemon older than protocol 4 does not know the persona ops (and sends no version).
+            message = (f"protocol mismatch: speak daemon at {addr} does not know {op!r}, so it is older than "
+                       f"this client's protocol {proto.PROTOCOL_VERSION}; deploy the daemon, or use the client "
+                       "that matches it (git pull) and reconnect /mcp")
+        elif op in proto.VOICED_OPS and not started and kind == proto.KIND_VALUE and proto.REPLY_PERSONA in reply:
+            # Refused before the lock: this session had not seen its current persona.
+            message = (f"{_persona_line(reply)}Nothing was spoken (or dialed). Rewrite your words as "
+                       f"{reply[proto.REPLY_PERSONA]['name']} and send again.")
+        else:   # the owner heard the announcement before the failure; a persona change is news either way
+            message = f"{_switch_line(reply)}{_persona_line(reply)}{message}"
         if kind == proto.KIND_TIMEOUT:
             raise TimeoutError(message)
         if kind == proto.KIND_VALUE:
@@ -204,7 +262,7 @@ def _request(op: str, fields: dict, budget: float) -> dict:
 # ---------------------------------------------------------------- budgets after "started"
 
 def _speak_budget(text: str) -> float:
-    """Synthesis and playback, plus the longest the owner may hold Angie (the holds of one
+    """Synthesis and playback, plus the longest the owner may hold the speech (the holds of one
     op add up to at most HOLD_MAX_SECONDS; then the daemon ends the call and replies)."""
     return 60.0 + len(text) / 5 + proto.HOLD_MAX_SECONDS
 
@@ -214,7 +272,7 @@ def _listen_budget(max_seconds: float, start_timeout_seconds: float) -> float:
 
 
 def _announce_budget() -> float:
-    return ANNOUNCE_BUDGET_SECONDS + len(_identity_fields()[proto.FIELD_PROJECT]) / 5
+    return ANNOUNCE_BUDGET_SECONDS + (proto.PERSONA_NAME_MAX + 2 + len(_identity_fields()[proto.FIELD_PROJECT])) / 5
 
 
 def _listen_fields(max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> dict:
@@ -231,11 +289,32 @@ def _switch_line(reply: dict) -> str:
     if proto.REPLY_SWITCHED_FROM not in reply:
         return ""
     return (f"[took over the call from \"{reply[proto.REPLY_SWITCHED_FROM]}\"; the owner heard the switch "
-            f"cue and this project's name first]\n")
+            f"cue and your persona's name and this project's name first]\n")
+
+
+def _persona_line(reply: dict) -> str:
+    """'[persona: you are <Name>; voice ...; speed ...; personality: ...]\n' when the reply
+    carries this project's persona (new to this session, or its name or personality changed);
+    "" otherwise. On the house persona it says "you are <Name>, the house persona", so the agent
+    knows not to add to its personality on its own. Comes after the switch line and before the
+    held line."""
+    if proto.REPLY_PERSONA not in reply:
+        return ""
+    p = reply[proto.REPLY_PERSONA]
+    voice = ", ".join(f"{vid} {weight:g}" for vid, weight in p["voice"].items())
+    personality = " / ".join(p["personality"]) if p["personality"] else "(none yet)"
+    shared = f"; shared with {', '.join(p['shared_with'])}" if p["shared_with"] else ""
+    house = ", the house persona" if p["house"] else ""
+    return f"[persona: you are {p['name']}{house}; voice {voice}; speed {p['speed']:g}; personality: {personality}{shared}]\n"
+
+
+def _lead(reply: dict) -> str:
+    """The lines every tool result starts with: the switch line, then the persona line."""
+    return _switch_line(reply) + _persona_line(reply)
 
 
 def _held_prefix(reply: dict) -> str:
-    """"[held 42s, then resumed]\n" when the owner held Angie and she finished; "" otherwise."""
+    """"[held 42s, then resumed]\n" when the owner held the speech and it finished; "" otherwise."""
     held = reply[proto.REPLY_HELD_SECONDS]
     return f"[held {held:.0f}s, then resumed]\n" if held > 0 else ""
 
@@ -252,18 +331,18 @@ def _expired_result(reply: dict) -> str:
 
 def _speak_result(reply: dict) -> str:
     if proto.REPLY_INTERRUPTION in reply:
-        return _switch_line(reply) + _expired_result(reply)
-    return f"{_switch_line(reply)}{_held_prefix(reply)}spoke for {reply['seconds']:.1f}s{AUDIO_NOTE}"
+        return _lead(reply) + _expired_result(reply)
+    return f"{_lead(reply)}{_held_prefix(reply)}spoke for {reply['seconds']:.1f}s{AUDIO_NOTE}"
 
 
 def _converse_result(reply: dict) -> str:
     if proto.REPLY_INTERRUPTION in reply:
-        return _switch_line(reply) + _expired_result(reply)
-    return f"{_switch_line(reply)}{_held_prefix(reply)}{reply['text']}{AUDIO_NOTE}"
+        return _lead(reply) + _expired_result(reply)
+    return f"{_lead(reply)}{_held_prefix(reply)}{reply['text']}{AUDIO_NOTE}"
 
 
 def _listen_result(reply: dict) -> str:
-    return f"{_switch_line(reply)}{reply['text']}"
+    return f"{_lead(reply)}{reply['text']}"
 
 
 def _speak_sync(text: str) -> str:
@@ -298,14 +377,15 @@ def _call_sync(greeting: str, override_quiet_hours: bool, max_seconds: float, si
                       "expect_generation": _current_generation()},
                      budget)
     if reply["outcome"] == proto.ANSWERED:
-        return f"{proto.ANSWERED}\n{reply['text']}{AUDIO_NOTE}"
-    return reply["outcome"]
+        return f"{_persona_line(reply)}{proto.ANSWERED}\n{reply['text']}{AUDIO_NOTE}"
+    return f"{_persona_line(reply)}{reply['outcome']}"
 
 
 def _hang_up_sync() -> str:
     global _call_generation
     try:
-        return _request(proto.OP_HANG_UP, {}, QUICK_REPLY_TIMEOUT_SECONDS)["outcome"]
+        reply = _request(proto.OP_HANG_UP, {}, QUICK_REPLY_TIMEOUT_SECONDS)
+        return f"{_persona_line(reply)}{reply['outcome']}"
     finally:
         with _expect_lock:
             _call_generation = None   # the owner asked to hang up: never a call-back, even if this raised
@@ -333,6 +413,24 @@ def _set_call_debug_sync(enabled: bool) -> dict:
         return {"daemon": f"unreachable: {e}"}
 
 
+def _persona_sync() -> dict:
+    return _strip(_request(proto.OP_PERSONA, {}, QUICK_REPLY_TIMEOUT_SECONDS))
+
+
+def _new_persona_sync() -> dict:
+    return _strip(_request(proto.OP_PERSONA_NEW, {}, QUICK_REPLY_TIMEOUT_SECONDS))
+
+
+def _set_persona_sync(name: str | None, voice: dict[str, float] | None, speed: float | None,
+                      personality: list[str] | None) -> dict:
+    return _strip(_request(proto.OP_PERSONA_SET, {"name": name, "voice": voice, "speed": speed,
+                                                  "personality": personality}, QUICK_REPLY_TIMEOUT_SECONDS))
+
+
+def _add_to_personality_sync(note: str) -> dict:
+    return _strip(_request(proto.OP_PERSONA_ADD, {"note": note}, QUICK_REPLY_TIMEOUT_SECONDS))
+
+
 def _status_sync() -> dict:
     try:
         reply = _request(proto.OP_STATUS, {}, QUICK_REPLY_TIMEOUT_SECONDS)
@@ -356,7 +454,25 @@ def _status_sync() -> dict:
 _INSTRUCTIONS = """\
 Voice tools for talking with the owner (Frank) over a Telegram call. Owner conventions:
 
-- On calls and in anything spoken you are "Angie", never Claude ("Hi Frank, it's Angie").
+- You have a persona: a name, a voice and a personality, shared by every project that
+  uses it. Call persona() before your first call or converse. On calls and in anything
+  spoken you are that name, never Claude, and you keep to its personality.
+- A result line "[persona: ...]" means your persona is new or changed: from now on you
+  are what it says. A ValueError carrying a persona means nothing was spoken or dialed;
+  rewrite your words as that persona and send them again.
+- When the owner asks to move this project to another persona, call
+  set_persona(name=...); to rename your persona (for every project sharing it), the
+  same call with the new name; for a brand-new persona, new_persona().
+- As you learn your role, add short lines to your personality with
+  add_to_personality(): tone, what the owner wants from you, standing context. Keep each
+  line one sentence. This is only for a persona the owner assigned: the house persona
+  (the persona line says "the house persona"; in persona() its "house" is true) never
+  grows on its own, so add to it only when the owner asks. He can still change it in a
+  persona review or on request.
+- "Persona review": read your whole persona back, one item at a time, and apply the
+  owner's trims and changes with set_persona(personality=[...]).
+- Change your voice or speed only when the owner asks. The persona tools act on your
+  own project only.
 - Spoken text is conversational: plain sentences, no markdown, lists or code.
 - One topic at a time, one aspect at a time, and one question at a time, so the
   conversation flows linearly.
@@ -404,10 +520,11 @@ Voice tools for talking with the owner (Frank) over a Telegram call. Owner conve
   (around 15 minutes or more). Never use speak() for a quick check or a short task.
 - Do not offer to call back; say you will come back with the result. When the work is
   done, check status(): if its call field says the call is still connected, converse()
-  with the result (it waits its turn, and the owner hears the switch cue and your
-  project's name first). Use call() only if the call has ended.
+  with the result (it waits its turn, and the owner hears the switch cue, your persona's
+  name and your project's name first). Use call() only if the call has ended.
 - When your speak/listen/converse is the first audio on the call after another
-  session's, the daemon first plays a double beep and speaks your project's name, and
+  session's, the daemon first plays a double beep and speaks your persona's name and
+  your project's name, and
   your result's first line is '[took over the call from "<other project>"; ...]'. The
   owner was just talking with that other session, and your words (written before you
   knew) followed the announcement. In your next spoken turn, open with ONE sentence that
@@ -452,10 +569,10 @@ _QUEUE_NOTE = """
 
     Switch of session: if the previous audio on the call came from another
     session (the greeting counts as the calling session's), the daemon first
-    plays a double beep and speaks this project's name, and the result (or the
-    error) starts with the line '[took over the call from "<other project>";
-    the owner heard the switch cue and this project's name first]'. Recap where
-    you left off and your last question in one sentence in your next turn.
+    plays a double beep and speaks your persona's name and your project's name,
+    and the result (or the error) starts with the line '[took over the call from
+    "<other project>"; ...]'. Recap where you left off and your last question in
+    one sentence in your next turn.
 """
 
 
@@ -558,7 +675,7 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
     BEFORE dialing, so the phone never rings. Lengthen it with the context of
     why you are calling; with nothing to report on a fresh conversation, open
     with something playful (a joke, something funny or flirty). Example:
-    "Hi Frank, it's Angie. The backtest finished a few minutes ago and the
+    "Hi Frank, it's <your persona's name>. The backtest finished a few minutes ago and the
     holdout came back clean, but there is one result I want your read on
     before I do anything else. Do you have a minute?". Works wherever their
     phone has signal; the call is placed by the speak daemon on patrick, so it
@@ -683,6 +800,48 @@ async def hang_up() -> str:
     queue like the other call tools.
     """
     return await _run(_hang_up_sync)
+
+
+@mcp.tool()
+@_doc("""Your project's persona (name, voice blend, speed, personality, the projects sharing it), every persona, and the voice ids and speed range you may use.
+
+    Returns `{"persona": {...}, "personas": [{"name", "house", "voice", "speed", "projects"}],
+    "voices": [ids], "speed_range": [min, max], "pool_left": n}`. Never waits for the call.
+""")
+async def persona() -> dict:
+    return await _run(_persona_sync)
+
+
+@mcp.tool()
+@_doc("""Give your project a brand-new persona with an unused name from the pool and the default voice; returns it.
+
+    Raises ValueError "every pool name is in use; ask the owner for a name" when the pool
+    is used up.
+""")
+async def new_persona() -> dict:
+    return await _run(_new_persona_sync)
+
+
+@mcp.tool()
+@_doc("""Change your persona: name alone moves your project onto the persona of that name, or renames yours (for every project sharing it) when no persona has it; voice {id: weight} and speed change how it sounds for every project using it from the next sentence; personality [lines] replaces the note (persona review).
+
+    `name` (one word of 2 to 12 letters) cannot be combined with the others. `voice` takes
+    1 to 4 English voice ids from `persona()` with positive weights (normalized to sum 1);
+    `speed` is within `persona()`'s speed_range.
+""")
+async def set_persona(name: str | None = None, voice: dict[str, float] | None = None, speed: float | None = None,
+                      personality: list[str] | None = None) -> dict:
+    return await _run(_set_persona_sync, name, voice, speed, personality)
+
+
+@mcp.tool()
+@_doc("""Add one line to your persona's personality.
+
+    Raises ValueError "the personality is full; ask the owner for a persona review" past
+    4000 characters.
+""")
+async def add_to_personality(note: str) -> dict:
+    return await _run(_add_to_personality_sync, note)
 
 
 @mcp.tool()

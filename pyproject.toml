@@ -43,7 +43,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["speak_server.py", "speak_protocol.py", "speak_engines.py", "speak_telegram.py",
+only-include = ["speak_server.py", "speak_protocol.py", "speak_engines.py", "speak_personas.py", "speak_telegram.py",
                 "speak_telegram_daemon.py", "speak_tone.py"]
 
 [tool.hatch.metadata]

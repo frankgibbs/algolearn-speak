@@ -11,12 +11,16 @@ Three layers, each with fakes as the other test files use (no CUDA, no Telegram)
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
 import unittest
+import weakref
+import zoneinfo
 from unittest import mock
 
 import numpy as np
@@ -27,6 +31,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, HERE)   # the link test harness
 
 import speak_engines as eng  # noqa: E402
+import speak_personas as sp  # noqa: E402
 import speak_protocol as proto  # noqa: E402
 import speak_server as client  # noqa: E402
 import speak_telegram as tg  # noqa: E402
@@ -354,23 +359,44 @@ class Clock:
         return self.t
 
 
+TEST_VOICES = ["af_bella", "af_heart", "am_adam", "bf_emma", "bm_george"]
+
+
+def temp_personas(record_event=lambda event, **fields: None) -> sp.PersonaStore:
+    """A persona store in a fresh temporary directory (removed with the store), seeded with
+    Angie on af_heart at 1.0 as the daemon seeds it."""
+    tmp = tempfile.mkdtemp(prefix="speak-personas-")
+    store = sp.PersonaStore.open(os.path.join(tmp, "personas.json"), TEST_VOICES, "af_heart", 1.0,
+                                 zoneinfo.ZoneInfo("America/Los_Angeles"), record_event)
+    weakref.finalize(store, shutil.rmtree, tmp, True)
+    return store
+
+
 class FakeEngines:
-    """One 0.5 s segment per sentence (split as Kokoro splits), tagged with its index; logged."""
+    """One 0.5 s segment per sentence (split as Kokoro splits), tagged with its index; logged.
+    A voice pack is the blend's key, so `voices` (what each synthesis spoke with) is readable."""
 
     def __init__(self, log: list, split_long: int | None = None) -> None:
         self.log = log
         self.split_long = split_long   # this sentence index comes as two segments
         self.heard = "hi Angie"
+        self.voices: list[tuple] = []   # ("segment", sentence index, pack, speed) / ("whole", text, pack, speed)
 
-    def synthesize_segments(self, text: str):
+    def voice_pack(self, blend):
+        return eng.blend_key(blend)
+
+    def synthesize_segments(self, text: str, voice_of):
         for i, _ in enumerate(eng.split_sentences(text)):
+            voice = voice_of()
+            self.voices.append(("segment", i, voice.pack, voice.speed))
             for _part in range(2 if i == self.split_long else 1):
                 self.log.append(("synth", i))
                 yield i, np.full(RATE // 2, 0.1, dtype=np.float32)
 
-    def synthesize(self, text: str) -> np.ndarray:
+    def synthesize(self, text: str, voice) -> np.ndarray:
         """Whole synthesis (the greeting, a switch announcement): 7 s, over the opener minimum."""
         self.log.append(("synthesize", text))
+        self.voices.append(("whole", text, voice.pack, voice.speed))
         return np.zeros(RATE * 7, dtype=np.float32)
 
     def transcribe(self, audio: np.ndarray) -> str:
@@ -453,11 +479,13 @@ class ServiceLock(d.AudioLock):
 
 class LockedService(d.SpeakService):
     """SpeakService whose tool ops run under the audio lock as their request's session, as
-    the daemon's handler runs them (AudioLock.take_floor refuses a session without it)."""
+    the daemon's handler runs them (AudioLock.take_floor refuses a session without it), after
+    the project's persona assignment, as SpeakDaemon.admit does before the lock."""
 
 
 def _locked(name: str):
     def op(self, sess, *args, **kwargs):
+        self.personas.ensure(sess.speaker.project)
         self.lock.acquire(name, "test", sess.speaker)
         try:
             return getattr(d.SpeakService, name)(self, sess, *args, **kwargs)
@@ -471,8 +499,11 @@ for _name in ("speak", "listen", "converse", "call", "hang_up"):
     setattr(LockedService, _name, _locked(_name))
 
 
-def locked_service(link, engines, settings: dict, record_event) -> LockedService:
-    return LockedService(link, engines, settings, ServiceLock(record_event))
+def locked_service(link, engines, settings: dict, record_event, personas: sp.PersonaStore | None = None) -> LockedService:
+    """`personas` defaults to a fresh store whose events are not recorded (the link's event
+    list stays the service's own)."""
+    return LockedService(link, engines, personas if personas is not None else temp_personas(), settings,
+                         ServiceLock(record_event))
 
 
 class HoldServiceCase(unittest.TestCase):
@@ -660,7 +691,8 @@ class TestPhraseSettings(unittest.TestCase):
     def test_load_settings_reads_them(self):
         env = {"SPEAK_KOKORO_MODEL": "m", "SPEAK_VOICE": "af_heart", "SPEAK_SPEED": "1.0",
                "SPEAK_WHISPER_MODEL": "w", "SPEAK_LANGUAGE": "en", "SPEAK_QUIET_HOURS": "22:00-07:00",
-               "SPEAK_HOLD_PHRASE": "hold on", "SPEAK_RESUME_PHRASE": "continue", "TZ": "America/Los_Angeles"}
+               "SPEAK_HOLD_PHRASE": "hold on", "SPEAK_RESUME_PHRASE": "continue", "TZ": "America/Los_Angeles",
+               "SPEAK_PERSONAS_FILE": "/var/lib/speak/personas.json"}
         with mock.patch.dict(os.environ, env):
             self.assertEqual(d.load_settings()["phrases"], {"hold on": proto.CMD_HOLD, "continue": proto.CMD_RESUME})
         env.pop("SPEAK_HOLD_PHRASE")
@@ -697,22 +729,23 @@ class TestSegments(unittest.TestCase):
         self.assertEqual(eng.split_sentences("No split here"), ["No split here"])
 
     def test_synthesize_segments_tags_each_segment_with_its_sentence(self):
-        e = eng.Engines("hexgrad/Kokoro-82M", "af_heart", 1.0, "large-v3-turbo", "en")
+        e = eng.Engines("hexgrad/Kokoro-82M", "large-v3-turbo", "en")
+        chunks = {"A.": 1, "B.": 2, "C.": 0, "D.": 1}   # "B." in two chunks; "C." had no phonemes
 
         def kokoro(text, voice, speed, split_pattern):
-            for idx in (0, 1, 1, 3):   # sentence 1 in two chunks; sentence 2 had no phonemes
-                yield types.SimpleNamespace(audio=FakeAudio(np.ones(2)), text_index=idx)
+            for _ in range(chunks[text]):
+                yield types.SimpleNamespace(audio=FakeAudio(np.ones(2)), text_index=0)
 
         e._kokoro = kokoro
-        got = list(e.synthesize_segments("A. B. C. D."))
+        got = list(e.synthesize_segments("A. B. C. D.", lambda: eng.Voice("pack", 1.0)))
         self.assertEqual([i for i, _ in got], [0, 1, 1, 3])
         self.assertEqual(got[0][1].dtype, np.float32)
 
     def test_a_segment_without_its_index_raises(self):
-        e = eng.Engines("hexgrad/Kokoro-82M", "af_heart", 1.0, "large-v3-turbo", "en")
+        e = eng.Engines("hexgrad/Kokoro-82M", "large-v3-turbo", "en")
         e._kokoro = lambda *a, **k: iter([types.SimpleNamespace(audio=FakeAudio(np.ones(2)), text_index=None)])
         with self.assertRaisesRegex(RuntimeError, "text_index"):
-            list(e.synthesize_segments("A."))
+            list(e.synthesize_segments("A.", lambda: eng.Voice("pack", 1.0)))
 
 
 # ---------------------------------------------------------------------------- the client

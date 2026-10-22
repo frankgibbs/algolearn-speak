@@ -24,6 +24,12 @@ anywhere. `speak`, `listen` and `converse` work only while a Telegram call is
 connected and raise otherwise; there is no fallback. Only text crosses the
 LAN; the audio travels only over the Telegram call.
 
+**Personas (owner decisions 2026-10-22, docs/DESIGN_PERSONAS.md).** Every
+project speaks as its persona: a name, a voice blend, a speed and a
+personality, kept by the daemon (see "Personas" below). "Angie" is the
+persona the daemon seeds and the one every new project joins; it is no
+longer the only name. Built in the working tree, not deployed.
+
 **Open to the LAN by design (owner decision).** Port 8765 has no
 authentication and no TLS: any LAN computer with the thin client can call the
 owner and hold a spoken conversation.
@@ -32,11 +38,15 @@ owner and hold a spoken conversation.
 
 | Tool | What it does |
 |---|---|
-| `speak(text)` | The daemon synthesizes `text` with Kokoro-82M one segment (a sentence) at a time and plays each into the connected call as soon as it is made, synthesizing the next while earlier ones play (owner decision 2026-10-16). Returns once all of it has played, with the spoken duration. While it plays the owner can hold it (see "Hold on / continue" below): `[held Ns, then resumed]` on its own line comes first when it was held; an expired hold returns the expired form instead. A `[took over the call from "<project>"; ...]` line comes before all of that when this session took the call over (see "Switch of session" below). When it finishes it gives up the floor (see "The floor" below), except when the call ended under it. |
-| `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep (the ear is open), then records the owner's call audio until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech), then Whisper large-v3-turbo transcribes. Once text is in hand, a rising two-note chime tells the owner their words were captured (owner decision 2026-10-16). No ear-closed beep and no spoken acknowledgement. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. After a switch of session the switch cue and "<project name>, still listening" come before the ear-open beep, and the result (or the `TimeoutError` message) starts with the `[took over the call from ...]` line. Keeps the floor, a no-speech `TimeoutError` included. |
-| `converse(text, ...)` | `speak` then `listen` under one lock hold. Returns the user's words, after a `[held Ns, then resumed]` line when the speech was held. After an expired hold it does not listen and returns the expired form. The `[took over the call from ...]` line comes first after a switch of session. Keeps the floor. |
-| `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is the whole opening, spoken the moment they answer: who is calling, why, and the context, ending with a question or invitation. It must be at least 6 s when spoken (measured on the synthesized audio); a shorter one raises `ValueError` BEFORE dialing (phone never rings; owner decision 2026-10-12) telling the model to add the context of why it is calling, or, on a fresh conversation with nothing to report, to open with something playful (a joke, something funny or flirty). Never padded. Once answered, `call` immediately does the `listen` (ear-open beep, VAD, Whisper, rising chime) under the same lock hold and returns the owner's words; listen parameters and defaults match `converse`, and a listen timeout or a drop raises as in `listen` (the call stays connected on a timeout). Returns `answered\n<their words>\n(audio: telegram)`, `already connected` (greeting not spoken, no listen), `not answered (declined or no answer)`, `busy (the owner's Telegram reports a call in progress)` (Telegram discarded it as busy; the phone did not ring), `answered, then hung up during the greeting` (the owner picked up and ended it before the greeting finished; one call back right away is allowed, then the one-hour rule), `hung up` (another session's `hang_up` ended it during the greeting), `answered but audio failed to connect: <error>` (the owner picked up but media failed; the daemon container restarts itself) or `not called: quiet hours (...)`. Check order: quiet hours, already connected, then the greeting length, then the wait until 10 s have passed since the last call ended, then the dial. |
+| `speak(text)` | The daemon synthesizes `text` with Kokoro-82M one segment (a sentence) at a time and plays each into the connected call as soon as it is made, synthesizing the next while earlier ones play (owner decision 2026-10-16). Returns once all of it has played, with the spoken duration. While it plays the owner can hold it (see "Hold on / continue" below): `[held Ns, then resumed]` on its own line comes first when it was held; an expired hold returns the expired form instead. A `[took over the call from "<project>"; ...]` line comes before all of that when this session took the call over (see "Switch of session" below), then a `[persona: ...]` line when the reply carries the project's persona (see "Personas" below). Speaks in the project's persona's voice, read again before each sentence. When it finishes it gives up the floor (see "The floor" below), except when the call ended under it. |
+| `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep (the ear is open), then records the owner's call audio until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech), then Whisper large-v3-turbo transcribes. Once text is in hand, a rising two-note chime tells the owner their words were captured (owner decision 2026-10-16). No ear-closed beep and no spoken acknowledgement. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. After a switch of session the switch cue and "<persona name>, <project name>, still listening" come before the ear-open beep, and the result (or the `TimeoutError` message) starts with the `[took over the call from ...]` line. Keeps the floor, a no-speech `TimeoutError` included. |
+| `converse(text, ...)` | `speak` then `listen` under one lock hold. Returns the user's words, after a `[held Ns, then resumed]` line when the speech was held. After an expired hold it does not listen and returns the expired form. The `[took over the call from ...]` line comes first after a switch of session, then the `[persona: ...]` line when there is one. Keeps the floor. |
+| `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is the whole opening, spoken the moment they answer in the calling project's persona's voice: who is calling (by the persona's name), why, and the context, ending with a question or invitation. It must be at least 6 s when spoken (measured on the synthesized audio); a shorter one raises `ValueError` BEFORE dialing (phone never rings; owner decision 2026-10-12) telling the model to add the context of why it is calling, or, on a fresh conversation with nothing to report, to open with something playful (a joke, something funny or flirty). Never padded. Once answered, `call` immediately does the `listen` (ear-open beep, VAD, Whisper, rising chime) under the same lock hold and returns the owner's words; listen parameters and defaults match `converse`, and a listen timeout or a drop raises as in `listen` (the call stays connected on a timeout). Returns `answered\n<their words>\n(audio: telegram)`, `already connected` (greeting not spoken, no listen), `not answered (declined or no answer)`, `busy (the owner's Telegram reports a call in progress)` (Telegram discarded it as busy; the phone did not ring), `answered, then hung up during the greeting` (the owner picked up and ended it before the greeting finished; one call back right away is allowed, then the one-hour rule), `hung up` (another session's `hang_up` ended it during the greeting), `answered but audio failed to connect: <error>` (the owner picked up but media failed; the daemon container restarts itself) or `not called: quiet hours (...)`. Check order: quiet hours, already connected, then the greeting length, then the wait until 10 s have passed since the last call ended, then the dial. |
 | `hang_up()` | End that call (only when the owner asks). Always clears the session's call expectation. |
+| `persona()` | This project's persona (the block: name, whether it is the house persona, voice blend, speed, personality, the projects sharing it), every persona with its projects, the English voice ids, the speed range and how many pool names are left. No lock. Agents call it first, before their first `call` or `converse`. |
+| `new_persona()` | Moves this project onto a brand-new persona: a random unused pool name, the default voice and speed. Only when the owner asks. Raises `ValueError` once the pool is used up. No lock. |
+| `set_persona(name=None, voice=None, speed=None, personality=None)` | One change per call to this project's persona. `name` alone moves the project onto the persona of that name (case-insensitive), or renames its own persona for every project sharing it when no persona has the name. `voice` (`{voice id: weight}`, 1 to 4 English voices, normalized to sum 1), `speed` (0.5 to 2.0) and `personality` (the whole note as a list of lines, for a persona review) change the persona for every project using it. Voice and speed only when the owner asks. No lock. |
+| `add_to_personality(note)` | Appends one line to the persona's personality (agents do this on their own as they learn their role, except on the house persona, which grows only when the owner asks). Raises once the note would pass 4000 characters: ask the owner for a persona review. No lock. |
 | `status()` | `{busy, current_tool, waiting, call}`: what holds the daemon's lock (`"<tool> (<client ip>)"`; `transcribe` is an HTTP whisper API request), how many requests from every session wait behind it, and the call state (`none`/`ringing`/`connected`). When the daemon is not reached, `call` is `daemon unreachable: <error>` and the other three are null. When the daemon speaks another protocol version, `call` is `protocol mismatch: ...` (update the client or deploy the daemon) and the other three are null. Never raises, never waits on the lock. |
 | `call_debug(lines=50)` / `set_call_debug(enabled)` | The daemon's recent call events and log tail; DEBUG logging on or off at runtime. No lock. `{"daemon": "unreachable: <error>"}` when the daemon is not reached. |
 
@@ -101,18 +111,21 @@ announcement is built in the working tree, not deployed yet.
 - **The daemon announces the switch, not the agents.** Every client sends a
   session id (`secrets.token_hex(8)`, generated once per client process,
   `init_identity` in `speak_server.py`) and a project name (the basename of
-  `os.getcwd()` when the client starts). No agent names and no per-session
-  voices.
+  `os.getcwd()` when the client starts). The name and voice the owner hears
+  are the project's persona's (see "Personas" below), not per session: two
+  sessions of one project, or two projects sharing a persona, sound alike.
 - A `speak`, `listen` or `converse` whose session differs from the session of
   the previous audio op on the same call is preceded by the switch cue (two
-  short 523 Hz beeps, `switch_pcm` in `speak_tone.py`) and then the project
-  name made speakable (`speakable_name`: runs of non-alphanumerics become one
-  space, so `algolearn-speak` is spoken "algolearn speak"). For a `speak` or
+  short 523 Hz beeps, `switch_pcm` in `speak_tone.py`) and then "<persona
+  name>, <project name made speakable>" (`speakable_name`: runs of
+  non-alphanumerics become one space, so `algolearn-speak` with the persona
+  Nova is spoken "Nova, algolearn speak"; owner decision 2026-10-22), in the
+  incoming project's persona's voice (owner decision 2026-10-22). For a `speak` or
   `converse` nothing else is said. The announcement is synthesized whole and
   played as one plain play: like the greeting and the cues, it cannot be held.
 - **A bare `listen` (owner decision 2026-10-20):** when the op that causes
-  the switch is `listen`, the announcement after the cue is "<speakable
-  project name>, still listening" (`SWITCH_LISTEN_SUFFIX` in
+  the switch is `listen`, the announcement after the cue is "<persona name>,
+  <speakable project name>, still listening" (`SWITCH_LISTEN_SUFFIX` in
   `speak_telegram_daemon.py`), still one clip synthesized whole, then the ear
   opens as usual. The live test that led to it: a session waiting in a bare
   `listen` got the turn after another session's converse, and the owner heard
@@ -127,7 +140,7 @@ announcement is built in the working tree, not deployed yet.
   placed it. `call` returning `already connected`, and `hang_up`, leave the
   turn as it is. Two sessions in the same folder are still two sessions: the
   switch is announced with the same name.
-- The switch cue and project name are also what tells the owner the floor
+- The switch cue and the names are also what tells the owner the floor
   changed hands (see "The floor" below); there is no separate floor cue.
 - The turn moves only once the announcement has played. An op refused before
   it plays (no call, empty text) or a call that drops during it leaves the
@@ -135,18 +148,123 @@ announcement is built in the working tree, not deployed yet.
 - **The reply carries `switched_from`** (the previous session's project)
   whenever the switch was announced, on a failure too (the owner heard it).
   The client puts `[took over the call from "<project>"; the owner heard the
-  switch cue and this project's name first]` on the result's own first line,
-  before a held or expired line, and in front of an error's message.
+  switch cue and your persona's name and this project's name first]` on the
+  result's own first line, before a persona, held or expired line, and in
+  front of an error's message.
 - The server instructions tell agents: after that line, the owner has just
   heard another project; open the next turn with one sentence recapping where
   you left off and your last question, unless his reply already answers it.
 - Event (`call_debug`): `session_switch` (`tool`, `from_project`,
-  `to_project`, `spoken` (the full text spoken, the "still listening" suffix
+  `to_project`, `to_persona` (the incoming persona's name), `spoken` (the full text spoken, the "still listening" suffix
   included), `announce_s`).
-- The client adds `10 + len(project)/5` s to the speak, listen and converse
-  budgets for the announcement; that covers the longer listen announcement
-  too (about 3 s of audio for `algolearn-speak` against 13 s added, on top of
-  the listen budget's own 60 s margin).
+- The client adds `10 + (12 + 2 + len(project))/5` s to the speak, listen
+  and converse budgets for the announcement (12 is the longest persona name,
+  a fixed bound so the budget never depends on whether the client has seen
+  its persona); that covers the longer listen announcement too, on top of
+  the listen budget's own 60 s margin.
+
+## Personas (owner decisions 2026-10-22)
+
+Design: `docs/DESIGN_PERSONAS.md`. Built in the working tree, not deployed.
+Protocol 4.
+
+- **What a persona is (owner decisions):** a name (one word of 2 to 12
+  letters, unique ignoring case), a voice blend (1 to 4 Kokoro voices with
+  weights, normalized to sum 1, e.g. 70% `af_heart` + 30% `af_bella`), a
+  speed (0.5 to 2.0) and a personality note (lines of tone, attributes and
+  role context, at most 4000 characters in all). Each project (the client's
+  project name) points at exactly one persona; several projects may share
+  one, and a shared name IS a shared persona. A change to a persona's voice,
+  speed or personality applies to every project using it. No delete tool:
+  unused personas are kept.
+- **Storage:** one JSON file (schema 1), `SPEAK_PERSONAS_FILE`
+  (`/var/lib/speak/personas.json`) on the `speak_state` docker volume, so it
+  survives rebuilds. `speak_personas.py` (`PersonaStore`) validates it on
+  load and on every change, applies a change to a copy, writes it
+  atomically (`<file>.tmp`, fsync, `os.replace`, fsync of the directory)
+  and swaps it in the moment `os.replace` succeeds, so memory matches the
+  disk; a failed directory fsync raises `PersonaDirSyncError`, saying the
+  change is on disk. A write holds the store lock across its fsyncs
+  (accepted: writes are rare, the `persona_of` reads are per sentence). A file that does not parse or validate stops
+  the daemon at startup and is never replaced; a change that does not
+  validate raises `ValueError` to the tool and writes nothing.
+- **Seeded Angie and new projects (owner decisions):** on a first start (no
+  file) the daemon seeds one persona, Angie, on `SPEAK_VOICE` and
+  `SPEAK_SPEED`, and marks it the house persona (by id, so a rename keeps
+  it the house persona). A project with no persona joins the house persona
+  on its first identity-carrying request (any tool op or persona op), with
+  no question to the owner. The owner moves a project whenever he wants, by
+  asking.
+- **Moving and renaming (owner decisions):** `set_persona(name=X)` moves the
+  project onto the persona named X when one exists (never a copy); when no
+  persona has the name, it renames the project's current persona for every
+  project sharing it. `new_persona()` (only when the owner asks) moves the
+  project onto a fresh persona with a random unused pool name and the
+  default voice and speed. The pool: Angie, Nova, Ruby, Hazel, Paige,
+  Stella, Gwen, Willow, Margo, Juno, Tess, Fiona; `new_persona` raises once
+  every pool name is in use.
+- **English voices only (owner decision):** ids starting `af_`, `am_`, `bf_`
+  or `bm_`. The expected set is the constant `ENGLISH_VOICES` in
+  `speak_engines.py`: the 28 English voices of `hexgrad/Kokoro-82M`
+  (verified from the Hub listing 2026-10-22; the repo has 54 voices).
+  At startup `Engines.load_voices` refuses a `SPEAK_VOICE` that is not one
+  of them before any fetch, then fetches exactly those packs
+  (`snapshot_download` with one `allow_patterns` entry per id, into the HF
+  cache on `speak_models`). With the Hub unreachable `snapshot_download` may
+  serve the cached snapshot (owner decision 2026-10-22); the daemon then
+  checks every one of the 28 is there and refuses to start, naming the
+  missing ids, when any is not. It loads each once on the CPU as float32;
+  the persona file is then validated against that list.
+- **American pronunciation for every voice (owner decision 2026-10-22):**
+  the one `KPipeline` runs with `lang_code="a"`, so the British voices
+  (`bf_`, `bm_`) speak with American pronunciation. A British path may come
+  later. A blend is the weighted sum of the packs, cached (LRU of
+  64) and checked to be a CPU `torch.FloatTensor`.
+- **Agents change voice or speed only when the owner asks** (for him to
+  experiment); they add to the personality on their own as they learn their
+  role, and the owner may start a "persona review" at any time (the agent
+  reads the persona back and he trims it, `set_persona(personality=[...])`).
+- **The house persona never adapts on its own (owner decision 2026-10-22):**
+  agents on it do not call `add_to_personality` of their own accord; the
+  owner can still change it in a persona review or on request. Stated once
+  in the server instructions; the block carries `house` (true/false) and the
+  persona line says "you are <Name>, the house persona". The daemon does not
+  enforce it.
+- **How the agent learns its persona:** the client keeps `_persona_seen`
+  (`"<persona id>:<words_revision>"`, null at start; design 2026-10-22: the
+  words revision rises only when the name or the personality changes, never
+  on a voice or speed change) and sends it on every tool op, moving it only
+  forward on an ordinary reply (a new id, or a higher words revision; a late
+  reply across a move to another persona costs at most one extra refusal, which
+  corrects it), but a refusal for a stale persona states the daemon's current
+  key and is applied unconditionally, even when lower. A tool reply carries
+  `persona` (the block: `id`, `words_revision`, `name`, `house`, `voice`,
+  `speed`, `personality`, `shared_with`) when the project's current key
+  differs from it, and every persona op reply carries it, and the client
+  puts it in the result as one line, `[persona: you are <Name>; voice <id>
+  <weight>, ...; speed <s>; personality: <line> / <line> | (none yet);
+  shared with <projects>]`, after the switch line and before the held line
+  (call and hang_up results start with it). Before the lock, a `speak`,
+  `converse` or `call` whose `persona_seen` is stale (the project moved, or
+  its persona's name or personality changed) is refused (nothing is
+  spoken or dialed) with the block; a voice or speed change refuses nothing
+  and reaches other sessions only through `persona()`; the client raises `ValueError`: the
+  persona line, then "Nothing was spoken (or dialed). Rewrite your words as
+  <Name> and send again." `listen` and `hang_up` carry no words and are
+  never refused for it. The server instructions tell agents to call
+  `persona()` first; the refusal is the guarantee.
+- **Changes take effect on the next sentence (owner decision):** the
+  speaking voice is read before each sentence is synthesized, so an op
+  already queued or playing follows a change sentence by sentence (and its
+  reply carries the new block when the name or personality changed). Two consequences of streaming: a sentence
+  already synthesized and queued keeps its voice, and a sentence replayed
+  after "continue" comes from the cache in the voice it was made in. The
+  call greeting is in the calling persona's voice, the switch announcement
+  in the incoming persona's.
+- Events (`call_debug`): `persona_assign` (`project`, `persona`, `how`:
+  `auto`/`new`/`moved`, `from`), `persona_change` (`persona`, `fields`,
+  `project`, old and new name, voice and speed), `persona_refused` (`tool`,
+  `project`, `seen`, `current`).
 
 ## The floor (owner decisions 2026-10-20)
 
@@ -235,10 +353,11 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
 ## Files
 
 - `speak_server.py`: the thin MCP client. Tool definitions and docstrings,
-  the server `instructions` (owner conventions sent to every client: the name
-  Angie, spoken style, one converse per turn, timeout handling, call
-  etiquette, debugging), `_run`, and the session's
-  call expectation (`_call_generation`). `main()`
+  the server `instructions` (owner conventions sent to every client: speak
+  as the project's persona, spoken style, one converse per turn, timeout
+  handling, call etiquette, debugging), `_run`, the session's
+  call expectation (`_call_generation`) and the persona it last saw
+  (`_persona_seen`). `main()`
   reads `SPEAK_DAEMON` (`host:port`, required, no default; unset or malformed
   fails at startup).
 - `speak_protocol.py`: the wire (stdlib only). Framing: a 4-byte big-endian
@@ -246,17 +365,26 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
   request per TCP connection, TCP keepalive both ways. Op names, error kinds,
   and the outcome and state strings (`ANSWERED`, `CONNECTED`, `END_HUNG_UP`,
   `OPENER_MIN_SECONDS`, `HOLD_MAX_SECONDS`, `FLOOR_IDLE_SECONDS`, the hold
-  command and reply field names, ...), each defined once.
+  command and reply field names, the persona limits and pool, ...), each
+  defined once.
+- `speak_personas.py`: the persona registry (stdlib only): `PersonaStore`
+  (open or seed, `ensure`, `persona_of`, `block`, `overview`, `new`, `set`,
+  `add`, the atomic write) and the validation.
 - `speak_telegram_daemon.py`: the daemon (`speak-telegram` entry point). TCP
   server, the audio lock with the floor (`AudioLock`: FIFO tickets with the
   session id, `take_floor`, `yield_floor`, `close`, the idle lapse), the tool logic (`SpeakService`:
   call checks, quiet hours, markdown stripping, cues, the hold phrases,
-  `classify` and the `_speak` hold loop), the debug ops, the
+  `classify` and the `_speak` hold loop, the voice per persona), the
+  persona refusal before the lock (`SpeakDaemon.admit`) and the persona
+  ops, the debug ops, the
   HTTP whisper API (`_WhisperHandler`, `SpeakDaemon.transcribe_pcm`), and
   `main()` (settings, engine load, Telegram, binds).
 - `speak_engines.py`: `Engines` (`synthesize_segments` per segment with its
-  sentence index for speak, `synthesize_stream`, `synthesize` whole for the
-  greeting), and `split_sentences`, the same sentence split Kokoro indexes. Kokoro `KPipeline` (hexgrad/Kokoro-82M) and
+  sentence index for speak, one Kokoro call per sentence asking the voice
+  before each; `synthesize` whole in one voice for the greeting and the
+  announcement; `load_voices` and `voice_pack` for the English packs and
+  blends; every synthesis takes a `Voice`, pack and speed), and
+  `split_sentences`, the same sentence split Kokoro indexes. Kokoro `KPipeline` (hexgrad/Kokoro-82M) and
   faster-whisper `WhisperModel` (compute_type `float32`) on `cuda`. The load
   raises if CUDA is missing, Kokoro's weights are not all fp32, or Kokoro's
   espeak-ng fallback did not load.
@@ -268,7 +396,8 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
 - `Dockerfile`, `docker-compose.yml`, `.dockerignore`: the daemon image and
   service.
 - `scripts/drive_daemon.py`: drives the daemon over TCP with the client's own
-  request code (status, call, speak, listen, converse, hang_up, debug), no MCP.
+  request code (status, call, speak, listen, converse, hang_up, debug, the
+  persona ops), no MCP.
 - `pyproject.toml`: base dependencies are only `mcp` (the client). The
   `daemon` extra holds Telegram, torch (CUDA 12.6 build on Linux), kokoro,
   misaki, faster-whisper, silero-vad, numpy, scipy.
@@ -276,9 +405,9 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
 ## Protocol
 
 - **Protocol version:** every request carries `protocol` =
-  `PROTOCOL_VERSION` (`speak_protocol.py`, now 3; the unversioned protocol
+  `PROTOCOL_VERSION` (`speak_protocol.py`, now 4; the unversioned protocol
   before Release 2 counts as 1, Release 2 is 2, the switch of session made
-  it 3 (owner decision 2026-10-20)). The daemon refuses `ping` and every tool op
+  it 3 (owner decision 2026-10-20), personas made it 4 (2026-10-22)). The daemon refuses `ping` and every tool op
   whose version is missing or differs, before the lock, with a `value` error
   telling the session to update its client (git pull) and reconnect /mcp.
   `status`, `debug` and `set_debug` are served to any client (diagnostics
@@ -292,8 +421,21 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
   a `value` error before the lock (`speak client sent no <field> ...; update
   the client (git pull) and reconnect /mcp`), as it refuses a missing
   protocol version, and refuses a project with no letters or digits
-  (nothing to speak). Quick ops carry no identity. Replies to `speak`,
-  `listen` and `converse` may carry `switched_from` (absent: no switch).
+  (nothing to speak). Quick ops other than the persona ops carry no
+  identity. Replies to `speak`, `listen` and `converse` may carry
+  `switched_from` (absent: no switch).
+- **Personas (protocol 4):** every tool op also carries `persona_seen`
+  (null or `"<persona id>:<words_revision>"`; missing is refused like a missing
+  version). Before the lock the daemon assigns a new project to the house
+  persona and refuses a `speak`, `converse` or `call` with a stale
+  `persona_seen` (kind `value`, the block in `persona`); a voice or speed
+  change does not make it stale. A reply to a tool op carries `persona`
+  (`{id, words_revision, name, house, voice, speed, personality,
+  shared_with}`) when the current key differs from `persona_seen`; a
+  persona op's reply always carries it. The persona ops (`persona`,
+  `persona_new`, `persona_set`, `persona_add`) are quick ops that never
+  touch the lock, but unlike the other quick ops they are versioned and
+  carry `session_id` and `project`.
 - Tool ops (`speak`, `listen`, `converse`, `call`, `hang_up`) queue in the
   daemon's lock and are never rejected: FIFO, except that the floor
   holder's ops go first (see "The floor"; no protocol change, the session id
@@ -303,8 +445,8 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
   budget (speak `60 + len/5 + 300` s, the 300 being `HOLD_MAX_SECONDS`;
   listen `start_timeout + max + 60`; converse the sum; call `60 + 30 + len/5 + listen`; hang_up 20 s). An overrun raises
   `RuntimeError` "did not reply", never `TimeoutError`.
-- Quick ops (`ping`, `status`, `debug`, `set_debug`) get one reply and never
-  touch the lock.
+- Quick ops (`ping`, `status`, `debug`, `set_debug` and the persona ops) get
+  one reply and never touch the lock.
 - Errors: `{"ok": false, "error", "kind"}`. The client raises `timeout` (no
   speech only) as `TimeoutError`, `value` as `ValueError`, `call_ended` and
   `runtime` as `RuntimeError`.
@@ -408,7 +550,7 @@ the phone has signal.
   finished, and only then is the chime queued. **Amended for the hold watch
   (owner decision 2026-10-16):** during speak, Silero runs on the owner's
   audio and Whisper runs on short hold/continue candidates (2 s or less,
-  after a pause) while Angie's audio plays. CTranslate2 releases the GIL
+  after a pause) while the persona's audio plays. CTranslate2 releases the GIL
   (measured on the Mac CPU only); `pump_stall` events on patrick are the
   live check.
 - **Listen cues (owner decisions 2026-10-16):** the ear-open beep opens the
@@ -472,18 +614,21 @@ the phone has signal.
 | Variable | Value | Meaning |
 |---|---|---|
 | `SPEAK_KOKORO_MODEL` | `hexgrad/Kokoro-82M` | HF repo of the Kokoro model (`KPipeline` repo_id) |
-| `SPEAK_VOICE` | `af_heart` | Kokoro voice (`af_*` American female, `am_*` male, `bf_*`/`bm_*` British) |
-| `SPEAK_SPEED` | `1.0` | Speech rate multiplier |
+| `SPEAK_VOICE` | `af_heart` | The voice the seeded Angie and every new persona start with. English voices only (`af_*` American female, `am_*` male, `bf_*`/`bm_*` British, spoken with American pronunciation), one of `ENGLISH_VOICES`; any other stops the daemon |
+| `SPEAK_SPEED` | `1.0` | The speed the seeded Angie and every new persona start with, 0.5 to 2.0 |
+| `SPEAK_PERSONAS_FILE` | `/var/lib/speak/personas.json` | The persona registry, on the `speak_state` volume. Its directory must exist at startup; a missing file is seeded with Angie |
 | `SPEAK_WHISPER_MODEL` | `large-v3-turbo` | faster-whisper model name |
 | `SPEAK_LANGUAGE` | `en` | Whisper language |
 | `SPEAK_QUIET_HOURS` | `22:00-07:00` | No-call window, may wrap midnight. Validated at startup |
-| `SPEAK_HOLD_PHRASE` | `hold on` | Holds Angie mid-speech. Matched as the whole normalized utterance |
+| `SPEAK_HOLD_PHRASE` | `hold on` | Holds the speech mid-sentence. Matched as the whole normalized utterance |
 | `SPEAK_RESUME_PHRASE` | `continue` | Resumes a hold. Startup refuses a phrase with no letters or digits, or two phrases that normalize alike |
 | `TZ` | `America/Los_Angeles` | The clock quiet hours use. Resolved with `zoneinfo` at startup (the image has tzdata); an unknown zone stops the daemon |
 
 Models are cached in the `speak_models` volume
-(`/root/.cache/huggingface`). Startup order: engines load and warm, then
-Silero and Telegram connect, then ports 8765 and 9000 bind; so a refused connection
+(`/root/.cache/huggingface`). Startup order: the personas directory is
+checked, engines load (with the English voice list) and warm, the persona
+file is opened (or seeded) and validated against the voices, then Silero
+and Telegram connect, then ports 8765 and 9000 bind; so a refused connection
 means "not ready or not running", never "running without models".
 
 ## Deployment on patrick
@@ -502,6 +647,9 @@ Workspace rules apply: `up --build -d`, never `down` first, never copy files
 into the container, never run code inside it. Every build, start, restart
 and stop is an owner action, approved per change. Logs: `docker logs
 speak-telegram` (Alloy also ships them to Loki and Grafana).
+
+The personas live in the `speak_state` volume (`/var/lib/speak`), which
+survives rebuilds like `speak_models`.
 
 **Deploying a protocol change** (`PROTOCOL_VERSION` bumped):
 1. Deploy the daemon (the command above, on the owner's word).
@@ -539,7 +687,11 @@ daemon on a loopback port with a fake link (protocol version, identity, the
 switch of session end to end, a hold that outlives its client);
 `tests/test_session_switch.py` tests the switch rules in `SpeakService`;
 `tests/test_floor.py` tests the floor in `AudioLock` (real threads, a short
-idle time), in `SpeakService`, and over the wire. The service-level tests
+idle time), in `SpeakService`, and over the wire;
+`tests/test_personas.py` tests the persona store (in a temporary
+directory), the English voice list and the blends (torch on the CPU); the
+persona voices and refusals are tested in `tests/test_session_switch.py`
+and over the wire in `tests/test_daemon_wire.py`. The service-level tests
 build the service with `locked_service` (`tests/test_hold.py`): each tool op
 runs under the audio lock as its session, as the handler runs it. No test
 contacts Telegram. The daemon itself needs CUDA and runs only in its

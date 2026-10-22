@@ -28,8 +28,8 @@ import speak_protocol as proto  # noqa: E402
 import speak_server as client  # noqa: E402
 import speak_telegram as tg  # noqa: E402
 import speak_telegram_daemon as d  # noqa: E402
-from test_daemon_wire import ID_A, ID_B, TurnLink, short_floor  # noqa: E402
-from test_hold import NEVER_LEFT, SETTINGS, FakeEngines, HoldServiceCase, ScriptedLink, locked_service  # noqa: E402
+from test_daemon_wire import ID_A, ID_B, TurnLink, as_session, seen_key, short_floor  # noqa: E402
+from test_hold import NEVER_LEFT, SETTINGS, FakeEngines, HoldServiceCase, ScriptedLink, locked_service, temp_personas  # noqa: E402
 
 A = d.Speaker("session-a", "algolearn-speak")
 B = d.Speaker("session-b", "algolearn-hedge")
@@ -511,7 +511,8 @@ class WireCase(unittest.TestCase):
     def setUp(self):
         self.link = GateLink()
         self.engines = FakeEngines([])
-        self.daemon = d.SpeakDaemon(self.link, self.engines, SETTINGS, d.DebugControl(), port=0, http_port=0)
+        self.daemon = d.SpeakDaemon(self.link, self.engines, temp_personas(), SETTINGS, d.DebugControl(), port=0,
+                                    http_port=0)
         short_floor(self.daemon, self.link, self.IDLE)
         self.daemon.start()
         self.addCleanup(self.daemon.stop)
@@ -519,6 +520,8 @@ class WireCase(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
         self.a, self.b = dict(ID_A), dict(ID_B)
+        for ident in (self.a, self.b):   # each session has seen its persona, as after persona()
+            self.as_session(ident, client._persona_sync)
         self.order: list[str] = []   # client bodies run in threads, as they return
         self.threads: list[threading.Thread] = []
         self.addCleanup(self.join_all)
@@ -530,13 +533,7 @@ class WireCase(unittest.TestCase):
             t.join(10)
 
     def as_session(self, ident: dict, fn, *args):
-        """Run a client sync body as one session (its identity and call expectation)."""
-        with mock.patch.object(client, "_identity", {k: v for k, v in ident.items() if not k.startswith("_")}), \
-                mock.patch.object(client, "_call_generation", ident.get("_expect")):
-            try:
-                return fn(*args)
-            finally:
-                ident["_expect"] = client._call_generation
+        return as_session(ident, fn, *args)
 
     def in_thread(self, name: str, ident: dict, fn, *args) -> dict:
         """Run a client body in a thread; the returned box gets "result" (or "error") and
@@ -587,7 +584,7 @@ class TestFloorOverTheWire(WireCase):
         b["thread"].join(10)
         self.assertEqual(self.order, ["A1", "A2", "B"])
         self.assertEqual(b["result"], '[took over the call from "algolearn-speak"; the owner heard the switch cue '
-                                      "and this project's name first]\nhi Angie" + proto.AUDIO_NOTE)
+                                      "and your persona's name and this project's name first]\nhi Angie" + proto.AUDIO_NOTE)
         self.assertEqual([(e["event"], e["project"], e.get("reason")) for e in self.floor_events()],
                          [(d.FLOOR_TAKE_EVENT, "algolearn-speak", None),
                           (d.FLOOR_RELEASE_EVENT, "algolearn-speak", "speak"),
@@ -638,7 +635,8 @@ class TestFloorOverTheWire(WireCase):
         played = list(self.link.log)
         s = socket.create_connection(self.daemon._server.server_address, timeout=10)
         proto.send_msg(s, {"op": proto.OP_CONVERSE, proto.FIELD_PROTOCOL: proto.PROTOCOL_VERSION, **ID_B,
-                           "text": "Two.", **client._listen_fields(120, 2.0, 45), "expect_generation": None})
+                           "text": "Two.", **client._listen_fields(120, 2.0, 45), "expect_generation": None,
+                           proto.FIELD_PERSONA_SEEN: seen_key(self.daemon, ID_B)})
         self.waiting(1)
         s.close()   # B's tool call was cancelled while it waited
         # A's floor lapses, B's op reaches the lock and is skipped

@@ -33,6 +33,17 @@ not a string, empty, or (project) has no letter or digit, before the lock, like 
 missing version. A speak/listen/converse reply (success or failure) carries
 REPLY_SWITCHED_FROM, the previous session's project, when the daemon announced a switch
 of session before the op's own audio; when the key is absent there was no switch.
+
+Personas (protocol 4, docs/DESIGN_PERSONAS.md, owner decisions 2026-10-22): every tool op
+also carries FIELD_PERSONA_SEEN, the "<persona id>:<words_revision>" of the project's
+persona this session last saw (null at first; a missing field is refused like a missing
+version). words_revision rises only when the persona's name or personality changes, the
+things an agent's words depend on; a voice or speed change leaves the key as it is (Design
+2026-10-22). A reply to a tool op carries REPLY_PERSONA, the project's persona block,
+whenever the project's key differs from it; a persona op's reply always carries it. Before
+the lock, speak, converse and call with a stale FIELD_PERSONA_SEEN are refused (kind value,
+with the block): nothing is spoken or dialed. The persona ops (PERSONA_OPS) are versioned and
+carry the identity like tool ops, but never touch the audio lock.
 """
 
 from __future__ import annotations
@@ -50,8 +61,10 @@ MAX_PAYLOAD_BYTES = 1 << 20   # text only crosses the wire
 # The wire version. Bump it whenever a request or reply changes in a way an older peer
 # would misread. The unversioned protocol before it counts as 1; 2 is Release 2 of
 # docs/DESIGN_INTERRUPT.md (hold replies, longer speak budgets); 3 adds the client's
-# identity to every tool op and the session-switch reply field (owner decision 2026-10-20).
-PROTOCOL_VERSION = 3
+# identity to every tool op and the session-switch reply field (owner decision 2026-10-20);
+# 4 adds personas: persona_seen on every tool op, the persona reply block and the persona
+# ops (owner decisions 2026-10-22, docs/DESIGN_PERSONAS.md).
+PROTOCOL_VERSION = 4
 FIELD_PROTOCOL = "protocol"
 
 # The client's identity on every tool op, and the session-switch announcement (owner
@@ -62,12 +75,30 @@ FIELD_PROTOCOL = "protocol"
 FIELD_SESSION_ID, FIELD_PROJECT = "session_id", "project"
 REPLY_SWITCHED_FROM = "switched_from"
 
+# Personas (docs/DESIGN_PERSONAS.md, owner decisions 2026-10-22). The block in REPLY_PERSONA:
+# {"id", "words_revision", "name", "house" (true on the house persona, which never grows its
+# personality on its own), "voice": {id: weight}, "speed", "personality": [text, ...],
+# "shared_with": [other projects]}.
+FIELD_PERSONA_SEEN = "persona_seen"
+REPLY_PERSONA = "persona"
+PERSONA_SPEED_MIN, PERSONA_SPEED_MAX = 0.5, 2.0
+PERSONA_POOL = ("Angie", "Nova", "Ruby", "Hazel", "Paige", "Stella", "Gwen", "Willow", "Margo", "Juno",
+                "Tess", "Fiona")
+PERSONA_SEED_NAME = "Angie"
+PERSONA_NAME_MAX = 12            # a name is one word of 2 to 12 letters
+PERSONALITY_MAX_CHARS = 4000
+PERSONA_MAX_VOICES = 4
+PERSONA_VOICE_PREFIXES = ("af_", "am_", "bf_", "bm_")   # English voices only
+
 # ops
 OP_PING, OP_STATUS, OP_DEBUG, OP_SET_DEBUG = "ping", "status", "debug", "set_debug"
 OP_SPEAK, OP_LISTEN, OP_CONVERSE, OP_CALL, OP_HANG_UP = "speak", "listen", "converse", "call", "hang_up"
-QUICK_OPS = frozenset({OP_PING, OP_STATUS, OP_DEBUG, OP_SET_DEBUG})
+OP_PERSONA, OP_PERSONA_NEW, OP_PERSONA_SET, OP_PERSONA_ADD = "persona", "persona_new", "persona_set", "persona_add"
+PERSONA_OPS = frozenset({OP_PERSONA, OP_PERSONA_NEW, OP_PERSONA_SET, OP_PERSONA_ADD})   # versioned, identity, no lock
+QUICK_OPS = frozenset({OP_PING, OP_STATUS, OP_DEBUG, OP_SET_DEBUG}) | PERSONA_OPS
 VERSIONLESS_OPS = frozenset({OP_STATUS, OP_DEBUG, OP_SET_DEBUG})   # served to a client of any protocol
 LOCKED_OPS = frozenset({OP_SPEAK, OP_LISTEN, OP_CONVERSE, OP_CALL, OP_HANG_UP})
+VOICED_OPS = frozenset({OP_SPEAK, OP_CONVERSE, OP_CALL})   # refused before the lock on a stale persona_seen
 PHASE_STARTED = "started"
 
 # error kinds: the client re-raises timeout as TimeoutError (no speech), value as
@@ -122,6 +153,11 @@ def speakable_name(project: str) -> str:
     digits becomes one space ("algolearn-speak" -> "algolearn speak"). "" when nothing is left,
     which the client refuses at startup and the daemon refuses in a request."""
     return " ".join(re.sub(r"[\W_]+", " ", project).split())
+
+
+def persona_key(block: dict) -> str:
+    """The "<persona id>:<words_revision>" a client sends as FIELD_PERSONA_SEEN after seeing `block`."""
+    return f"{block['id']}:{block['words_revision']}"
 
 
 def is_audio_failure(outcome: str) -> bool:
