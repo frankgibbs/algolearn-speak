@@ -1,6 +1,6 @@
 # Design: the floor (one conversation at a time on the shared call)
 
-Status: design, written 2026-10-20; deployed in commit `b5cd149` on 2026-10-22.
+Status: design, written 2026-10-20; deployed in commit `b5cd149` on 2026-10-20.
 The client text (section 6) was rewritten by owner decision 2026-10-22.
 Every build, restart and stop of `speak-telegram` remains an owner action,
 approved per change.

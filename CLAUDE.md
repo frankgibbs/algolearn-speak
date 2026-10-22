@@ -150,7 +150,7 @@ announcement is built in the working tree, not deployed yet.
 
 ## The floor (owner decisions 2026-10-20)
 
-Design: `docs/DESIGN_FLOOR.md`. Deployed in commit b5cd149 on 2026-10-22.
+Design: `docs/DESIGN_FLOOR.md`. Deployed in commit b5cd149 on 2026-10-20.
 No protocol change: the protocol stays 3.
 
 - **The floor:** the session that last played audio on the call holds it
