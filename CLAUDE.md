@@ -28,7 +28,7 @@ LAN; the audio travels only over the Telegram call.
 project speaks as its persona: a name, a voice blend, a speed and a
 personality, kept by the daemon (see "Personas" below). "Angie" is the
 persona the daemon seeds and the one every new project joins; it is no
-longer the only name. Built in the working tree, not deployed.
+longer the only name. Deployed in commit 6a9fcbe on 2026-10-22.
 
 **Open to the LAN by design (owner decision).** Port 8765 has no
 authentication and no TLS: any LAN computer with the thin client can call the
@@ -56,7 +56,8 @@ Every `speak`/`listen`/`converse` result, and an answered `call`, ends with
 
 ## Hold on / continue (Release 2 of docs/DESIGN_INTERRUPT.md)
 
-Owner decisions 2026-10-16. Built in the working tree, not deployed; the
+Owner decisions 2026-10-16. Deployed (committed in 2186c40 on 2026-10-16;
+in the images built from 84c2740 on 2026-10-20 and every later deploy); the
 echo gate (design section 8.1) and the live checks (8.2 to 8.4) have not
 been run.
 
@@ -106,7 +107,8 @@ been run.
 
 Deployed in commit 84c2740 and tested live on 2026-10-20 (the bare-listen
 finding below came from that test). The bare-listen "still listening"
-announcement is built in the working tree, not deployed yet.
+announcement is deployed (committed in 2fa4a20 on 2026-10-20; in the image
+built from b5cd149 on 2026-10-20 and every later deploy).
 
 - **The daemon announces the switch, not the agents.** Every client sends a
   session id (`secrets.token_hex(8)`, generated once per client process,
