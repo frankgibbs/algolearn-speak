@@ -93,6 +93,9 @@ WHISPER_HTTP_PORT = 9000   # the retired whisper-service's port, so its clients 
 TRANSCRIBE_TOOL = "transcribe"   # how status names an HTTP transcription holding the audio lock
 SESSION_SWITCH_EVENT = "session_switch"   # call_debug: a switch of session was announced on the call
 PERSONA_REFUSED_EVENT = "persona_refused"   # call_debug: a stale persona_seen was refused before the lock
+# call_debug: call() returned or raised without dialing (owner decision 2026-10-23), and its reasons.
+CALL_REFUSED_EVENT = "call_refused"
+REFUSED_QUIET_HOURS, REFUSED_EMPTY_GREETING, REFUSED_SHORT_GREETING = "quiet_hours", "empty_greeting", "greeting_too_short"
 # The floor (docs/DESIGN_FLOOR.md, owner decisions 2026-10-20): call_debug events and the
 # floor_release reasons.
 FLOOR_TAKE_EVENT, FLOOR_RELEASE_EVENT = "floor_take", "floor_release"
@@ -772,21 +775,27 @@ class SpeakService:
     def call(self, sess: Session, greeting: str, override_quiet_hours: bool, max_seconds: float,
              silence_seconds: float, start_timeout_seconds: float) -> dict:
         # Checked under the lock: a call queued behind a long converse is judged when it would dial.
-        # Local time in the required TZ (America/Los_Angeles, compose environment).
-        if not override_quiet_hours and in_quiet_hours(self.quiet_window, datetime.datetime.now(self.tz).time()):
-            return {"outcome": f"not called: quiet hours ({self.quiet_hours})"}
+        # A connected call first (owner decision 2026-10-23): the owner is on the line, so a
+        # session coming back with a result gets "already connected" whatever the time.
         info = self.link.info()
         if info["state"] == tg.CONNECTED:
             sess.expect(self.key(info["generation"]))
             return {"outcome": tg.ALREADY_CONNECTED}
-        # Last of the pre-dial checks, so quiet hours / already connected keep their outcomes.
+        # Local time in the required TZ (America/Los_Angeles, compose environment).
+        if not override_quiet_hours and in_quiet_hours(self.quiet_window, datetime.datetime.now(self.tz).time()):
+            self.link.record_event(CALL_REFUSED_EVENT, project=sess.speaker.project, reason=REFUSED_QUIET_HOURS)
+            return {"outcome": f"not called: quiet hours ({self.quiet_hours})"}
+        # Last of the pre-dial checks, so already connected / quiet hours keep their outcomes.
         # Measured on the synthesized audio, not guessed from word count.
         text = self.plain(greeting)
         if not text:
+            self.link.record_event(CALL_REFUSED_EVENT, project=sess.speaker.project, reason=REFUSED_EMPTY_GREETING)
             raise ValueError("call() needs a non-empty greeting")
         audio = self.engines.synthesize(text, self._voice(sess.speaker.project))   # the caller's persona
         seconds = len(audio) / TTS_RATE
         if seconds < tg.OPENER_MIN_SECONDS:
+            self.link.record_event(CALL_REFUSED_EVENT, project=sess.speaker.project, reason=REFUSED_SHORT_GREETING,
+                                   greeting_s=round(seconds, 1))
             raise ValueError(
                 f"call() greeting is only {seconds:.1f}s when spoken; it must be at least {tg.OPENER_MIN_SECONDS:g}s. "
                 "Nothing was dialed. The greeting is the whole opening: say who is calling, why, and the context, "

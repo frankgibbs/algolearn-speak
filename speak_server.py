@@ -497,7 +497,8 @@ Voice tools for talking with the owner (Frank) over a Telegram call. Owner conve
 - Never speak "hold on" or "continue" as a sentence by itself: on a phone without echo
   cancellation you would hear yourself and hold or resume your own speech.
 - When the owner asks you to call, they are up: pass override_quiet_hours=True without
-  asking. Calls you start on your own respect quiet hours.
+  asking. Calls you start on your own respect quiet hours; they never apply while a call
+  is connected, since the owner is on the line.
 - Call etiquette: "not answered" -> wait an hour. "busy" -> call once more, then wait an
   hour. Owner hung up -> call back once right away; if that is not answered, wait an hour.
   "Telegram call ended during ..." -> call back. hang_up only when the owner asks.
@@ -515,13 +516,21 @@ Voice tools for talking with the owner (Frank) over a Telegram call. Owner conve
   conversation going. He will likely have more questions, or a related thread on the
   same topic.
 - Before leaving, ask whether he has anything else.
-- End with ONE speak() sign-off (for example "Will do, talk soon.") only when the topic
-  has closed, the owner has said he has nothing else, and the remaining work is long
-  (around 15 minutes or more). Never use speak() for a quick check or a short task.
-- Do not offer to call back; say you will come back with the result. When the work is
-  done, check status(): if its call field says the call is still connected, converse()
-  with the result (it waits its turn, and the owner hears the switch cue, your persona's
-  name and your project's name first). Use call() only if the call has ended.
+- End with ONE speak() sign-off only when the topic has closed, the owner has said he has
+  nothing else, and the remaining work is long (around 15 minutes or more); never for a
+  quick check or a short task. Promise to come back on the call (for example "Will do,
+  I'll come back on the call with it."), never "by message".
+- Coming back is owed, by voice. When work you told the owner about finishes (an agent's
+  report, a task notification, your own work), report it on the call before anything
+  else, even much later or after your context was summarized. A text or push message is
+  in addition, never instead. Do not offer to call back (do not ask whether he wants it):
+  you always come back.
+- To come back: status() first. If its call is "connected", converse() with the result:
+  he is on the line, so quiet hours do not apply, and it waits its turn behind another
+  session. Use call() only if the call has ended.
+- If call() returns quiet hours or "not answered": say in this terminal when you will try
+  again, and start a background timer (for example a background `sleep` until then) so
+  you are woken to do it.
 - When your speak/listen/converse is the first audio on the call after another
   session's, the daemon first plays a double beep and speaks your persona's name and
   your project's name, and
@@ -616,9 +625,7 @@ _CALL_NOTE = """
 
     Write it as spoken prose: plain sentences, no markdown, no code. Returns the spoken duration.
 
-    speak() gives up the floor; use it only for the final sign-off. For a
-    conversational turn use `converse(text)`, never speak() then listen(): the gap
-    between the two calls is seconds of dead air before the ear-open beep.
+    speak() gives up the floor: use it only for the final sign-off, then come back on the call when the work is done.
 """ + _HOLD_NOTE + _QUEUE_NOTE + _CALL_NOTE)
 async def speak(text: str) -> str:
     return await _run(_speak_sync, text)
@@ -688,7 +695,7 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
                                                  raises as in listen (a timeout leaves the
                                                  call connected: reopen the ear with listen)
       "already connected"                     -- a call is already up (greeting not
-                                                 spoken); just talk
+                                                 spoken), at any hour; just talk
       "not answered (declined or no answer)"  -- what you have can wait; do not
                                                  call again for at least one hour
       "busy (the owner's Telegram reports a call in progress)"
@@ -735,6 +742,8 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
     Hang up with `hang_up()` only when the owner asks; they can also hang up
     themselves. If the speak daemon cannot be reached this raises "speak daemon
     at <addr> is not reachable: ...".
+
+    To come back with a result, status() first; while the call is connected use converse(), not call().
     """
     return await _run(_call_sync, greeting, override_quiet_hours, max_seconds, silence_seconds, start_timeout_seconds)
 
@@ -860,6 +869,8 @@ async def status() -> dict:
     ("transcribe" is a request to the daemon's HTTP whisper API on port 9000),
     or null if idle. `waiting` counts every queued caller from every session.
     Never raises and never blocks on the audio lock.
+
+    Check it first when coming back with a result: "connected" means converse(), not call().
     """
     return await _run(_status_sync)
 
