@@ -453,6 +453,11 @@ class TelegramLink:
         """A call event recorded by the daemon's tool logic (e.g. hold_expire_hangup_failed)."""
         self._event(event, **fields)
 
+    def record_unbound_event(self, event: str, **fields) -> None:
+        """An event recorded by the daemon's tool logic that belongs to no call (call_refused:
+        nothing was dialed), so it carries no call_id and no elapsed_s, never the last call's."""
+        self.events.record(None, event, **fields)
+
     # ------------------------------------------------------------ lifecycle
 
     def start(self) -> None:

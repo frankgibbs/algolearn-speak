@@ -138,7 +138,10 @@ they are committed, the line numbers move with them.
   length (≥ 6 s, measured on the synthesized audio). Only then does it call
   `telegram.call(audio, 24000)`. If the call is answered, it listens under
   the same lock hold (`speak_server.py:502-541`). `_hang_up_sync` always
-  clears the expectation (`speak_server.py:544-553`).
+  clears the expectation (`speak_server.py:544-553`). (Amended by owner
+  decision 2026-10-23: the daemon's `call` now checks already connected
+  first, then quiet hours, so a connected call is "already connected" at
+  any hour.)
 - **Debug and status.** `call_debug` and `set_call_debug` go to the daemon
   without the lock (`speak_server.py:723-762`). `status()` returns
   `{busy, current_tool, waiting, call}` and never raises
@@ -395,7 +398,7 @@ on that text (section 2.1).
 | `speak(text)` | `speak` op; returns `spoke for Ns\n(audio: telegram)` | lock → call check → `_plain` → Kokoro (all chunks) → `link.play` → guard |
 | `listen(max, silence, start_timeout)` | `listen` op | lock → call check → ear-open cue + `link.record` → ear-closed cue → Whisper → ack (chime + "Processing.") → guard. Since owner decisions 2026-10-16: ear-open cue + `link.record` → Whisper → rising chime → guard (no ear-closed cue, no spoken ack) |
 | `converse(text, ...)` | `converse` op | speak then listen, one lock hold |
-| `call(greeting, override_quiet_hours, ...)` | `call` op; sets its expectation from the reply | lock → quiet hours (daemon clock, `TZ=America/Los_Angeles`) → already connected → Kokoro greeting and the ≥ 6 s check → `link.call` → on `answered`, the listen above in the same hold. Outcomes and check order are as in `speak_server.py:502-541` |
+| `call(greeting, override_quiet_hours, ...)` | `call` op; sets its expectation from the reply | lock → quiet hours (daemon clock, `TZ=America/Los_Angeles`) → already connected → Kokoro greeting and the ≥ 6 s check → `link.call` → on `answered`, the listen above in the same hold. Outcomes and check order are as in `speak_server.py:502-541`, except that already connected now comes before quiet hours (owner decision 2026-10-23) |
 | `hang_up()` | `hang_up` op; always clears its expectation (`speak_server.py:552`) | lock → `link.hang_up()` |
 | `status()` | `status` op; never raises | no lock; busy, current_tool, waiting, call |
 | `call_debug(lines)` / `set_call_debug(enabled)` | as today | as today, no lock |

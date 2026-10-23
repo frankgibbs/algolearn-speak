@@ -185,6 +185,9 @@ not depend on how they sound). The client still only moves its key forward (4.7)
   synthesizes it whole with `self.engines.synthesize(text)` (Verified
   `speak_telegram_daemon.py:750`) and checks the 6 s floor (Verified `:752`); an
   answered call sets the turn and takes the floor (Verified `:767-768`).
+  Amended by owner decision 2026-10-23: `call` now checks already connected first,
+  then quiet hours, so a connected call is "already connected" at any hour; the rest
+  of the order is unchanged.
 - The floor (`AudioLock.take_floor`, `yield_floor`; Verified
   `speak_telegram_daemon.py:322`, `:340`) and `FLOOR_IDLE_SECONDS = 45.0` (Verified
   `speak_protocol.py:112`).

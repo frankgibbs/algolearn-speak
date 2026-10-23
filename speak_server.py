@@ -493,7 +493,8 @@ Voice tools for talking with the owner (Frank) over a Telegram call. Owner conve
   A result starting "[hold expired after ...; the call was ended]" means the owner never
   said "continue" within 5 minutes, so the daemon hung up: the reply was NOT finished
   and converse did NOT listen. Do not assume he heard it and do not call back right
-  away (he ignores calls after this); keep the "not spoken" text and pick it up later.
+  away (he ignores calls after this); keep the "not spoken" text and come back with it
+  after an hour's wait, by timer (see waiting below).
 - Never speak "hold on" or "continue" as a sentence by itself: on a phone without echo
   cancellation you would hear yourself and hold or resume your own speech.
 - When the owner asks you to call, they are up: pass override_quiet_hours=True without
@@ -501,7 +502,13 @@ Voice tools for talking with the owner (Frank) over a Telegram call. Owner conve
   is connected, since the owner is on the line.
 - Call etiquette: "not answered" -> wait an hour. "busy" -> call once more, then wait an
   hour. Owner hung up -> call back once right away; if that is not answered, wait an hour.
-  "Telegram call ended during ..." -> call back. hang_up only when the owner asks.
+  "answered, then hung up during the greeting" -> call once more; if that ends the same
+  way or is not answered, wait an hour. "Telegram call ended during ..." -> call back.
+  hang_up only when the owner asks.
+- Waiting: whenever these rules say to wait (quiet hours, "not answered", "busy" twice,
+  hung up during the greeting twice, an expired hold), say in this terminal when you will
+  try again and start a background timer (for example a background `sleep` until then)
+  so you are woken to do it.
 - When a call seems off (silence, no speech heard, drops): set_call_debug(True), place
   or keep the call, read call_debug (its docstring says how to read the events), and add
   instrumentation rather than retrying blind. No need to ask first. Turn debug off once
@@ -527,10 +534,9 @@ Voice tools for talking with the owner (Frank) over a Telegram call. Owner conve
   you always come back.
 - To come back: status() first. If its call is "connected", converse() with the result:
   he is on the line, so quiet hours do not apply, and it waits its turn behind another
-  session. Use call() only if the call has ended.
-- If call() returns quiet hours or "not answered": say in this terminal when you will try
-  again, and start a background timer (for example a background `sleep` until then) so
-  you are woken to do it.
+  session. If it is "ringing", another session is dialing: check status() again until it
+  reads "connected" (then converse()) or "none" (then call()). Use call() only if the
+  call has ended.
 - When your speak/listen/converse is the first audio on the call after another
   session's, the daemon first plays a double beep and speaks your persona's name and
   your project's name, and
@@ -716,7 +722,9 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
                                                  during the greeting (the owner asked for
                                                  it); do not call again
       "not called: quiet hours (22:00-07:00)" -- nothing was dialed; no calls in
-                                                 that window
+                                                 that window. Never returned while a
+                                                 call is connected: that is "already
+                                                 connected" at any hour
       "answered but audio failed to connect: <error type/message>"
                                               -- the owner picked up but the media
                                                  connection failed (they hear beeping,
@@ -730,8 +738,10 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
                                                  uptime_seconds, call state "none"),
                                                  you may place ONE new call. Do not
                                                  loop.
-    Quiet hours are a hard rule. Pass `override_quiet_hours=True` ONLY when the
-    owner has said in this conversation that they are up and want calls.
+    Quiet hours are a hard rule for placing a call. They never apply while a call is
+    connected: call() then returns "already connected", whatever the time. Pass
+    `override_quiet_hours=True` ONLY when the owner has said in this conversation that
+    they are up and want calls.
 
     Rule of engagement: if speak/listen/converse raises "Telegram call ended
     during ...", the call dropped mid-conversation -- call back with this tool.
@@ -870,7 +880,7 @@ async def status() -> dict:
     or null if idle. `waiting` counts every queued caller from every session.
     Never raises and never blocks on the audio lock.
 
-    Check it first when coming back with a result: "connected" means converse(), not call().
+    Check it first when coming back with a result: "connected" means converse(), not call(); "ringing" means another session is dialing, so check again until "connected" (converse) or "none" (call).
     """
     return await _run(_status_sync)
 

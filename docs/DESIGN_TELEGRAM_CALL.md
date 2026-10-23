@@ -167,7 +167,9 @@ with something playful (a joke, something funny or flirty). Check order in
 `call`: quiet hours, daemon state and already-connected (both keep their
 outcomes, the greeting is irrelevant to them), then the length check, then the
 dial. The daemon's `write_opener` raises on a short opener as a backstop;
-no padding path exists.
+no padding path exists. Amended by owner decision 2026-10-23: already
+connected is now checked first, then quiet hours, so a connected call is
+"already connected" at any hour; the rest of the order is unchanged.
 
 ## 5. The tools
 

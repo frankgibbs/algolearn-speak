@@ -85,6 +85,9 @@ class HoldingLink:
     def record_event(self, event: str, **fields) -> None:
         self.events.record(None, event, **fields)
 
+    def record_unbound_event(self, event: str, **fields) -> None:
+        self.events.record(None, event, **fields)
+
     def play_watched(self, segments, rate, classify, accept):
         tag, _audio = next(iter(segments))
         return tg.PlayOutcome(proto.CMD_HOLD, 100, tag, 0.1)
@@ -345,6 +348,9 @@ class TurnLink:
     def record_event(self, event: str, **fields) -> None:
         self.events.record(None, event, **fields)
 
+    def record_unbound_event(self, event: str, **fields) -> None:
+        self.events.record(None, event, **fields)
+
     def call(self, audio, rate) -> str:
         self.generation += 1
         self._state = tg.CONNECTED
@@ -413,6 +419,20 @@ class TestSessionSwitchOverTheWire(unittest.TestCase):
         self.assertEqual((second["from_project"], second["to_project"], second["tool"], second["spoken"]),
                          ("algolearn-hedge", "algolearn-speak", "listen", "Angie, algolearn speak, still listening"))
         self.assertIn(("synthesize", "Angie, algolearn speak, still listening"), self.engines.log)
+
+    def test_already_connected_during_quiet_hours(self):
+        """Owner decision 2026-10-23: a connected call is checked before quiet hours, so a session
+        coming back without override gets "already connected" and talks on the call."""
+        a, b = self.session(ID_A), self.session(ID_B)
+        self.as_session(a, client._call_sync, "Hi Frank, it's Angie.", True, 120, 2.0, 45)
+        with mock.patch.object(d, "in_quiet_hours", lambda window, now: True):
+            self.assertEqual(self.as_session(b, client._call_sync, "Hi Frank, it's Angie again.", False, 120, 2.0, 45),
+                             proto.ALREADY_CONNECTED)
+        self.assertEqual(b["_expect"], a["_expect"])   # b now expects the connected call
+        self.assertEqual([e for e in self.link.events.recent(100) if e["event"] == d.CALL_REFUSED_EVENT], [])
+        self.assertEqual(self.link.log.count("greeting"), 1)   # dialed once, by a
+        self.assertEqual(self.as_session(a, client._converse_sync, "One.", 120, 2.0, 45),
+                         "hi Angie" + proto.AUDIO_NOTE)   # the turn is still a's: no switch
 
     def test_a_failure_after_the_announcement_still_says_who_took_over(self):
         a, b = self.session(ID_A), self.session(ID_B)

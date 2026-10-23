@@ -782,20 +782,24 @@ class SpeakService:
             sess.expect(self.key(info["generation"]))
             return {"outcome": tg.ALREADY_CONNECTED}
         # Local time in the required TZ (America/Los_Angeles, compose environment).
-        if not override_quiet_hours and in_quiet_hours(self.quiet_window, datetime.datetime.now(self.tz).time()):
-            self.link.record_event(CALL_REFUSED_EVENT, project=sess.speaker.project, reason=REFUSED_QUIET_HOURS)
+        now = datetime.datetime.now(self.tz).time()
+        if not override_quiet_hours and in_quiet_hours(self.quiet_window, now):
+            # Refusals belong to no call: recorded unbound, never with the last call's id.
+            self.link.record_unbound_event(CALL_REFUSED_EVENT, project=sess.speaker.project,
+                                           reason=REFUSED_QUIET_HOURS, local_time=now.strftime("%H:%M"))
             return {"outcome": f"not called: quiet hours ({self.quiet_hours})"}
         # Last of the pre-dial checks, so already connected / quiet hours keep their outcomes.
         # Measured on the synthesized audio, not guessed from word count.
         text = self.plain(greeting)
         if not text:
-            self.link.record_event(CALL_REFUSED_EVENT, project=sess.speaker.project, reason=REFUSED_EMPTY_GREETING)
+            self.link.record_unbound_event(CALL_REFUSED_EVENT, project=sess.speaker.project,
+                                           reason=REFUSED_EMPTY_GREETING)
             raise ValueError("call() needs a non-empty greeting")
         audio = self.engines.synthesize(text, self._voice(sess.speaker.project))   # the caller's persona
         seconds = len(audio) / TTS_RATE
         if seconds < tg.OPENER_MIN_SECONDS:
-            self.link.record_event(CALL_REFUSED_EVENT, project=sess.speaker.project, reason=REFUSED_SHORT_GREETING,
-                                   greeting_s=round(seconds, 1))
+            self.link.record_unbound_event(CALL_REFUSED_EVENT, project=sess.speaker.project,
+                                           reason=REFUSED_SHORT_GREETING, greeting_s=round(seconds, 1))
             raise ValueError(
                 f"call() greeting is only {seconds:.1f}s when spoken; it must be at least {tg.OPENER_MIN_SECONDS:g}s. "
                 "Nothing was dialed. The greeting is the whole opening: say who is calling, why, and the context, "

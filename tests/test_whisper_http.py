@@ -63,6 +63,9 @@ class FakeLink:
     def record_event(self, event: str, **fields) -> None:
         pass
 
+    def record_unbound_event(self, event: str, **fields) -> None:
+        pass
+
 
 OWNER_SESSION = d.Speaker("s-test", "algolearn-speak")   # the tool op these tests hold the lock with
 SETTINGS = {"SPEAK_QUIET_HOURS": "22:00-07:00", "quiet_window": (1320, 420),

@@ -416,9 +416,15 @@ class ScriptedLink:
         self.hung_up = 0
         self.fail_hang_up: BaseException | None = None
         self.events: list[tuple[str, dict]] = []
+        self.unbound: list[tuple[str, dict]] = []
 
     def record_event(self, event: str, **fields) -> None:
         self.events.append((event, fields))
+
+    def record_unbound_event(self, event: str, **fields) -> None:
+        """An event of no call (the real link records it with call_id None); kept apart from
+        `events`, so a test sees which of the two the service used."""
+        self.unbound.append((event, fields))
 
     def info(self) -> dict:
         return {"state": self._state, "generation": 1, "end_reason": tg.END_HUNG_UP if self.hung_up else None}
