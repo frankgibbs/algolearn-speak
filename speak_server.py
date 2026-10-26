@@ -474,16 +474,18 @@ The floor (one conversation at a time):
   Never ask whether he wants a call back. First status(). "connected": send ONE
   converse() with your report and leave it waiting in the queue, however long, even
   behind another session's conversation. After about 120 s Claude Code moves it to the
-  background and notifies you when it completes: that is normal. Do not cancel it,
-  resend it, text instead or call(). "ringing": another session is dialing; status()
-  again. "none": call().
+  background and notifies you when it completes: that is normal. While it waits, do
+  not cancel it, resend it, text instead or call(). If it returns "Telegram call ended
+  during ..." or "needs a connected Telegram call", call() back as Calls says.
+  "ringing": another session is dialing; status() again. "none": call().
 - A result starting '[took over the call from "<project>"; ...]' means he was just
   talking with that project. Open your next turn with one sentence recapping where you
   left off and your last question, unless his reply already answers it.
 
 Calls:
-- When he asks you to call, he is up: pass override_quiet_hours=True. Calls you start
-  on your own respect quiet hours; they never apply while a call is connected.
+- When he asks you to call, he is up: pass override_quiet_hours=True without asking.
+  Calls you start on your own respect quiet hours; they never apply while a call is
+  connected.
 - "not answered": wait an hour. "busy": call once more, then wait an hour. He hung up,
   or "answered, then hung up during the greeting": call back once right away; if that is
   not answered or ends the same way, wait an hour. "Telegram call ended during ...":
@@ -508,21 +510,28 @@ Speaking:
   alone only to reopen the ear after a TimeoutError or with nothing to say first.
 - A TimeoutError means nobody spoke in time; the call is still up: listen() again,
   do not hang up.
-- Go straight into the answer, never "heard you" or a restatement. Hand real work to
-  agents rather than going silent.
+- Go straight into the answer, never "heard you" or a restatement. Once he lets you
+  go, hand the work to agents.
 - He says "hold on" to stop you and "continue" to resume. "[held Ns, then resumed]":
   all was said. "[hold expired ...; the call was ended]": the reply was NOT finished
   and converse did not listen; keep the "not spoken" text and come back with it after
   an hour, by timer. Never speak "hold on" or "continue" as a sentence by itself
   (the echo would hold you).
-- A call seems off (silence, drops): set_call_debug(True), read call_debug(), add
-  instrumentation rather than retrying blind; debug off once calls work.
+- A call seems off (silence, drops): without asking, set_call_debug(True), place a test
+  call, read call_debug(), add instrumentation rather than retrying blind; debug off
+  once calls work.
 """
 
-if len(_INSTRUCTIONS) >= INSTRUCTIONS_MAX_CHARS:
-    raise RuntimeError(f"the speak server instructions are {len(_INSTRUCTIONS)} characters; Claude Code "
-                       f"truncates them at {INSTRUCTIONS_MAX_CHARS}, so shorten them (move detail into "
-                       "the tool docstrings)")
+
+def check_instructions_length(text: str) -> None:
+    """Raise unless `text` is shorter than INSTRUCTIONS_MAX_CHARS (at most 4095 characters)."""
+    if len(text) >= INSTRUCTIONS_MAX_CHARS:
+        raise RuntimeError(f"the speak server instructions are {len(text)} characters; they must be under "
+                           f"{INSTRUCTIONS_MAX_CHARS} (Claude Code truncates them at {INSTRUCTIONS_MAX_CHARS}), "
+                           "so shorten them (move detail into the tool docstrings)")
+
+
+check_instructions_length(_INSTRUCTIONS)
 
 mcp = MCPServer("algolearn-speak", instructions=_INSTRUCTIONS)
 
@@ -558,7 +567,7 @@ _QUEUE_NOTE = """
     progress anywhere, this one queues and waits; it is never rejected. Use
     `status()` to see what is running and how many calls are waiting; `busy`
     false with `waiting` above 0 means another session holds the floor. Your
-    call still queues behind it: leave it waiting.
+    request still queues behind it: leave it waiting.
 
     Switch of session: if the previous audio on the call came from another
     session (the greeting counts as the calling session's), the daemon first
@@ -650,8 +659,9 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 2.0, start
 
     converse() keeps the floor. Coming back with a report, it may wait minutes in the queue
     behind another session; after about 120 s Claude Code moves it to the background and
-    notifies you when it completes. Leave it waiting: do not cancel it, resend it, text
-    instead or call().
+    notifies you when it completes. While it waits, leave it: do not cancel it, resend it,
+    text instead or call(). If it returns "Telegram call ended during ..." or "needs a
+    connected Telegram call", call() back.
 """ + _HOLD_NOTE + _QUEUE_NOTE + _CALL_NOTE)
 async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float = 2.0, start_timeout_seconds: float = 45.0) -> str:
     return await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)

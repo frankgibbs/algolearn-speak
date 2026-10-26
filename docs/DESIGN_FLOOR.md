@@ -397,13 +397,11 @@ No protocol bump (owner decision 9). Verified reasons it is not needed:
    is around 15 minutes or more".
 3. Coming back is owed, by voice. When the work is done: `status()` first. On
    "connected", ONE `converse` with the report, left waiting in the queue
-   however long it takes, even behind another session's conversation. Claude
-   Code moves a tool call to the background after about 120 s ("still
-   running ... moved to the background as task ...") and notifies the agent
-   when it completes; that is normal, not a failure: the agent does not
-   cancel it, resend it, text instead, or `call`. On "ringing", `status()`
-   again. On "none", `call`; the call etiquette applies (`not answered`: wait
-   an hour by background timer, and so on).
+   however long it takes, even behind another session's conversation; while
+   it waits, the agent does not cancel it, resend it, text instead, or
+   `call`. On "ringing", `status()` again. On "none", `call`; the call
+   etiquette applies (`not answered`: wait an hour by background timer, and
+   so on).
 4. The instructions are written in the second person to the agent on the
    line ("you ..."), not as a description of the daemon.
 
@@ -412,13 +410,29 @@ No protocol bump (owner decision 9). Verified reasons it is not needed:
 every floor and coming-back rule sat after the cut and agents never saw
 them.
 
+**Verified 2026-10-26** in a live call from this repo: a queued converse
+that waited behind another session's conversation was moved to the
+background by Claude Code after 120 s, kept running (the request was not
+cancelled), played when the floor was released, and its result arrived as a
+task notification with the owner's words.
+
+**Design (code review, 2026-10-26):** the no-cancel, no-resend rule of
+decision 3 holds only while the `converse` waits. When it returns "Telegram
+call ended during ..." or "needs a connected Telegram call", the agent calls
+back with `call` as the call etiquette says. Kept from the earlier text, and
+restored in the review: `override_quiet_hours=True` without asking when the
+owner asks for a call; `set_call_debug(True)` and a test call without asking
+when a call seems off. "Hand real work to agents" now reads "once he lets you
+go, hand the work to agents", so it agrees with decision 2.
+
 **Design (2026-10-26):** `_INSTRUCTIONS` states the floor and coming back
 first, then calls, the persona and speaking, and keeps every rule agents
-still need in 3,792 characters; wording that the tool docstrings
+still need in 3,971 characters; wording that the tool docstrings
 already carry is cut from it. `speak_server.py` raises `RuntimeError` at
-import when `len(_INSTRUCTIONS)` reaches `INSTRUCTIONS_MAX_CHARS` (4096),
-with a comment saying why; `tests/test_hold.py` checks the length, the
-import-time refusal, the order and the 2026-10-26 wording. Kept from
+import (`check_instructions_length`) when `len(_INSTRUCTIONS)` reaches
+`INSTRUCTIONS_MAX_CHARS` (4096), with a comment saying why;
+`tests/test_hold.py` checks the length, the boundary (4095 passes, 4096 is
+refused), the import-time refusal, the order and the 2026-10-26 wording. Kept from
 2026-10-22: the 45 s idle timeout is not mentioned anywhere agent-facing
 (`FLOOR_IDLE_SECONDS` still drives the daemon), and there is no "one moment"
 before work. Client only; the protocol is unchanged.
@@ -441,9 +455,10 @@ The floor (one conversation at a time):
   Never ask whether he wants a call back. First status(). "connected": send ONE
   converse() with your report and leave it waiting in the queue, however long, even
   behind another session's conversation. After about 120 s Claude Code moves it to the
-  background and notifies you when it completes: that is normal. Do not cancel it,
-  resend it, text instead or call(). "ringing": another session is dialing; status()
-  again. "none": call().
+  background and notifies you when it completes: that is normal. While it waits, do
+  not cancel it, resend it, text instead or call(). If it returns "Telegram call ended
+  during ..." or "needs a connected Telegram call", call() back as Calls says.
+  "ringing": another session is dialing; status() again. "none": call().
 - A result starting '[took over the call from "<project>"; ...]' means he was just
   talking with that project. Open your next turn with one sentence recapping where you
   left off and your last question, unless his reply already answers it.
@@ -460,7 +475,7 @@ The first paragraph:
     progress anywhere, this one queues and waits; it is never rejected. Use
     `status()` to see what is running and how many calls are waiting; `busy`
     false with `waiting` above 0 means another session holds the floor. Your
-    call still queues behind it: leave it waiting.
+    request still queues behind it: leave it waiting.
 ```
 
 The switch paragraph is unchanged.
@@ -482,8 +497,9 @@ The switch paragraph is unchanged.
 ```
     converse() keeps the floor. Coming back with a report, it may wait minutes in the queue
     behind another session; after about 120 s Claude Code moves it to the background and
-    notifies you when it completes. Leave it waiting: do not cancel it, resend it, text
-    instead or call().
+    notifies you when it completes. While it waits, leave it: do not cancel it, resend it,
+    text instead or call(). If it returns "Telegram call ended during ..." or "needs a
+    connected Telegram call", call() back.
 ```
 
 `status`, its last paragraph:

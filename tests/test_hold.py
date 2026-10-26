@@ -795,10 +795,20 @@ class TestClient(unittest.TestCase):
         for tool in (client.speak, client.converse):
             self.assertIn("[hold expired after 300s; the call was ended]", tool.__doc__)
 
+    @staticmethod
+    def _flat(text: str) -> str:
+        """`text` with every run of whitespace as one space, so wording checks ignore line wrapping."""
+        return " ".join(text.split())
+
     def test_the_instructions_fit_under_claude_codes_cut(self):
         # Claude Code truncates MCP server instructions at 4096 characters.
         self.assertEqual(client.INSTRUCTIONS_MAX_CHARS, 4096)
         self.assertLess(len(client._INSTRUCTIONS), client.INSTRUCTIONS_MAX_CHARS)
+
+    def test_the_length_check_allows_4095_characters_and_refuses_4096(self):
+        client.check_instructions_length("x" * 4095)
+        with self.assertRaisesRegex(RuntimeError, "are 4096 characters; they must be under 4096"):
+            client.check_instructions_length("x" * 4096)
 
     def test_an_overlong_instructions_text_stops_the_import(self):
         # Run the client's source with 4096 more characters in the instructions, in a fresh interpreter.
@@ -811,25 +821,35 @@ class TestClient(unittest.TestCase):
                 "exec(compile(src, 'speak_server.py', 'exec'), {'__name__': 'speak_server_overlong'})\n")
         out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
         self.assertNotEqual(out.returncode, 0)
-        self.assertIn("Claude Code truncates them at 4096", out.stderr)
+        self.assertIn("they must be under 4096", out.stderr)
 
     def test_the_floor_and_coming_back_come_first(self):
         text = client._INSTRUCTIONS
         floor = text.index("The floor")
         for later in ("Calls:", "Your persona:", "Speaking:"):
             self.assertLess(floor, text.index(later))
-        self.assertIn("ask him\n  whether he is ready to let you go", text)
-        self.assertIn("ONE speak() that\n  promises to come back on the call", text)
-        self.assertIn("leave it waiting in the queue", text)
-        self.assertIn("Do not cancel it,\n  resend it, text instead or call()", text)
-        self.assertNotIn("15 minutes", text)
+        flat = self._flat(text)
+        for wording in ("ask him whether he is ready to let you go",
+                        "ONE speak() that promises to come back on the call",
+                        "leave it waiting in the queue",
+                        "While it waits, do not cancel it, resend it, text instead or call().",
+                        'If it returns "Telegram call ended during ..." or "needs a connected Telegram call", '
+                        "call() back",
+                        "pass override_quiet_hours=True without asking",
+                        "without asking, set_call_debug(True), place a test call",
+                        "Once he lets you go, hand the work to agents."):
+            self.assertIn(wording, flat)
+        self.assertNotIn("15 minutes", flat)
+        self.assertNotIn("rather than going silent", flat)
 
     def test_the_docstrings_state_the_sign_off_and_coming_back(self):
-        self.assertIn("once the owner has said you may\n    go do the work", client.speak.__doc__)
-        self.assertIn("Leave it waiting: do not cancel it, resend it", client.converse.__doc__)
+        self.assertIn("once the owner has said you may go do the work", self._flat(client.speak.__doc__))
+        converse = self._flat(client.converse.__doc__)
+        self.assertIn("While it waits, leave it: do not cancel it, resend it, text instead or call().", converse)
+        self.assertIn('"needs a connected Telegram call", call() back.', converse)
         self.assertIn("listen() keeps the floor.", client.listen.__doc__)
-        self.assertIn('This `busy` is not call()\'s "busy" outcome.', client.status.__doc__)
-        self.assertIn("Your\n    call still queues behind it: leave it waiting.", client._QUEUE_NOTE)
+        self.assertIn('This `busy` is not call()\'s "busy" outcome.', self._flat(client.status.__doc__))
+        self.assertIn("Your request still queues behind it: leave it waiting.", self._flat(client._QUEUE_NOTE))
 
     def test_the_client_still_imports_no_numpy_torch_or_ntgcalls(self):
         code = ("import sys, speak_server; "

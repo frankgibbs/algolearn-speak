@@ -335,10 +335,11 @@ No protocol change: the protocol stays 3.
   server instructions off at 4096 characters, and the 2026-10-23 text was
   6,891 characters, so every floor and coming-back rule sat past the cut and
   agents never saw them. The text now puts the floor and coming back first,
-  then calls, the persona and speaking, and stays under the limit (3,792
-  characters); `speak_server.py` raises `RuntimeError` at import when
-  `len(_INSTRUCTIONS)` reaches `INSTRUCTIONS_MAX_CHARS` (4096), and a test
-  checks it. Detail lives in the tool docstrings, which are not cut. The
+  then calls, the persona and speaking, and stays under the limit (3,971
+  characters); `speak_server.py` raises `RuntimeError` at import
+  (`check_instructions_length`) when `len(_INSTRUCTIONS)` reaches
+  `INSTRUCTIONS_MAX_CHARS` (4096), and tests check it (4095 passes, 4096
+  is refused). Detail lives in the tool docstrings, which are not cut. The
   rules (owner decisions 2026-10-26):
   1. Stay in `converse` while you work the problem out with the owner
      (understanding it, deciding what to do). Every turn is one `converse`.
@@ -353,15 +354,23 @@ No protocol change: the protocol stays 3.
      text only in addition, and never ask whether he wants a call back.
      `status()` first. On "connected", send ONE `converse` with the report
      and leave it waiting in the queue, however long it takes, even behind
-     another session's conversation. Claude Code moves a tool call to the
-     background after about 120 s ("still running ... moved to the
-     background as task ...") and notifies the agent when it completes; that
-     is normal, not a failure: do not cancel it, do not resend it, do not
-     text instead, do not `call`. On "ringing", `status()` again. On "none",
-     `call`, and the call etiquette applies (`not answered`: wait an hour by
-     background timer, and so on).
-  The rules kept from 2026-10-22 and 2026-10-23: the session that last
-  played audio holds the floor (`converse` and `listen` keep it, `speak`
+     another session's conversation. While it waits, do not cancel it, do
+     not resend it, do not text instead, do not `call`. On "ringing", `status()` again. On
+     "none", `call`, and the call etiquette applies (`not answered`: wait an
+     hour by background timer, and so on).
+  Verified 2026-10-26 in a live call from this repo: a queued converse that
+  waited behind another session's conversation was moved to the background
+  by Claude Code after 120 s, kept running (the request was not cancelled),
+  played when the floor was released, and its result arrived as a task
+  notification with the owner's words. Design (code review 2026-10-26): the
+  no-cancel, no-resend rule holds only while the `converse` waits; when it
+  returns "Telegram call ended during ..." or "needs a connected Telegram
+  call", the agent calls back with `call` as the call etiquette says.
+  The rules kept from 2026-10-22 and 2026-10-23, and earlier: when the
+  owner asks for a call, `override_quiet_hours=True` without asking; when a
+  call seems off, `set_call_debug(True)` and a test call without asking
+  first; real work goes to agents, now once the owner has let you go; the
+  session that last played audio holds the floor (`converse` and `listen` keep it, `speak`
   gives it up); `listen` alone only to reopen the ear after a
   `TimeoutError` or with nothing to say first; whenever the call etiquette
   says to wait (quiet hours, `not answered`, `busy` twice, hung up during
@@ -373,13 +382,15 @@ No protocol change: the protocol stays 3.
   line. Docstrings: `speak` says it is only the sign-off once the owner has
   said you may go do the work; `converse` that it keeps the floor and,
   coming back, may wait minutes in the queue, moved to the background, so
-  you leave it waiting; `listen` that it keeps the floor; `status` that
+  you leave it waiting while it waits, and call back with `call` if it
+  returns "Telegram call ended during ..." or "needs a connected Telegram
+  call"; `listen` that it keeps the floor; `status` that
   `busy` true or `waiting` above 0 while "connected" still means `converse`,
   and that this `busy` is not `call`'s `busy` outcome; `call` that while the
   call is connected you use `converse`, not `call`; `_QUEUE_NOTE` that
   `busy` false with `waiting` above 0 means another session holds the floor
-  and your call still queues behind it. No "one moment" before work, and the
-  idle timeout is not mentioned to agents at all. Client only, no protocol
+  and your request still queues behind it. No "one moment" before work, and
+  the idle timeout is not mentioned to agents at all. Client only, no protocol
   change. Running sessions get the new text after `/mcp` reconnect (a
   `git pull` on each computer first).
 
