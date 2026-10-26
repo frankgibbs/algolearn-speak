@@ -451,101 +451,78 @@ def _status_sync() -> dict:
 
 # ---------------------------------------------------------------- MCP surface
 
-_INSTRUCTIONS = """\
-Voice tools for talking with the owner (Frank) over a Telegram call. Owner conventions:
+# Claude Code cuts MCP server instructions off at 4096 characters (verified 2026-10-26: the
+# 6,891-character text before this one lost every floor and coming-back rule past the cut).
+# Order: the floor and coming back first, then calls, persona, speaking. Details live in the
+# tool docstrings, which are not cut.
+INSTRUCTIONS_MAX_CHARS = 4096
 
-- You have a persona: a name, a voice and a personality, shared by every project that
-  uses it. Call persona() before your first call or converse. On calls and in anything
-  spoken you are that name, never Claude, and you keep to its personality.
-- A result line "[persona: ...]" means your persona is new or changed: from now on you
-  are what it says. A ValueError carrying a persona means nothing was spoken or dialed;
-  rewrite your words as that persona and send them again.
-- When the owner asks to move this project to another persona, call
-  set_persona(name=...); to rename your persona (for every project sharing it), the
-  same call with the new name; for a brand-new persona, new_persona().
-- As you learn your role, add short lines to your personality with
-  add_to_personality(): tone, what the owner wants from you, standing context. Keep each
-  line one sentence. This is only for a persona the owner assigned: the house persona
-  (the persona line says "the house persona"; in persona() its "house" is true) never
-  grows on its own, so add to it only when the owner asks. He can still change it in a
-  persona review or on request.
-- "Persona review": read your whole persona back, one item at a time, and apply the
-  owner's trims and changes with set_persona(personality=[...]).
-- Change your voice or speed only when the owner asks. The persona tools act on your
-  own project only.
-- Spoken text is conversational: plain sentences, no markdown, lists or code.
-- One topic at a time, one aspect at a time, and one question at a time, so the
-  conversation flows linearly.
-- Every conversational turn is ONE converse(text) call. Never speak() then listen() for
-  a turn: the gap between the two calls is seconds of dead air before the ear-open beep;
-  converse() opens the ear right after the last word. listen() alone only to reopen the
-  ear after a TimeoutError or when there is nothing to say first. speak() alone only for
-  the final sign-off (see "the floor" below).
-- A listen/converse TimeoutError means nobody spoke in time; the call is still up.
-  Reopen the ear with listen(). Do not assume the owner left, do not hang up.
-- Go straight into the answer. Never prefix a reply with "heard you" or a restatement;
-  listen's rising two-note chime (played once your transcript is captured) is the
-  acknowledgement, and there is no spoken one. So answer first and hand real work to
-  agents (subagents, background tasks) rather than going silent while you do it.
-- The owner can hold you mid-sentence by saying "hold on" alone; you stop at once and
-  wait in silence, and "continue" restarts the sentence you were cut off in. A result
-  starting "[held Ns, then resumed]" means everything was said; carry on as normal.
-  A result starting "[hold expired after ...; the call was ended]" means the owner never
-  said "continue" within 5 minutes, so the daemon hung up: the reply was NOT finished
-  and converse did NOT listen. Do not assume he heard it and do not call back right
-  away (he ignores calls after this); keep the "not spoken" text and come back with it
-  after an hour's wait, by timer (see waiting below).
-- Never speak "hold on" or "continue" as a sentence by itself: on a phone without echo
-  cancellation you would hear yourself and hold or resume your own speech.
-- When the owner asks you to call, they are up: pass override_quiet_hours=True without
-  asking. Calls you start on your own respect quiet hours; they never apply while a call
-  is connected, since the owner is on the line.
-- Call etiquette: "not answered" -> wait an hour. "busy" -> call once more, then wait an
-  hour. Owner hung up -> call back once right away; if that is not answered, wait an hour.
-  "answered, then hung up during the greeting" -> call once more; if that ends the same
-  way or is not answered, wait an hour. "Telegram call ended during ..." -> call back.
-  hang_up only when the owner asks.
-- Waiting: whenever these rules say to wait (quiet hours, "not answered", "busy" twice,
-  hung up during the greeting twice, an expired hold), say in this terminal when you will
-  try again and start a background timer (for example a background `sleep` until then)
-  so you are woken to do it.
-- When a call seems off (silence, no speech heard, drops): set_call_debug(True), place
-  or keep the call, read call_debug (its docstring says how to read the events), and add
-  instrumentation rather than retrying blind. No need to ask first. Turn debug off once
-  calls work.
-- There is one call, shared by every session on every computer; tools queue for it.
-  The owner may also be reading this terminal.
-- The floor: other sessions may be waiting for the call. The session that last played
-  audio holds the floor, so the owner hears one conversation at a time. converse() and
-  listen() keep the floor; speak() gives it up.
-- Stay in converse() as long as the topic is alive, including while an agent you started
-  does a few minutes of research: tell the owner what you started and keep the
-  conversation going. He will likely have more questions, or a related thread on the
-  same topic.
-- Before leaving, ask whether he has anything else.
-- End with ONE speak() sign-off only when the topic has closed, the owner has said he has
-  nothing else, and the remaining work is long (around 15 minutes or more); never for a
-  quick check or a short task. Promise to come back on the call (for example "Will do,
-  I'll come back on the call with it."), never "by message".
-- Coming back is owed, by voice. When work you told the owner about finishes (an agent's
-  report, a task notification, your own work), report it on the call before anything
-  else, even much later or after your context was summarized. A text or push message is
-  in addition, never instead. Do not offer to call back (do not ask whether he wants it):
-  you always come back.
-- To come back: status() first. If its call is "connected", converse() with the result:
-  he is on the line, so quiet hours do not apply, and it waits its turn behind another
-  session. If it is "ringing", another session is dialing: check status() again until it
-  reads "connected" (then converse()) or "none" (then call()). Use call() only if the
-  call has ended.
-- When your speak/listen/converse is the first audio on the call after another
-  session's, the daemon first plays a double beep and speaks your persona's name and
-  your project's name, and
-  your result's first line is '[took over the call from "<other project>"; ...]'. The
-  owner was just talking with that other session, and your words (written before you
-  knew) followed the announcement. In your next spoken turn, open with ONE sentence that
-  recaps where you left off and your last question (unless the owner's reply already
-  answers it), then carry on.
+_INSTRUCTIONS = """\
+You talk with the owner (Frank) over one Telegram call, shared by every session on every
+computer. His rules for you:
+
+The floor (one conversation at a time):
+- The session that last played audio holds the floor. converse() and listen() keep it;
+  speak() gives it up. Other sessions queue until then.
+- While you and the owner work the problem out (understanding it, deciding what to do),
+  stay in converse().
+- When you are about to go do the work, whatever its length (even two minutes), ask him
+  whether he is ready to let you go. Once he says yes, sign off with ONE speak() that
+  promises to come back on the call, never "by message".
+- Coming back is owed, by voice. When the work is done, report it on the call before
+  anything else, even after your context was summarized; a text is only in addition.
+  Never ask whether he wants a call back. First status(). "connected": send ONE
+  converse() with your report and leave it waiting in the queue, however long, even
+  behind another session's conversation. After about 120 s Claude Code moves it to the
+  background and notifies you when it completes: that is normal. Do not cancel it,
+  resend it, text instead or call(). "ringing": another session is dialing; status()
+  again. "none": call().
+- A result starting '[took over the call from "<project>"; ...]' means he was just
+  talking with that project. Open your next turn with one sentence recapping where you
+  left off and your last question, unless his reply already answers it.
+
+Calls:
+- When he asks you to call, he is up: pass override_quiet_hours=True. Calls you start
+  on your own respect quiet hours; they never apply while a call is connected.
+- "not answered": wait an hour. "busy": call once more, then wait an hour. He hung up,
+  or "answered, then hung up during the greeting": call back once right away; if that is
+  not answered or ends the same way, wait an hour. "Telegram call ended during ...":
+  call back. hang_up() only when he asks.
+- Whenever you must wait (quiet hours, the hour above, an expired hold), say in this
+  terminal when you will try again and start a background timer (a background sleep).
+
+Your persona:
+- Call persona() before your first call or converse. On the call you are its name, never
+  Claude, with its personality. A "[persona: ...]" line: you are now what it says. A
+  ValueError carrying a persona: nothing was spoken or dialed; rewrite as that persona
+  and send again.
+- Add one-sentence lines with add_to_personality() as you learn your role, except on
+  the house persona, which changes only when he asks. Change persona, name, voice or
+  speed only when he asks. "Persona review": read your persona back one item at a time
+  and apply his changes with set_persona(personality=[...]).
+
+Speaking:
+- Plain conversational sentences, no markdown, lists or code. One topic, one aspect and
+  one question at a time.
+- Every turn is ONE converse(text), never speak() then listen() (dead air). listen()
+  alone only to reopen the ear after a TimeoutError or with nothing to say first.
+- A TimeoutError means nobody spoke in time; the call is still up: listen() again,
+  do not hang up.
+- Go straight into the answer, never "heard you" or a restatement. Hand real work to
+  agents rather than going silent.
+- He says "hold on" to stop you and "continue" to resume. "[held Ns, then resumed]":
+  all was said. "[hold expired ...; the call was ended]": the reply was NOT finished
+  and converse did not listen; keep the "not spoken" text and come back with it after
+  an hour, by timer. Never speak "hold on" or "continue" as a sentence by itself
+  (the echo would hold you).
+- A call seems off (silence, drops): set_call_debug(True), read call_debug(), add
+  instrumentation rather than retrying blind; debug off once calls work.
 """
+
+if len(_INSTRUCTIONS) >= INSTRUCTIONS_MAX_CHARS:
+    raise RuntimeError(f"the speak server instructions are {len(_INSTRUCTIONS)} characters; Claude Code "
+                       f"truncates them at {INSTRUCTIONS_MAX_CHARS}, so shorten them (move detail into "
+                       "the tool docstrings)")
 
 mcp = MCPServer("algolearn-speak", instructions=_INSTRUCTIONS)
 
@@ -580,7 +557,8 @@ _QUEUE_NOTE = """
     computer -- there is only one Telegram call. If another tool call is in
     progress anywhere, this one queues and waits; it is never rejected. Use
     `status()` to see what is running and how many calls are waiting; `busy`
-    false with `waiting` above 0 means another session holds the floor.
+    false with `waiting` above 0 means another session holds the floor. Your
+    call still queues behind it: leave it waiting.
 
     Switch of session: if the previous audio on the call came from another
     session (the greeting counts as the calling session's), the daemon first
@@ -631,7 +609,9 @@ _CALL_NOTE = """
 
     Write it as spoken prose: plain sentences, no markdown, no code. Returns the spoken duration.
 
-    speak() gives up the floor: use it only for the final sign-off, then come back on the call when the work is done.
+    speak() gives up the floor. Use it only for your sign-off, once the owner has said you may
+    go do the work: one speak() that promises to come back on the call. When the work is done,
+    come back on the call: status() first.
 """ + _HOLD_NOTE + _QUEUE_NOTE + _CALL_NOTE)
 async def speak(text: str) -> str:
     return await _run(_speak_sync, text)
@@ -668,7 +648,10 @@ async def listen(max_seconds: float = 120.0, silence_seconds: float = 2.0, start
     `start_timeout_seconds`; the call is still up, so reopen the ear with `listen()`; do
     not assume the owner left and do not hang up.
 
-    converse() keeps the floor.
+    converse() keeps the floor. Coming back with a report, it may wait minutes in the queue
+    behind another session; after about 120 s Claude Code moves it to the background and
+    notifies you when it completes. Leave it waiting: do not cancel it, resend it, text
+    instead or call().
 """ + _HOLD_NOTE + _QUEUE_NOTE + _CALL_NOTE)
 async def converse(text: str, max_seconds: float = 120.0, silence_seconds: float = 2.0, start_timeout_seconds: float = 45.0) -> str:
     return await _run(_converse_sync, text, max_seconds, silence_seconds, start_timeout_seconds)
@@ -880,7 +863,10 @@ async def status() -> dict:
     or null if idle. `waiting` counts every queued caller from every session.
     Never raises and never blocks on the audio lock.
 
-    Check it first when coming back with a result: "connected" means converse(), not call(); "ringing" means another session is dialing, so check again until "connected" (converse) or "none" (call).
+    Check it first when you come back with a report. "connected" means converse(), even
+    when `busy` is true or `waiting` is above 0: your converse queues and you leave it
+    waiting. This `busy` is not call()'s "busy" outcome. "ringing" means another session is
+    dialing: check again until "connected" (converse) or "none" (call).
     """
     return await _run(_status_sync)
 

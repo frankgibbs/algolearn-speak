@@ -38,16 +38,16 @@ owner and hold a spoken conversation.
 
 | Tool | What it does |
 |---|---|
-| `speak(text)` | The daemon synthesizes `text` with Kokoro-82M one segment (a sentence) at a time and plays each into the connected call as soon as it is made, synthesizing the next while earlier ones play (owner decision 2026-10-16). Returns once all of it has played, with the spoken duration. While it plays the owner can hold it (see "Hold on / continue" below): `[held Ns, then resumed]` on its own line comes first when it was held; an expired hold returns the expired form instead. A `[took over the call from "<project>"; ...]` line comes before all of that when this session took the call over (see "Switch of session" below), then a `[persona: ...]` line when the reply carries the project's persona (see "Personas" below). Speaks in the project's persona's voice, read again before each sentence. When it finishes it gives up the floor (see "The floor" below), except when the call ended under it. |
+| `speak(text)` | The daemon synthesizes `text` with Kokoro-82M one segment (a sentence) at a time and plays each into the connected call as soon as it is made, synthesizing the next while earlier ones play (owner decision 2026-10-16). Returns once all of it has played, with the spoken duration. While it plays the owner can hold it (see "Hold on / continue" below): `[held Ns, then resumed]` on its own line comes first when it was held; an expired hold returns the expired form instead. A `[took over the call from "<project>"; ...]` line comes before all of that when this session took the call over (see "Switch of session" below), then a `[persona: ...]` line when the reply carries the project's persona (see "Personas" below). Speaks in the project's persona's voice, read again before each sentence. When it finishes it gives up the floor (see "The floor" below), except when the call ended under it. Agents use it only for the sign-off, once the owner has said they may go do the work (owner decision 2026-10-26). |
 | `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep (the ear is open), then records the owner's call audio until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech), then Whisper large-v3-turbo transcribes. Once text is in hand, a rising two-note chime tells the owner their words were captured (owner decision 2026-10-16). No ear-closed beep and no spoken acknowledgement. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. After a switch of session the switch cue and "<persona name>, <project name>, still listening" come before the ear-open beep, and the result (or the `TimeoutError` message) starts with the `[took over the call from ...]` line. Keeps the floor, a no-speech `TimeoutError` included. |
-| `converse(text, ...)` | `speak` then `listen` under one lock hold. Returns the user's words, after a `[held Ns, then resumed]` line when the speech was held. After an expired hold it does not listen and returns the expired form. The `[took over the call from ...]` line comes first after a switch of session, then the `[persona: ...]` line when there is one. Keeps the floor. |
+| `converse(text, ...)` | `speak` then `listen` under one lock hold. Returns the user's words, after a `[held Ns, then resumed]` line when the speech was held. After an expired hold it does not listen and returns the expired form. The `[took over the call from ...]` line comes first after a switch of session, then the `[persona: ...]` line when there is one. Keeps the floor. An agent coming back with a report sends one `converse` and leaves it waiting in the queue, however long (owner decision 2026-10-26). |
 | `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is the whole opening, spoken the moment they answer in the calling project's persona's voice: who is calling (by the persona's name), why, and the context, ending with a question or invitation. It must be at least 6 s when spoken (measured on the synthesized audio); a shorter one raises `ValueError` BEFORE dialing (phone never rings; owner decision 2026-10-12) telling the model to add the context of why it is calling, or, on a fresh conversation with nothing to report, to open with something playful (a joke, something funny or flirty). Never padded. Once answered, `call` immediately does the `listen` (ear-open beep, VAD, Whisper, rising chime) under the same lock hold and returns the owner's words; listen parameters and defaults match `converse`, and a listen timeout or a drop raises as in `listen` (the call stays connected on a timeout). Returns `answered\n<their words>\n(audio: telegram)`, `already connected` (greeting not spoken, no listen), `not answered (declined or no answer)`, `busy (the owner's Telegram reports a call in progress)` (Telegram discarded it as busy; the phone did not ring), `answered, then hung up during the greeting` (the owner picked up and ended it before the greeting finished; one call back right away is allowed, then the one-hour rule), `hung up` (another session's `hang_up` ended it during the greeting), `answered but audio failed to connect: <error>` (the owner picked up but media failed; the daemon container restarts itself) or `not called: quiet hours (...)`. Check order (owner decision 2026-10-23): already connected (whatever the time: the owner is on the line), quiet hours, then the greeting length, then the wait until 10 s have passed since the last call ended, then the dial. Quiet hours, an empty greeting and a too-short greeting each record the event `call_refused` (`project`, `reason`: `quiet_hours`, `empty_greeting` or `greeting_too_short`, the last with `greeting_s`); `already connected` is not a refusal and records nothing. `call_refused` belongs to no call: it carries `call_id` null and no `elapsed_s` (`TelegramLink.record_unbound_event`), and the `quiet_hours` one carries `local_time` (`HH:MM`, daemon clock). Daemon only, no protocol change. Deployed in commits d503492 and fce8f93 on 2026-10-23. |
 | `hang_up()` | End that call (only when the owner asks). Always clears the session's call expectation. |
 | `persona()` | This project's persona (the block: name, whether it is the house persona, voice blend, speed, personality, the projects sharing it), every persona with its projects, the English voice ids, the speed range and how many pool names are left. No lock. Agents call it first, before their first `call` or `converse`. |
 | `new_persona()` | Moves this project onto a brand-new persona: a random unused pool name, the default voice and speed. Only when the owner asks. Raises `ValueError` once the pool is used up. No lock. |
 | `set_persona(name=None, voice=None, speed=None, personality=None)` | One change per call to this project's persona. `name` alone moves the project onto the persona of that name (case-insensitive), or renames its own persona for every project sharing it when no persona has the name. `voice` (`{voice id: weight}`, 1 to 4 English voices, normalized to sum 1), `speed` (0.5 to 2.0) and `personality` (the whole note as a list of lines, for a persona review) change the persona for every project using it. Voice and speed only when the owner asks. No lock. |
 | `add_to_personality(note)` | Appends one line to the persona's personality (agents do this on their own as they learn their role, except on the house persona, which grows only when the owner asks). Raises once the note would pass 4000 characters: ask the owner for a persona review. No lock. |
-| `status()` | `{busy, current_tool, waiting, call}`: what holds the daemon's lock (`"<tool> (<client ip>)"`; `transcribe` is an HTTP whisper API request), how many requests from every session wait behind it, and the call state (`none`/`ringing`/`connected`). When the daemon is not reached, `call` is `daemon unreachable: <error>` and the other three are null. When the daemon speaks another protocol version, `call` is `protocol mismatch: ...` (update the client or deploy the daemon) and the other three are null. Never raises, never waits on the lock. |
+| `status()` | `{busy, current_tool, waiting, call}`: what holds the daemon's lock (`"<tool> (<client ip>)"`; `transcribe` is an HTTP whisper API request), how many requests from every session wait behind it, and the call state (`none`/`ringing`/`connected`). When the daemon is not reached, `call` is `daemon unreachable: <error>` and the other three are null. When the daemon speaks another protocol version, `call` is `protocol mismatch: ...` (update the client or deploy the daemon) and the other three are null. Never raises, never waits on the lock. While `call` is `connected`, a session coming back sends `converse` even when `busy` is true or `waiting` is above 0; this `busy` is not `call`'s `busy` outcome. |
 | `call_debug(lines=50)` / `set_call_debug(enabled)` | The daemon's recent call events and log tail; DEBUG logging on or off at runtime. No lock. `{"daemon": "unreachable: <error>"}` when the daemon is not reached. |
 
 Every `speak`/`listen`/`converse` result, and an answered `call`, ends with
@@ -327,44 +327,61 @@ No protocol change: the protocol stays 3.
   queued then). `status` is unchanged, so `busy` can be false while
   `waiting` is non-zero (the lock is free and the waiters are not eligible).
   No tool reply tells the holder that others wait (owner decision).
-- **Etiquette in the client (owner decisions 2026-10-22, coming back
-  2026-10-23):** stated once, in the server instructions; `speak`, `listen`
-  and `converse` each carry one line on their own floor effect (`converse`
-  and `listen` keep it, `speak` gives it up, is only for the final sign-off,
-  and you come back on the call), `status` and `call` one line each on coming
-  back (`status()` first; "connected" means `converse`, not `call`;
-  "ringing" means another session is dialing, check again), and
-  `_QUEUE_NOTE` keeps only the queue and `status` content (`busy` false with
-  `waiting` above 0 means another session holds the floor). The rules: the
-  session that last played audio holds the floor; every turn is one
-  `converse`; stay in `converse` while the topic is alive, including while an
-  agent you started researches for a few minutes (tell the owner what you
-  started and keep talking); ask whether he has anything else before
-  leaving; end with one `speak` sign-off only when the topic has closed, he
-  has nothing else, and the remaining work is long (around 15 minutes or
-  more), never for a quick check or a short task, promising to come back on
-  the call, never "by message"; coming back is owed, by voice: when work you
-  told the owner about finishes (an agent's report, a task notification,
-  your own work), report it on the call before anything else, even much
-  later or after your context was summarized, with a text or push message
-  only in addition, never instead; "do not offer to call back" means do not
-  ask whether he wants it, you always come back; to come back, `status()`
-  first, `converse` if its call is "connected" (quiet hours do not apply, it
-  waits its turn behind the switch cue), on "ringing" (another session is
-  dialing) `status()` again until "connected" (`converse`) or "none"
-  (`call`), `call` only if it has ended; whenever the call etiquette says
-  to wait (quiet hours, `not answered`, `busy` twice, hung up during the
-  greeting twice, an expired hold), say in the terminal when you will try
-  again and start a background timer (a background `sleep`) to be woken
-  for it; an expired hold's unspoken text comes back after the hour's wait,
-  by timer; `listen` alone only to reopen the ear after a `TimeoutError`
-  or with nothing to say first. "Calls you start on your own respect quiet
-  hours" stays, and says they never apply while a call is connected; the
-  `call` docstring says the same of its quiet-hours rule and outcome. No
-  "one moment" before work, and the idle timeout is not mentioned to agents
-  at all. Running sessions get the new text after `/mcp` reconnect. The
-  coming-back text (2026-10-23) was deployed in commits
-  d503492 and fce8f93 on 2026-10-23.
+- **Etiquette in the client (owner decisions 2026-10-22 and 2026-10-23,
+  replaced by owner decisions 2026-10-26, agreed on a call):** stated once,
+  in the server instructions (`_INSTRUCTIONS`), written to the agent on the
+  line in the second person ("you ..."), not as a description of the daemon
+  (owner decision 2026-10-26). Verified 2026-10-26: Claude Code cuts MCP
+  server instructions off at 4096 characters, and the 2026-10-23 text was
+  6,891 characters, so every floor and coming-back rule sat past the cut and
+  agents never saw them. The text now puts the floor and coming back first,
+  then calls, the persona and speaking, and stays under the limit (3,792
+  characters); `speak_server.py` raises `RuntimeError` at import when
+  `len(_INSTRUCTIONS)` reaches `INSTRUCTIONS_MAX_CHARS` (4096), and a test
+  checks it. Detail lives in the tool docstrings, which are not cut. The
+  rules (owner decisions 2026-10-26):
+  1. Stay in `converse` while you work the problem out with the owner
+     (understanding it, deciding what to do). Every turn is one `converse`.
+  2. When you are about to go do the work, whatever its length (even a
+     2-minute job), ask the owner whether he is ready to let you go; then
+     sign off with ONE `speak` that promises to come back on the call, never
+     "by message". This replaces the rules of 2026-10-22 (stay in `converse`
+     while an agent researches; sign off only when the topic has closed, he
+     has nothing else and the remaining work is around 15 minutes or more).
+  3. Coming back is owed, by voice: when the work is done, report it on the
+     call before anything else, even after your context was summarized, a
+     text only in addition, and never ask whether he wants a call back.
+     `status()` first. On "connected", send ONE `converse` with the report
+     and leave it waiting in the queue, however long it takes, even behind
+     another session's conversation. Claude Code moves a tool call to the
+     background after about 120 s ("still running ... moved to the
+     background as task ...") and notifies the agent when it completes; that
+     is normal, not a failure: do not cancel it, do not resend it, do not
+     text instead, do not `call`. On "ringing", `status()` again. On "none",
+     `call`, and the call etiquette applies (`not answered`: wait an hour by
+     background timer, and so on).
+  The rules kept from 2026-10-22 and 2026-10-23: the session that last
+  played audio holds the floor (`converse` and `listen` keep it, `speak`
+  gives it up); `listen` alone only to reopen the ear after a
+  `TimeoutError` or with nothing to say first; whenever the call etiquette
+  says to wait (quiet hours, `not answered`, `busy` twice, hung up during
+  the greeting twice, an expired hold), say in the terminal when you will
+  try again and start a background timer (a background `sleep`); an expired
+  hold's unspoken text comes back after the hour's wait, by timer; calls you
+  start on your own respect quiet hours, which never apply while a call is
+  connected; the recap sentence after a `[took over the call from ...]`
+  line. Docstrings: `speak` says it is only the sign-off once the owner has
+  said you may go do the work; `converse` that it keeps the floor and,
+  coming back, may wait minutes in the queue, moved to the background, so
+  you leave it waiting; `listen` that it keeps the floor; `status` that
+  `busy` true or `waiting` above 0 while "connected" still means `converse`,
+  and that this `busy` is not `call`'s `busy` outcome; `call` that while the
+  call is connected you use `converse`, not `call`; `_QUEUE_NOTE` that
+  `busy` false with `waiting` above 0 means another session holds the floor
+  and your call still queues behind it. No "one moment" before work, and the
+  idle timeout is not mentioned to agents at all. Client only, no protocol
+  change. Running sessions get the new text after `/mcp` reconnect (a
+  `git pull` on each computer first).
 
 Without a connected call, `speak`/`listen`/`converse` raise `<tool> needs a
 connected Telegram call (call state is ...); place one with the call tool`.

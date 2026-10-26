@@ -1,7 +1,8 @@
 # Design: the floor (one conversation at a time on the shared call)
 
 Status: design, written 2026-10-20; deployed in commit `b5cd149` on 2026-10-20.
-The client text (section 6) was rewritten by owner decision 2026-10-22.
+The client text (section 6) was rewritten by owner decision 2026-10-22, and
+again by owner decisions 2026-10-26.
 Every build, restart and stop of `speak-telegram` remains an owner action,
 approved per change.
 
@@ -68,7 +69,8 @@ stopping point.
    connected when the work is done, the agent just runs `converse` (it
    queues, gets the floor when it is free, and the switch cue announces the
    project); it uses `call` only if the call has ended. **Amended by owner
-   decision 2026-10-22:** the etiquette as it now reads is in section 6.
+   decision 2026-10-22, then by owner decisions 2026-10-26:** the etiquette
+   as it now reads is in section 6.
 6. **No new cue.** The existing switch-of-session cue and project-name
    announcement is what tells the owner the floor changed hands.
 7. **An answered `call` gives the caller the floor** right away.
@@ -382,50 +384,69 @@ No protocol bump (owner decision 9). Verified reasons it is not needed:
 
 ## 6. Client text (`speak_server.py`)
 
-**Owner decision 2026-10-22** (made on a call), replacing the text built on
-2026-10-20:
-- The floor etiquette is stated once, in `_INSTRUCTIONS`. Each of `speak`,
-  `listen` and `converse` gets one plain line about its own floor effect.
-  `_QUEUE_NOTE` keeps only its queue and `status` content.
-- The 45 s idle timeout is not mentioned anywhere agent-facing: agents never
-  reason about silence. (`FLOOR_IDLE_SECONDS` still drives the daemon; the
-  client no longer composes it into text.)
-- No "one moment" before work: `speak` is only the final sign-off.
-- Stay in `converse` while the topic is alive, including while an agent you
-  started researches for a few minutes; ask whether the owner has anything
-  else before leaving; sign off with one `speak` only when the topic has
-  closed, the owner has nothing else, and the remaining work is long (around
-  15 minutes or more).
+**Owner decisions 2026-10-26** (agreed on a call), replacing the text of
+2026-10-22 and its coming-back additions of 2026-10-23:
+1. Stay in `converse` while working the problem out with the owner
+   (understanding it, deciding what to do).
+2. When the agent is about to go do the work, whatever its length (even a
+   2-minute job), it asks the owner whether he is ready to let it go, then
+   signs off with ONE `speak` that promises to come back on the call. This
+   replaces the 2026-10-22 rules "stay in `converse` while an agent you
+   started researches for a few minutes" and "sign off with `speak` only when
+   the topic has closed, the owner has nothing else, and the remaining work
+   is around 15 minutes or more".
+3. Coming back is owed, by voice. When the work is done: `status()` first. On
+   "connected", ONE `converse` with the report, left waiting in the queue
+   however long it takes, even behind another session's conversation. Claude
+   Code moves a tool call to the background after about 120 s ("still
+   running ... moved to the background as task ...") and notifies the agent
+   when it completes; that is normal, not a failure: the agent does not
+   cancel it, resend it, text instead, or `call`. On "ringing", `status()`
+   again. On "none", `call`; the call etiquette applies (`not answered`: wait
+   an hour by background timer, and so on).
+4. The instructions are written in the second person to the agent on the
+   line ("you ..."), not as a description of the daemon.
+
+**Verified (2026-10-26):** Claude Code truncates MCP server instructions at
+4096 characters. The 2026-10-23 `_INSTRUCTIONS` was 6,891 characters, so
+every floor and coming-back rule sat after the cut and agents never saw
+them.
+
+**Design (2026-10-26):** `_INSTRUCTIONS` states the floor and coming back
+first, then calls, the persona and speaking, and keeps every rule agents
+still need in 3,792 characters; wording that the tool docstrings
+already carry is cut from it. `speak_server.py` raises `RuntimeError` at
+import when `len(_INSTRUCTIONS)` reaches `INSTRUCTIONS_MAX_CHARS` (4096),
+with a comment saying why; `tests/test_hold.py` checks the length, the
+import-time refusal, the order and the 2026-10-26 wording. Kept from
+2026-10-22: the 45 s idle timeout is not mentioned anywhere agent-facing
+(`FLOOR_IDLE_SECONDS` still drives the daemon), and there is no "one moment"
+before work. Client only; the protocol is unchanged.
 
 ### 6.1 `_INSTRUCTIONS`
 
-The turn bullet ends:
+The floor section, first in the text:
 
 ```
-  converse() opens the ear right after the last word. listen() alone only to reopen the
-  ear after a TimeoutError or when there is nothing to say first. speak() alone only for
-  the final sign-off (see "the floor" below).
-```
-
-After the bullet "There is one call, shared by every session on every
-computer; tools queue for it.":
-
-```
-- The floor: other sessions may be waiting for the call. The session that last played
-  audio holds the floor, so the owner hears one conversation at a time. converse() and
-  listen() keep the floor; speak() gives it up.
-- Stay in converse() as long as the topic is alive, including while an agent you started
-  does a few minutes of research: tell the owner what you started and keep the
-  conversation going. He will likely have more questions, or a related thread on the
-  same topic.
-- Before leaving, ask whether he has anything else.
-- End with ONE speak() sign-off (for example "Will do, talk soon.") only when the topic
-  has closed, the owner has said he has nothing else, and the remaining work is long
-  (around 15 minutes or more). Never use speak() for a quick check or a short task.
-- Do not offer to call back; say you will come back with the result. When the work is
-  done, check status(): if its call field says the call is still connected, converse()
-  with the result (it waits its turn, and the owner hears the switch cue and your
-  project's name first). Use call() only if the call has ended.
+The floor (one conversation at a time):
+- The session that last played audio holds the floor. converse() and listen() keep it;
+  speak() gives it up. Other sessions queue until then.
+- While you and the owner work the problem out (understanding it, deciding what to do),
+  stay in converse().
+- When you are about to go do the work, whatever its length (even two minutes), ask him
+  whether he is ready to let you go. Once he says yes, sign off with ONE speak() that
+  promises to come back on the call, never "by message".
+- Coming back is owed, by voice. When the work is done, report it on the call before
+  anything else, even after your context was summarized; a text is only in addition.
+  Never ask whether he wants a call back. First status(). "connected": send ONE
+  converse() with your report and leave it waiting in the queue, however long, even
+  behind another session's conversation. After about 120 s Claude Code moves it to the
+  background and notifies you when it completes: that is normal. Do not cancel it,
+  resend it, text instead or call(). "ringing": another session is dialing; status()
+  again. "none": call().
+- A result starting '[took over the call from "<project>"; ...]' means he was just
+  talking with that project. Open your next turn with one sentence recapping where you
+  left off and your last question, unless his reply already answers it.
 ```
 
 ### 6.2 `_QUEUE_NOTE`
@@ -438,18 +459,44 @@ The first paragraph:
     computer -- there is only one Telegram call. If another tool call is in
     progress anywhere, this one queues and waits; it is never rejected. Use
     `status()` to see what is running and how many calls are waiting; `busy`
-    false with `waiting` above 0 means another session holds the floor.
+    false with `waiting` above 0 means another session holds the floor. Your
+    call still queues behind it: leave it waiting.
 ```
 
 The switch paragraph is unchanged.
 
 ### 6.3 Docstrings
 
-- `speak`: "speak() gives up the floor; use it only for the final sign-off."
-  followed by the existing sentence that a conversational turn is
-  `converse(text)`, never speak() then listen().
-- `listen`: "listen() keeps the floor."
-- `converse`: "converse() keeps the floor."
+`speak`:
+
+```
+    speak() gives up the floor. Use it only for your sign-off, once the owner has said you may
+    go do the work: one speak() that promises to come back on the call. When the work is done,
+    come back on the call: status() first.
+```
+
+`listen`: "listen() keeps the floor."
+
+`converse`:
+
+```
+    converse() keeps the floor. Coming back with a report, it may wait minutes in the queue
+    behind another session; after about 120 s Claude Code moves it to the background and
+    notifies you when it completes. Leave it waiting: do not cancel it, resend it, text
+    instead or call().
+```
+
+`status`, its last paragraph:
+
+```
+    Check it first when you come back with a report. "connected" means converse(), even
+    when `busy` is true or `waiting` is above 0: your converse queues and you leave it
+    waiting. This `busy` is not call()'s "busy" outcome. "ringing" means another session is
+    dialing: check again until "connected" (converse) or "none" (call).
+```
+
+`call`, its last line (2026-10-23, unchanged): "To come back with a result,
+status() first; while the call is connected use converse(), not call()."
 
 ## 7. Code changes
 

@@ -795,6 +795,42 @@ class TestClient(unittest.TestCase):
         for tool in (client.speak, client.converse):
             self.assertIn("[hold expired after 300s; the call was ended]", tool.__doc__)
 
+    def test_the_instructions_fit_under_claude_codes_cut(self):
+        # Claude Code truncates MCP server instructions at 4096 characters.
+        self.assertEqual(client.INSTRUCTIONS_MAX_CHARS, 4096)
+        self.assertLess(len(client._INSTRUCTIONS), client.INSTRUCTIONS_MAX_CHARS)
+
+    def test_an_overlong_instructions_text_stops_the_import(self):
+        # Run the client's source with 4096 more characters in the instructions, in a fresh interpreter.
+        marker = '_INSTRUCTIONS = """\\\n'
+        code = ("import pathlib\n"
+                f"marker = {marker!r}\n"
+                "src = pathlib.Path('speak_server.py').read_text()\n"
+                "assert marker in src\n"
+                "src = src.replace(marker, marker + 'x' * 4096, 1)\n"
+                "exec(compile(src, 'speak_server.py', 'exec'), {'__name__': 'speak_server_overlong'})\n")
+        out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("Claude Code truncates them at 4096", out.stderr)
+
+    def test_the_floor_and_coming_back_come_first(self):
+        text = client._INSTRUCTIONS
+        floor = text.index("The floor")
+        for later in ("Calls:", "Your persona:", "Speaking:"):
+            self.assertLess(floor, text.index(later))
+        self.assertIn("ask him\n  whether he is ready to let you go", text)
+        self.assertIn("ONE speak() that\n  promises to come back on the call", text)
+        self.assertIn("leave it waiting in the queue", text)
+        self.assertIn("Do not cancel it,\n  resend it, text instead or call()", text)
+        self.assertNotIn("15 minutes", text)
+
+    def test_the_docstrings_state_the_sign_off_and_coming_back(self):
+        self.assertIn("once the owner has said you may\n    go do the work", client.speak.__doc__)
+        self.assertIn("Leave it waiting: do not cancel it, resend it", client.converse.__doc__)
+        self.assertIn("listen() keeps the floor.", client.listen.__doc__)
+        self.assertIn('This `busy` is not call()\'s "busy" outcome.', client.status.__doc__)
+        self.assertIn("Your\n    call still queues behind it: leave it waiting.", client._QUEUE_NOTE)
+
     def test_the_client_still_imports_no_numpy_torch_or_ntgcalls(self):
         code = ("import sys, speak_server; "
                 "print(sorted(m for m in ('numpy', 'torch', 'ntgcalls', 'scipy') if m in sys.modules))")
