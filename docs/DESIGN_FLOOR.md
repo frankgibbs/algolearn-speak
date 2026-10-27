@@ -405,6 +405,18 @@ No protocol bump (owner decision 9). Verified reasons it is not needed:
 4. The instructions are written in the second person to the agent on the
    line ("you ..."), not as a description of the daemon.
 
+**Owner decision 2026-10-27** (on a call), amending the rule "`hang_up` only
+when he asks": right after the one `speak` sign-off of decision 2, the agent
+calls `status()`. If `waiting` is 0 (nobody is queued), it calls
+`hang_up()`; if `waiting` is above 0, it leaves the call open for the next
+session. The call etiquette's hang-up rule now reads "`hang_up()` only when
+he asks, or after your sign-off when nobody waits". The owner accepted the
+race in which another session queues between the `status()` and the
+`hang_up()`: that session finds the call ended ("Telegram call ended during
+..." or "needs a connected Telegram call") and calls back under the existing
+call etiquette (his reasoning, 2026-10-27). Client text only: the daemon,
+the floor mechanism and the protocol are unchanged.
+
 **Verified (2026-10-26):** Claude Code truncates MCP server instructions at
 4096 characters. The 2026-10-23 `_INSTRUCTIONS` was 6,891 characters, so
 every floor and coming-back rule sat after the cut and agents never saw
@@ -427,7 +439,8 @@ go, hand the work to agents", so it agrees with decision 2.
 
 **Design (2026-10-26):** `_INSTRUCTIONS` states the floor and coming back
 first, then calls, the persona and speaking, and keeps every rule agents
-still need in 3,971 characters; wording that the tool docstrings
+still need in 3,971 characters (4,085 since the 2026-10-27 hang-up rule, made
+room for by shorter wording elsewhere, no rule dropped); wording that the tool docstrings
 already carry is cut from it. `speak_server.py` raises `RuntimeError` at
 import (`check_instructions_length`) when `len(_INSTRUCTIONS)` reaches
 `INSTRUCTIONS_MAX_CHARS` (4096), with a comment saying why;
@@ -450,18 +463,26 @@ The floor (one conversation at a time):
 - When you are about to go do the work, whatever its length (even two minutes), ask him
   whether he is ready to let you go. Once he says yes, sign off with ONE speak() that
   promises to come back on the call, never "by message".
+- After your sign-off, call status(). "waiting" 0 (nobody queued): hang_up(). Above 0:
+  leave the line open for the next session.
 - Coming back is owed, by voice. When the work is done, report it on the call before
   anything else, even after your context was summarized; a text is only in addition.
   Never ask whether he wants a call back. First status(). "connected": send ONE
   converse() with your report and leave it waiting in the queue, however long, even
-  behind another session's conversation. After about 120 s Claude Code moves it to the
-  background and notifies you when it completes: that is normal. While it waits, do
-  not cancel it, resend it, text instead or call(). If it returns "Telegram call ended
-  during ..." or "needs a connected Telegram call", call() back as Calls says.
+  behind another session's conversation. After about 120 s Claude Code backgrounds it
+  and notifies you when it completes (normal). While it waits, do not cancel it, resend
+  it, text instead or call(). If it returns "Telegram call ended during ..." or "needs
+  a connected Telegram call", call() back as Calls says.
   "ringing": another session is dialing; status() again. "none": call().
 - A result starting '[took over the call from "<project>"; ...]' means he was just
   talking with that project. Open your next turn with one sentence recapping where you
   left off and your last question, unless his reply already answers it.
+```
+
+The hang-up rule in the Calls section (2026-10-27):
+
+```
+  call back. hang_up() only when he asks, or after your sign-off when nobody waits.
 ```
 
 ### 6.2 `_QUEUE_NOTE`
@@ -486,8 +507,17 @@ The switch paragraph is unchanged.
 
 ```
     speak() gives up the floor. Use it only for your sign-off, once the owner has said you may
-    go do the work: one speak() that promises to come back on the call. When the work is done,
-    come back on the call: status() first.
+    go do the work: one speak() that promises to come back on the call. Right after it, call
+    status(): when `waiting` is 0 (nobody is queued), hang_up(); when it is above 0, leave the
+    call open for the next session. When the work is done, come back on the call: status() first.
+```
+
+`hang_up`, its first lines (2026-10-27):
+
+```
+    End the Telegram call placed by `call()`. Use only when the owner asks you to, or
+    right after your speak() sign-off when status() shows `waiting` 0 (nobody is queued);
+    when `waiting` is above 0, leave the call open for the next session.
 ```
 
 `listen`: "listen() keeps the floor."
@@ -509,6 +539,9 @@ The switch paragraph is unchanged.
     when `busy` is true or `waiting` is above 0: your converse queues and you leave it
     waiting. This `busy` is not call()'s "busy" outcome. "ringing" means another session is
     dialing: check again until "connected" (converse) or "none" (call).
+
+    Check it right after your speak() sign-off too: `waiting` 0 means hang_up(); above 0,
+    leave the call open for the next session.
 ```
 
 `call`, its last line (2026-10-23, unchanged): "To come back with a result,

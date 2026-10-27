@@ -837,13 +837,28 @@ class TestClient(unittest.TestCase):
                         "call() back",
                         "pass override_quiet_hours=True without asking",
                         "without asking, set_call_debug(True), place a test call",
-                        "Once he lets you go, hand the work to agents."):
+                        "Once he lets you go, hand the work to agents.",
+                        'After your sign-off, call status(). "waiting" 0 (nobody queued): hang_up(). '
+                        "Above 0: leave the line open for the next session.",
+                        "hang_up() only when he asks, or after your sign-off when nobody waits."):
             self.assertIn(wording, flat)
+        self.assertNotIn("hang_up() only when he asks.", flat)
+        # The hang-up rule sits next to the sign-off rule, inside the floor section.
+        self.assertLess(text.index("After your sign-off"), text.index("Calls:"))
+        self.assertLess(text.index("sign off with ONE speak()"), text.index("After your sign-off"))
         self.assertNotIn("15 minutes", flat)
         self.assertNotIn("rather than going silent", flat)
 
     def test_the_docstrings_state_the_sign_off_and_coming_back(self):
-        self.assertIn("once the owner has said you may go do the work", self._flat(client.speak.__doc__))
+        speak = self._flat(client.speak.__doc__)
+        self.assertIn("once the owner has said you may go do the work", speak)
+        self.assertIn("Right after it, call status(): when `waiting` is 0 (nobody is queued), hang_up(); "
+                      "when it is above 0, leave the call open for the next session.", speak)
+        hang_up = self._flat(client.hang_up.__doc__)
+        self.assertIn("Use only when the owner asks you to, or right after your speak() sign-off when "
+                      "status() shows `waiting` 0 (nobody is queued)", hang_up)
+        self.assertIn("Check it right after your speak() sign-off too: `waiting` 0 means hang_up(); above 0, "
+                      "leave the call open for the next session.", self._flat(client.status.__doc__))
         converse = self._flat(client.converse.__doc__)
         self.assertIn("While it waits, leave it: do not cancel it, resend it, text instead or call().", converse)
         self.assertIn('"needs a connected Telegram call", call() back.', converse)
