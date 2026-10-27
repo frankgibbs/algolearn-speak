@@ -388,7 +388,7 @@ def _hang_up_sync() -> str:
         return f"{_persona_line(reply)}{reply['outcome']}"
     finally:
         with _expect_lock:
-            _call_generation = None   # the owner asked to hang up: never a call-back, even if this raised
+            _call_generation = None   # a deliberate end (the owner asked, or the sign-off with nobody else): never a call-back, even if this raised
 
 
 def _strip(reply: dict) -> dict:
@@ -469,20 +469,19 @@ The floor (one conversation at a time):
 - When you are about to go do the work, whatever its length (even two minutes), ask him
   whether he is ready to let you go. Once he says yes, sign off with ONE speak() that
   promises to come back on the call, never "by message".
-- After your sign-off, call status(). "waiting" 0 (nobody queued): hang_up(). Above 0:
-  leave the line open for the next session.
+- After your sign-off, call status(). "busy" false and "waiting" 0 (nobody else):
+  hang_up(). Otherwise leave the line open for the next session.
 - Coming back is owed, by voice. When the work is done, report it on the call before
   anything else, even after your context was summarized; a text is only in addition.
   Never ask whether he wants a call back. First status(). "connected": send ONE
   converse() with your report and leave it waiting in the queue, however long, even
-  behind another session's conversation. After about 120 s Claude Code backgrounds it
-  and notifies you when it completes (normal). While it waits, do not cancel it, resend
-  it, text instead or call(). If it returns "Telegram call ended during ..." or "needs
-  a connected Telegram call", call() back as Calls says.
+  behind another session's conversation. Being backgrounded after ~120 s is normal.
+  While it waits, do not cancel it, resend it, text instead or call(). If it returns
+  "Telegram call ended during ..." or "needs a connected Telegram call", call() back as
+  Calls says.
   "ringing": another session is dialing; status() again. "none": call().
-- A result starting '[took over the call from "<project>"; ...]' means he was just
-  talking with that project. Open your next turn with one sentence recapping where you
-  left off and your last question, unless his reply already answers it.
+- '[took over the call from ...]': open with one sentence recapping where you left off
+  and your last question, unless his reply answers it.
 
 Calls:
 - When he asks you to call, he is up: pass override_quiet_hours=True without asking.
@@ -491,7 +490,8 @@ Calls:
 - "not answered": wait an hour. "busy": call once more, then wait an hour. He hung up,
   or "answered, then hung up during the greeting": call back once right away; if that is
   not answered or ends the same way, wait an hour. "Telegram call ended during ...":
-  call back. hang_up() only when he asks, or after your sign-off when nobody waits.
+  call back. hang_up() only when he asks, or after your sign-off when status() shows
+  nobody else.
 - Whenever you must wait (quiet hours, the hour above, an expired hold), say in this
   terminal when you will try again and start a background timer (a background sleep).
 
@@ -502,22 +502,20 @@ Your persona:
   and send again.
 - Add one-sentence lines with add_to_personality() as you learn your role, except on
   the house persona, which changes only when he asks. Change persona, name, voice or
-  speed only when he asks. "Persona review": read your persona back one item at a time
-  and apply his changes with set_persona(personality=[...]).
+  speed only when he asks. "Persona review": go item by item, then
+  set_persona(personality=[...]).
 
 Speaking:
 - Plain conversational sentences, no markdown, lists or code. One topic, one aspect and
   one question at a time.
 - Every turn is ONE converse(text), never speak() then listen() (dead air). listen()
   alone only to reopen the ear after a TimeoutError or with nothing to say first.
-- A TimeoutError means nobody spoke in time; the call is still up: listen() again,
-  do not hang up.
+- TimeoutError: nobody spoke, the call is up; listen() again.
 - Go straight into the answer, never "heard you" or a restatement. Once he lets you
   go, hand the work to agents.
-- He says "hold on" to stop you and "continue" to resume. "[held Ns, then resumed]":
-  all was said. "[hold expired ...; the call was ended]": the reply was NOT finished
-  and converse did not listen; keep the "not spoken" text and come back with it after
-  an hour, by timer. Never speak "hold on" or "continue" as a sentence by itself.
+- "[held Ns, then resumed]": all was said. "[hold expired ...; the call was ended]":
+  the reply was NOT finished and converse did not listen; keep the "not spoken" text
+  and come back with it after an hour, by timer. Never speak "hold on" or "continue" as a sentence by itself.
 - A call seems off (silence, drops): without asking, set_call_debug(True), place a test
   call, read call_debug(), instrument rather than retry blind; debug off once calls
   work.
@@ -621,8 +619,10 @@ _CALL_NOTE = """
 
     speak() gives up the floor. Use it only for your sign-off, once the owner has said you may
     go do the work: one speak() that promises to come back on the call. Right after it, call
-    status(): when `waiting` is 0 (nobody is queued), hang_up(); when it is above 0, leave the
-    call open for the next session. When the work is done, come back on the call: status() first.
+    status(): when `busy` is false and `waiting` is 0 (no other session holds the lock or is
+    queued), hang_up(); otherwise leave the call open for the next session. A session queued
+    behind your speak() takes the lock the moment it ends, so it shows as `busy`, not in
+    `waiting`. When the work is done, come back on the call: status() first.
 """ + _HOLD_NOTE + _QUEUE_NOTE + _CALL_NOTE)
 async def speak(text: str) -> str:
     return await _run(_speak_sync, text)
@@ -744,9 +744,10 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
     whatever the reason (a redial 1.4 s after a hang-up left the owner's
     Telegram app dropping every incoming call until it was force-quit); a
     call placed sooner waits out the rest of those 10 s, then dials.
-    Hang up with `hang_up()` only when the owner asks; they can also hang up
-    themselves. If the speak daemon cannot be reached this raises "speak daemon
-    at <addr> is not reachable: ...".
+    Hang up with `hang_up()` when the owner asks, or right after your speak()
+    sign-off when status() shows `busy` false and `waiting` 0; the owner can
+    also hang up themselves. If the speak daemon cannot be reached this
+    raises "speak daemon at <addr> is not reachable: ...".
 
     To come back with a result, status() first; while the call is connected use converse(), not call().
     """
@@ -808,9 +809,10 @@ async def set_call_debug(enabled: bool) -> dict:
 
 @mcp.tool()
 async def hang_up() -> str:
-    """End the Telegram call placed by `call()`. Use only when the owner asks you to, or
-    right after your speak() sign-off when status() shows `waiting` 0 (nobody is queued);
-    when `waiting` is above 0, leave the call open for the next session.
+    """End the Telegram call placed by `call()`. Use it when the owner asks you to, or
+    right after your speak() sign-off when status() shows `busy` false and `waiting` 0
+    (no other session holds the lock or is queued); otherwise leave the call open for the
+    next session.
 
     Returns "hung up" or "no active call". Waits its turn in the audio lock
     queue like the other call tools.
@@ -882,8 +884,9 @@ async def status() -> dict:
     waiting. This `busy` is not call()'s "busy" outcome. "ringing" means another session is
     dialing: check again until "connected" (converse) or "none" (call).
 
-    Check it right after your speak() sign-off too: `waiting` 0 means hang_up(); above 0,
-    leave the call open for the next session.
+    Check it right after your speak() sign-off too: `busy` false and `waiting` 0 means
+    hang_up(); otherwise leave the call open for the next session. An op that has taken the
+    lock is no longer counted in `waiting`: it shows as `busy`.
     """
     return await _run(_status_sync)
 

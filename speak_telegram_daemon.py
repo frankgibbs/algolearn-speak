@@ -827,7 +827,7 @@ class SpeakService:
         try:
             return {"outcome": self.link.hang_up()}
         finally:
-            sess.expect(None)   # the owner asked to hang up: never a call-back, even if this raised
+            sess.expect(None)   # a deliberate end (the owner asked, or the agent's sign-off with nobody else): never a call-back, even if this raised
             self.lock.yield_floor(sess.speaker, FLOOR_HANG_UP)   # a deliberate end (owner decision 2026-10-20)
 
 

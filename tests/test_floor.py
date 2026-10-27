@@ -670,6 +670,44 @@ class TestFloorOverTheWire(WireCase):
         self.as_session(self.a, client._speak_sync, "Will do, talk soon.")
         b["thread"].join(10)
 
+    def test_after_a_sign_off_a_session_queued_behind_it_shows_as_busy_not_waiting(self):
+        # The sign-off rule (owner decision 2026-10-27) must read busy as well as waiting: an op
+        # leaves the queue the moment it takes the lock, so B, queued behind A's sign-off, is busy.
+        self.answered_by_a()
+        self.link.gate = threading.Event()   # B's converse keeps the lock in its listen
+        b = self.in_thread("B", self.b, client._converse_sync, "Two.", 120, 2.0, 45)
+        self.waiting(1)
+        self.as_session(self.a, client._speak_sync, "Will do, talk soon.")
+        right_after = client._status_sync()
+        self.assertFalse(not right_after["busy"] and right_after["waiting"] == 0, right_after)
+        wait_until(lambda: self.daemon.lock.snapshot()[0], "B's converse to hold the lock")
+        status = client._status_sync()
+        self.assertEqual((status["busy"], status["waiting"]), (True, 0))   # waiting alone would say hang up
+        self.assertTrue(status["current_tool"].startswith("converse"))
+        self.link.gate.set()
+        b["thread"].join(10)
+        self.assertIn("result", b)
+
+    def test_a_hang_up_sent_after_another_session_queued_waits_behind_its_floor(self):
+        # The race the owner accepted (2026-10-27): B queues between A's status() and A's hang_up().
+        # B goes first and takes the floor; A's hang_up waits until B's floor lapses, then ends the call.
+        self.answered_by_a()
+        self.as_session(self.a, client._speak_sync, "Will do, talk soon.")   # A's sign-off gives up the floor
+        self.link.gate = threading.Event()
+        b = self.in_thread("B", self.b, client._converse_sync, "Two.", 120, 2.0, 45)
+        wait_until(lambda: self.daemon.lock.snapshot()[0], "B's converse to hold the lock")
+        a = self.in_thread("A hang_up", self.a, client._hang_up_sync)
+        self.waiting(1)
+        self.link.gate.set()
+        b["thread"].join(10)
+        b_done = time.monotonic()
+        a["thread"].join(10)
+        self.assertEqual(self.order, ["B", "A hang_up"])
+        self.assertGreaterEqual(time.monotonic() - b_done, self.IDLE * 0.9)   # it waited out B's idle floor
+        self.assertEqual(a["result"], tg.HUNG_UP)
+        self.assertEqual([(e["event"], e["project"], e.get("reason")) for e in self.floor_events()][-2:],
+                         [(d.FLOOR_TAKE_EVENT, "algolearn-hedge", None),
+                          (d.FLOOR_RELEASE_EVENT, "algolearn-hedge", "idle")])
 
 if __name__ == "__main__":
     unittest.main()
