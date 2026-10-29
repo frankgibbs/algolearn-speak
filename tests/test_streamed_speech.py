@@ -173,7 +173,7 @@ class ServiceCase(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "kokoro failed"):
             self.svc.speak(self.sess, "One. Two.", NEVER_LEFT)
         self.assertNotIn("stream_done", self.names())
-        self.assertEqual(self.log[-1], ("hang_up",))   # the failed speak gave up the floor with nobody queued
+        self.assertNotIn(("hang_up",), self.log)   # a failed speak leaves the call up (owner decision 2026-10-28)
 
 
 class FakeAudio:

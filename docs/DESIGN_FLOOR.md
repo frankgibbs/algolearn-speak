@@ -289,7 +289,7 @@ the queue in plain FIFO order.
 
 | When | Reason | Basis |
 |---|---|---|
-| A `speak` that took the turn ends, except when the call ended under it | `speak` | Owner decision 2. Called in a `finally` in `SpeakService.speak` after `_take_turn` returned, skipped when the exception is the call-ended error (next row). With no other tool op queued at that moment, the daemon then ends the call (section 4.10, owner decisions 2026-10-28) |
+| A `speak` that took the turn ends, except when the call ended under it | `speak` | Owner decision 2. Called in `SpeakService.speak` after `_take_turn` returned (in its `except` when the speech raised), skipped when the exception is the call-ended error (next row). When the speech played through and no other tool op with its client still there is queued at that moment, the daemon then ends the call (section 4.10, owner decisions 2026-10-28) |
 | `converse` or `listen` ends, including with a no-speech `TimeoutError` | (none: the floor is kept) | Owner decisions 2 and 13 |
 | The call drops unplanned during or between the holder's ops (the owner hangs up, a network failure; `_end_call` on the link's loop thread, `speak_telegram.py:570-588`), including during a `speak` | (none: kept until the 45 s lapse) | Owner decision 10. The op that saw the drop raises `Telegram call ended during <tool>` and releases the lock; that release starts the 45 s (section 4.3). The interrupted session's `call` is eligible and goes ahead of every other session; its answered call takes the floor again (section 4.4). No hook from the link is needed: the floor is not touched at the moment of the drop |
 | The holder sends nothing for 45 s after its last op ended | `idle` | Owner decision 3, section 4.3 |
@@ -375,46 +375,73 @@ event: nothing yielded the floor.
 4. The agent-side `status()`/`hang_up()` step goes from the instructions and
    the docstrings; `hang_up()` is "only when he asks" again.
 
+**Owner decisions 2026-10-28, after the code review of commit 7efff53**
+(they replace the build's own choices on these points):
+5. Only a `speak` that played through (fully, or held and then resumed)
+   hangs up when nobody is queued. A sign-off `speak` that raised while the
+   call is still up does not: it releases the floor as before (reason
+   `speak`; the normal release and the 45 s idle lapse apply) and leaves
+   the call up, so the agent can send its sign-off again. Its error reply
+   does not carry `call_ended`, and the `speak` docstring tells the agent
+   that after a failed sign-off the call is still up and to send the
+   `speak()` again.
+6. When counting the queue at the sign-off, a queued op whose client has
+   already left does not count. A queue of only departed clients counts as
+   empty, so the daemon hangs up.
+7. No exception is swallowed or replaced by the hang-up.
+
 **Design (build, 2026-10-28), within those decisions:**
 - **Atomicity.** `AudioLock.yield_floor` returns, after it clears the floor,
-  the number of queued tickets that carry a session, counted under the same
-  hold of the lock's condition (`speak_telegram_daemon.py:369-381`).
-  `SpeakService.speak` calls it in its `finally` and, when it returns 0,
-  calls `_sign_off_hang_up` (`speak_telegram_daemon.py:761-762`, `:764`),
-  while the speak still holds the audio lock: the handler releases the lock
-  only after `run_locked` returns (`speak_telegram_daemon.py:1008`, released
-  at `:1014`). So no queued op can run between the count and the hang-up.
-  An op that arrives after the count runs after the hang-up and finds no
-  call: `require_call` (`speak_telegram_daemon.py:534`) raises "needs a
-  connected Telegram call" (the link's `END_HUNG_UP` clears an expectation
-  of that call, as after `hang_up`), and the instructions already say to
-  `call()` back on that error.
+  the number of queued tickets that carry a session and whose client is
+  still there, counted under the same hold of the lock's condition
+  (`speak_telegram_daemon.py:375-391`). Each ticket carries the
+  `client_left` probe its acquire was given; the handler passes
+  `_peer_left` on its own socket (`:1010`). `_peer_left` (`:1058`) is a
+  `select` with a zero timeout, then a `MSG_PEEK`, so calling it under the
+  condition never blocks. `SpeakService.speak` (`:748`) calls
+  `yield_floor` after the speech returned (`:774`) and, when the count is
+  0, `_sign_off_hang_up` (`:776`), while the speak still holds the audio
+  lock: the handler releases the lock only after `run_locked` returns
+  (`:1025`, released at `:1031`). So no queued op can run between the count
+  and the hang-up.
+- **A late arrival.** An op that arrives after the count, while the
+  hang-up is in progress, queues behind the speak, runs after the hang-up
+  and finds no call: `require_call` (`:544`) raises "needs a connected
+  Telegram call" (the link's `END_HUNG_UP` clears an expectation of that
+  call, as after `hang_up`, so it is not "ended during"). The instructions
+  tell that agent to `call()` back, and `call` waits until
+  `REDIAL_SETTLE_SECONDS` (10 s) have passed since the hang-up before it
+  dials, so the owner's phone rings again about 10 s after the call ended.
+- **A failed speak.** When the speech raises other than with the
+  call-ended error, `speak` yields the floor (reason `speak`) in its
+  `except` (`:768`) and re-raises the same exception; it never reaches the
+  hang-up. The call-ended error yields nothing, as before.
+- **No exception masked.** The hang-up runs only on the path where the
+  speech returned, outside any `except` or `finally`, so no speak
+  exception is in flight while it runs; a hang-up that raises records
+  `signoff_hangup_failed` (`project`, `error`) and re-raises its own error,
+  which becomes the `speak`'s result (the call may still be up); the
+  expectation is cleared either way, and no `call_ended` is sent.
 - **HTTP transcriptions do not count.** Their ticket has no session
-  (`transcribe_pcm` acquires with `None`, `speak_telegram_daemon.py:1275`),
-  so a transcription queued at that moment does not keep the call up. It is
-  not lost: it stays queued and runs once the speak releases the lock, after
-  the hang-up.
-- **Which cases hang up.** Only when `yield_floor(..., "speak")` actually
-  cleared the floor and counted 0: a `speak` that played to the end, one
-  held and resumed, and one that raised while the call stayed connected (a
-  synthesis error, for example); the failure's reply carries
-  `call_ended` too. Never: a `speak` under which the call ended (no yield,
-  the floor stays for the call-back), an expired hold (the daemon has
-  already hung up and yielded with `hold_expired`), a client that left
-  during a hold (yielded with `client_left`, the call stays up), a `speak`
-  refused before its turn (empty text, no call), `converse` and `listen`
-  (they keep the floor). Any queued tool op counts, this session's own
-  included, and also one whose client has left but has not yet been
-  skipped: the call then stays up.
-- **A failed hang-up** records `signoff_hangup_failed` (`project`, `error`)
-  and its error becomes the `speak`'s result (the call may still be up);
-  the expectation is cleared either way, and no `call_ended` is sent.
+  (`transcribe_pcm` acquires with `None`, `:1292`), so a transcription
+  queued at that moment does not keep the call up. It is not lost: it stays
+  queued and runs once the speak releases the lock, after the hang-up.
+- **Which cases never hang up:** a `speak` that raised (decision 5), a
+  `speak` under which the call ended (no yield, the floor stays for the
+  call-back), an expired hold (the daemon has already hung up and yielded
+  with `hold_expired`), a client that left during a hold (yielded with
+  `client_left`, the call stays up), a `speak` refused before its turn
+  (empty text, no call), `converse` and `listen` (they keep the floor). Any
+  queued tool op whose client is still there counts, this session's own
+  included.
 - **The reply.** `run_locked` adds `call_ended` (`REPLY_CALL_ENDED`,
-  `CALL_ENDED_SIGNOFF` in `speak_protocol.py`) on success and failure alike,
-  with `expect` null. The client puts "[call ended: nobody else was
-  waiting]" on its own line after "spoke for Ns" (or after an error's
-  message), before the audio note, and raises on an unknown value
-  (`_ended_line`, `speak_server.py:311`).
+  `CALL_ENDED_SIGNOFF` in `speak_protocol.py`) only once a sign-off
+  hang-up succeeded, with `expect` null. The client puts "[call ended:
+  nobody else was waiting]" on its own line after "spoke for Ns", before
+  the audio note (`_ended_line`, `speak_server.py:314`). It raises on an
+  unknown value (naming the speak's duration), and on an error reply that
+  carries the field, with the daemon's error in its message
+  (`speak_server.py:253-255`).
 - **No protocol bump.** A protocol 4 client that predates the field ignores
   it and still clears its expectation from `expect`; `PROTOCOL_VERSION`
   stays 4.
@@ -616,10 +643,11 @@ The switch paragraph is unchanged.
     speak() gives up the floor. Use it only for your sign-off, once the owner has said you may
     go do the work: one speak() that promises to come back on the call. Then do nothing more
     on the call: when no other request is queued as it ends, the daemon hangs up and the
-    result's last line before the audio note is "[call ended: nobody else was waiting]" (on
-    an error too); otherwise the call stays up and the next session takes the floor. Do not
-    call hang_up() or call back for it. When the work is done, come back on the call:
-    status() first.
+    result's last line before the audio note is "[call ended: nobody else was waiting]";
+    otherwise the call stays up and the next session takes the floor. Do not call hang_up()
+    or call back for it. If the sign-off raises an error other than "Telegram call ended
+    during ...", the call is still up: send the speak() again. When the work is done, come
+    back on the call: status() first.
 ```
 
 `hang_up`, its first lines (2026-10-28):
@@ -679,7 +707,7 @@ status() first; while the call is connected use converse(), not call()."
 |---|---|
 | `speak_protocol.py` | `FLOOR_IDLE_SECONDS = 45.0` |
 | `speak_telegram_daemon.py` | `AudioLock`: per-ticket session id, eligibility rule (4.2), timed waits and lapse (4.3), `take_floor` (refused unless the lock is held by that session), `yield_floor`, `close` (4.9), `_current_session`, constructor `idle_seconds` and `record_event`; `acquire` clears the deadline when the holder's ticket arrives and removes its ticket if its wait raises (4.2). `_Handler.handle`: passes the `Speaker` to `acquire`. `transcribe_pcm`: acquires with no session (always eligible). `SpeakService`: takes the lock; `_take_turn` and the answered branch of `call` call `take_floor`; `speak` yields with `speak` in a `finally` once the turn was taken, except on the call-ended error; `hang_up` yields with `hang_up`; `_hold_expired` yields with `hold_expired`; `_client_left_during_hold` yields with `client_left`. `SpeakDaemon.__init__`: builds the lock before the service; `SpeakDaemon.stop` and the handler's audio-failure restart call `lock.close()` right after setting `closing` (4.9) |
-| `speak_telegram_daemon.py` (2026-10-28) | `yield_floor` returns the queued tool-op count (None when nothing was yielded); `SpeakService.speak`'s `finally` calls `_sign_off_hang_up` when it is 0; `Session.call_ended`; `run_locked` adds `call_ended`; events `signoff_hangup`, `signoff_hangup_failed` (section 4.10) |
+| `speak_telegram_daemon.py` (2026-10-28) | `acquire` takes the ticket's `client_left` probe; `yield_floor` returns the count of queued tool ops whose client is still there (None when nothing was yielded); `SpeakService.speak` calls `_sign_off_hang_up` when the speech returned and the count is 0, and only yields when it raised; `Session.call_ended`; `run_locked` adds `call_ended`; events `signoff_hangup`, `signoff_hangup_failed` (section 4.10) |
 | `speak_protocol.py` (2026-10-28) | `REPLY_CALL_ENDED`, `CALL_ENDED_SIGNOFF` |
 | `speak_server.py` | Section 6 text; `_ended_line` (2026-10-28) |
 | `tests/` | Section 8 |
@@ -751,21 +779,33 @@ helpers):
 
 Added 2026-10-28 for section 4.10 (`tests/test_floor.py`):
 - `AudioLock.yield_floor` counts the queued tool ops and not transcriptions;
-  it counts 0 with nothing queued, and returns None without the floor.
+  it counts 0 with nothing queued, and returns None without the floor; it
+  skips a queued op whose `client_left` probe is true, so a queue of only
+  departed clients counts 0.
 - Service level (`TestSignOffHangUp`): a sign-off with nothing queued hangs
   up, clears the expectation and records `floor_release` then
   `signoff_hangup`; a held and resumed one hangs up too; `converse` and
   `listen` (with and without speech) never hang up; a drop during the speak,
   an expired hold, a client that left during a hold and an empty-text speak
-  are no sign-off; a failed sign-off hang-up records
-  `signoff_hangup_failed`, raises and still clears; `run_locked` carries
-  `call_ended` and `expect` null, on a failed speak too.
+  are no sign-off; a sign-off speak that raised releases the floor, leaves
+  the call up and the expectation standing, and its retry signs off; a
+  failed sign-off hang-up records `signoff_hangup_failed`, raises its own
+  error and still clears; `run_locked` carries `call_ended` and `expect`
+  null after a sign-off, and no `call_ended` on a failed speak or a failed
+  hang-up.
 - Over the wire (`TestSignOffHangUpOverTheWire`): a sign-off with nobody
   queued returns the "[call ended: ...]" line, clears the client's
   expectation and leaves no call; with a session queued the call stays up
   and that session takes the floor; a queued transcription does not keep the
-  call up and is answered 200 after the hang-up; a failed speak's error
-  ends with the line.
+  call up and is answered 200 after the hang-up; a failed sign-off speak's
+  error is the bare error, the call stays up and the retry ends it; a queue
+  holding only a session whose client closed its socket counts as empty,
+  so the call ends and that op is skipped; an op queued while the sign-off's
+  hang-up is in progress gets "needs a connected Telegram call"
+  (`test_an_op_queued_during_the_sign_off_hang_up_finds_no_call`).
+- Client (`tests/test_hold.py`): an unknown `call_ended` raises naming the
+  speak's duration; an error reply carrying `call_ended` raises with the
+  daemon's error.
 - Removed: the two 2026-10-27 wire tests (`busy` not `waiting` after a
   sign-off, and a `hang_up` racing a queued session). The service-level
   switch tests that run several speaks on one call use a lock that always

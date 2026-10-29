@@ -63,9 +63,11 @@ class Waiter(threading.Thread):
     """Acquires the lock as `speaker` (None: a transcription), notes the grant, holds the lock
     until `finish` is set, then releases."""
 
-    def __init__(self, lock: d.AudioLock, name: str, speaker: d.Speaker | None, order: list) -> None:
+    def __init__(self, lock: d.AudioLock, name: str, speaker: d.Speaker | None, order: list,
+                 client_left=None) -> None:
         super().__init__(daemon=True)
         self.lock = lock
+        self.client_left = client_left
         self.label = name
         self.speaker = speaker
         self.order = order
@@ -75,7 +77,7 @@ class Waiter(threading.Thread):
 
     def run(self) -> None:
         tool = d.TRANSCRIBE_TOOL if self.speaker is None else proto.OP_CONVERSE
-        self.lock.acquire(tool, "10.0.0.5", self.speaker)
+        self.lock.acquire(tool, "10.0.0.5", self.speaker, self.client_left)
         self.granted_at = time.monotonic()
         self.order.append(self.label)
         self.granted.set()
@@ -99,10 +101,10 @@ class LockCase(unittest.TestCase):
         for w in self.waiters:
             w.join(5)
 
-    def queue(self, name: str, speaker: d.Speaker | None) -> Waiter:
+    def queue(self, name: str, speaker: d.Speaker | None, client_left=None) -> Waiter:
         """Start a waiter and return once its ticket is queued (or it holds the lock)."""
         before = self.lock.snapshot()[2]
-        w = Waiter(self.lock, name, speaker, self.order)
+        w = Waiter(self.lock, name, speaker, self.order, client_left)
         self.waiters.append(w)
         w.start()
         wait_until(lambda: self.lock.snapshot()[2] > before or w.granted.is_set(), f"{name} to queue")
@@ -198,6 +200,18 @@ class TestAudioLockFloor(LockCase):
         self.queue("transcribe", None)
         self.queue("C", C)
         self.assertEqual(self.lock.yield_floor(A, d.FLOOR_SPEAK), 2)
+        self.lock.release()
+
+    def test_yield_floor_skips_queued_ops_whose_client_has_left(self):
+        # Owner decision 2026-10-28: a queue of only departed clients counts as empty.
+        self.hold_floor(A)
+        left = {"B": True, "C": False}
+        self.queue("B", B, lambda: left["B"])
+        self.queue("C", C, lambda: left["C"])
+        self.assertEqual(self.lock.yield_floor(A, d.FLOOR_SPEAK), 1)   # C is still there
+        self.lock.take_floor(A)
+        left["C"] = True
+        self.assertEqual(self.lock.yield_floor(A, d.FLOOR_SPEAK), 0)   # both gone
         self.lock.release()
 
     def test_yield_floor_with_nothing_queued_counts_zero_and_without_the_floor_none(self):
@@ -409,8 +423,8 @@ class TestServiceFloor(FloorServiceCase):
             with self.assertRaisesRegex(RuntimeError, "boom"):
                 self.svc.speak(self.req(), self.TEXT, NEVER_LEFT)
         self.assertEqual(self.releases(), [("algolearn-speak", "speak")])
-        # ... with nobody queued, so the daemon ends the call (owner decision 2026-10-28)
-        self.assertEqual((self.link.state(), self.link.hung_up), (tg.NONE, 1))
+        # ... and leaves the call up, even with nobody queued (owner decision 2026-10-28)
+        self.assertEqual((self.link.state(), self.link.hung_up), (tg.CONNECTED, 0))
 
     def test_an_op_refused_before_it_plays_leaves_the_floor_alone(self):
         with self.assertRaises(ValueError):
@@ -567,6 +581,19 @@ class TestSignOffHangUp(FloorServiceCase):
             self.svc.speak(self.expecting(), self.TEXT, NEVER_LEFT)
         self.assertEqual((self.link.state(), self.link.hung_up, self.signoffs()), (tg.CONNECTED, 0, []))
 
+    def test_a_failed_sign_off_speak_leaves_the_call_up_for_a_retry(self):
+        # Owner decision 2026-10-28: only a speak that played through hangs up.
+        sess = self.expecting()
+        with mock.patch.object(self.link, "play_watched", side_effect=RuntimeError("boom")):
+            with self.assertRaisesRegex(RuntimeError, "^boom$"):
+                self.svc.speak(sess, self.TEXT, NEVER_LEFT)
+        self.assertEqual((self.link.state(), self.link.hung_up, self.signoffs()), (tg.CONNECTED, 0, []))
+        self.assertIsNone(sess.call_ended)
+        self.assertIsNotNone(sess.generation)   # the expectation stands: the call is up
+        self.assertEqual(self.releases(), [("algolearn-speak", "speak")])
+        self.svc.speak(self.expecting(), self.TEXT, NEVER_LEFT)   # the retry signs off
+        self.assertEqual((self.link.state(), len(self.signoffs())), (tg.NONE, 1))
+
     def test_a_speak_refused_before_its_turn_does_not_hang_up(self):
         with self.assertRaises(ValueError):
             self.svc.speak(self.expecting(), "  ", NEVER_LEFT)
@@ -599,11 +626,20 @@ class TestSignOffHangUp(FloorServiceCase):
         self.assertEqual(reply[proto.REPLY_CALL_ENDED], proto.CALL_ENDED_SIGNOFF)
         self.assertIsNone(reply["expect"])
 
-    def test_a_failed_speak_that_hung_up_says_so_too(self):
+    def test_a_failed_speak_reply_has_no_call_ended(self):
         with mock.patch.object(self.link, "play_watched", side_effect=RuntimeError("boom")):
             reply = self.run_locked()
         self.assertIs(reply["ok"], False)
-        self.assertEqual(reply[proto.REPLY_CALL_ENDED], proto.CALL_ENDED_SIGNOFF)
+        self.assertEqual(reply["error"], "boom")
+        self.assertNotIn(proto.REPLY_CALL_ENDED, reply)
+        self.assertEqual(reply["expect"], self.svc.key(self.link.info()["generation"]))   # the call is still up
+
+    def test_a_failed_sign_off_hang_up_reply_carries_its_error_and_no_call_ended(self):
+        self.link.fail_hang_up = RuntimeError("leave_call failed")
+        reply = self.run_locked()
+        self.assertIs(reply["ok"], False)
+        self.assertIn("leave_call failed", reply["error"])
+        self.assertNotIn(proto.REPLY_CALL_ENDED, reply)
         self.assertIsNone(reply["expect"])
 
     def test_without_a_sign_off_hang_up_the_reply_has_no_call_ended(self):
@@ -621,6 +657,14 @@ class GateLink(TurnLink):
         super().__init__()
         self.gate: threading.Event | None = None
         self.speech_gate: threading.Event | None = None   # holds a speak while it plays
+        self.hang_up_gate: threading.Event | None = None   # holds a hang-up in progress
+        self.hanging_up = threading.Event()   # set once a hang-up has started
+
+    def hang_up(self) -> str:
+        self.hanging_up.set()
+        if self.hang_up_gate is not None:
+            self.hang_up_gate.wait(10)
+        return super().hang_up()
 
     def play_watched(self, segments, rate, classify, accept):
         if self.speech_gate is not None:
@@ -657,7 +701,7 @@ class WireCase(unittest.TestCase):
         self.addCleanup(self.join_all)
 
     def join_all(self):
-        for gate in (self.link.gate, self.link.speech_gate):
+        for gate in (self.link.gate, self.link.speech_gate, self.link.hang_up_gate):
             if gate is not None:
                 gate.set()
         for t in self.threads:
@@ -824,14 +868,49 @@ class TestSignOffHangUpOverTheWire(WireCase):
         with self.assertRaisesRegex(RuntimeError, "needs a connected Telegram call"):
             self.as_session(self.a, client._converse_sync, "One.", 120, 2.0, 45)
 
-    def test_a_failed_sign_off_speak_says_after_its_error_that_the_call_ended(self):
+    def test_a_failed_sign_off_speak_leaves_the_call_up_and_its_retry_ends_it(self):
         self.answered_by_a()
+        expect = self.a["_expect"]
         with mock.patch.object(self.link, "play_watched", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError) as cm:
                 self.as_session(self.a, client._speak_sync, "Will do, talk soon.")
-        self.assertEqual(str(cm.exception), "boom" + self.ENDED)
-        self.assertIsNone(self.a["_expect"])
+        self.assertEqual(str(cm.exception), "boom")   # no call-ended line
+        self.assertEqual((self.a["_expect"], self.link.state(), self.signoffs()), (expect, tg.CONNECTED, []))
+        self.assertEqual(self.as_session(self.a, client._speak_sync, "Will do, talk soon."),
+                         "spoke for 0.5s" + self.ENDED + proto.AUDIO_NOTE)
         self.assertEqual(self.link.state(), tg.NONE)
+
+    def test_a_queue_of_only_departed_clients_counts_as_empty(self):
+        self.answered_by_a()
+        s = socket.create_connection(self.daemon._server.server_address, timeout=10)
+        proto.send_msg(s, {"op": proto.OP_CONVERSE, proto.FIELD_PROTOCOL: proto.PROTOCOL_VERSION, **ID_B,
+                           "text": "Two.", **client._listen_fields(120, 2.0, 45), "expect_generation": None,
+                           proto.FIELD_PERSONA_SEEN: seen_key(self.daemon, ID_B)})
+        self.waiting(1)   # behind A's floor
+        s.close()         # B's tool call was cancelled while it waited
+        played = len(self.link.log)
+        self.assertEqual(self.as_session(self.a, client._speak_sync, "Will do, talk soon."),
+                         "spoke for 0.5s" + self.ENDED + proto.AUDIO_NOTE)
+        self.assertEqual((self.link.state(), len(self.signoffs())), (tg.NONE, 1))
+        wait_until(lambda: self.daemon.lock.snapshot() == (False, None, 0), "B's op to be skipped")
+        self.assertNotIn(("stream_start", "Two."), self.link.log[played:])   # B played nothing
+
+    def test_an_op_queued_during_the_sign_off_hang_up_finds_no_call(self):
+        # The late arrival: queued after the count, it runs after the hang-up (the lock is
+        # still held) and gets the no-call error, on which the instructions say call() back.
+        self.answered_by_a()
+        self.link.hang_up_gate = threading.Event()
+        a = self.in_thread("A", self.a, client._speak_sync, "Will do, talk soon.")
+        self.assertTrue(self.link.hanging_up.wait(10))
+        b = self.in_thread("B", self.b, client._converse_sync, "Two.", 120, 2.0, 45)
+        self.waiting(1)
+        self.link.hang_up_gate.set()
+        a["thread"].join(10)
+        b["thread"].join(10)
+        self.assertEqual(a["result"], "spoke for 0.5s" + self.ENDED + proto.AUDIO_NOTE)
+        self.assertIsInstance(b["error"], RuntimeError)
+        self.assertIn("needs a connected Telegram call", str(b["error"]))
+        self.assertEqual(self.order, ["A", "B"])
 
     def test_a_sign_off_with_a_session_queued_leaves_the_call_to_it(self):
         self.answered_by_a()

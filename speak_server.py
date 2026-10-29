@@ -250,7 +250,10 @@ def _request(op: str, fields: dict, budget: float) -> dict:
             message = (f"{_persona_line(reply)}Nothing was spoken (or dialed). Rewrite your words as "
                        f"{reply[proto.REPLY_PERSONA]['name']} and send again.")
         else:   # the owner heard the announcement before the failure; a persona change is news either way
-            message = f"{_switch_line(reply)}{_persona_line(reply)}{message}{_ended_line(reply)}"
+            if proto.REPLY_CALL_ENDED in reply:   # only a speak that played through ends the call
+                raise RuntimeError(f"speak daemon sent call_ended {reply[proto.REPLY_CALL_ENDED]!r} "
+                                   f"on an error reply; its error: {message}")
+            message = f"{_switch_line(reply)}{_persona_line(reply)}{message}"
         if kind == proto.KIND_TIMEOUT:
             raise TimeoutError(message)
         if kind == proto.KIND_VALUE:
@@ -311,11 +314,13 @@ def _persona_line(reply: dict) -> str:
 def _ended_line(reply: dict) -> str:
     """'\n[call ended: nobody else was waiting]' when the daemon ended the call after this
     speak, the sign-off, because no other session was queued (owner decision 2026-10-28); ""
-    otherwise. It follows the result's own text (or an error's message), before the audio note."""
+    otherwise. It follows the result's own text, before the audio note. An error reply never
+    carries the field (_request raises if one does, with the daemon's error)."""
     if proto.REPLY_CALL_ENDED not in reply:
         return ""
     if reply[proto.REPLY_CALL_ENDED] != proto.CALL_ENDED_SIGNOFF:
-        raise RuntimeError(f"speak daemon sent an unknown call_ended: {reply[proto.REPLY_CALL_ENDED]!r}")
+        raise RuntimeError(f"speak daemon sent an unknown call_ended {reply[proto.REPLY_CALL_ENDED]!r} "
+                           f"on a speak that played for {reply['seconds']:.1f}s")
     return "\n[call ended: nobody else was waiting]"
 
 
@@ -630,10 +635,11 @@ _CALL_NOTE = """
     speak() gives up the floor. Use it only for your sign-off, once the owner has said you may
     go do the work: one speak() that promises to come back on the call. Then do nothing more
     on the call: when no other request is queued as it ends, the daemon hangs up and the
-    result's last line before the audio note is "[call ended: nobody else was waiting]" (on
-    an error too); otherwise the call stays up and the next session takes the floor. Do not
-    call hang_up() or call back for it. When the work is done, come back on the call:
-    status() first.
+    result's last line before the audio note is "[call ended: nobody else was waiting]";
+    otherwise the call stays up and the next session takes the floor. Do not call hang_up()
+    or call back for it. If the sign-off raises an error other than "Telegram call ended
+    during ...", the call is still up: send the speak() again. When the work is done, come
+    back on the call: status() first.
 """ + _HOLD_NOTE + _QUEUE_NOTE + _CALL_NOTE)
 async def speak(text: str) -> str:
     return await _run(_speak_sync, text)

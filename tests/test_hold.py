@@ -857,8 +857,10 @@ class TestClient(unittest.TestCase):
         self.assertIn("once the owner has said you may go do the work", speak)
         self.assertIn("Then do nothing more on the call: when no other request is queued as it ends, the daemon "
                       "hangs up and the result's last line before the audio note is \"[call ended: nobody else was "
-                      "waiting]\" (on an error too); otherwise the call stays up and the next session takes the "
-                      "floor. Do not call hang_up() or call back for it.", speak)
+                      "waiting]\"; otherwise the call stays up and the next session takes the floor. Do not call "
+                      "hang_up() or call back for it. If the sign-off raises an error other than \"Telegram call "
+                      "ended during ...\", the call is still up: send the speak() again.", speak)
+        self.assertNotIn("(on an error too)", speak)
         self.assertIn("Use it only when the owner asks you to. After your speak() sign-off the daemon itself hangs "
                       "up when no other request is queued, so never call it for that.",
                       self._flat(client.hang_up.__doc__))
@@ -892,8 +894,25 @@ class TestClient(unittest.TestCase):
         self.assertEqual(client._speak_result({"seconds": 5.0, "held_seconds": 7.0, **ended}),
                          "[held 7s, then resumed]\nspoke for 5.0s\n[call ended: nobody else was waiting]"
                          + proto.AUDIO_NOTE)
-        with self.assertRaisesRegex(RuntimeError, "unknown call_ended"):
+        with self.assertRaisesRegex(RuntimeError, "unknown call_ended 'other' on a speak that played for 1.0s"):
             client._speak_result({"seconds": 1.0, "held_seconds": 0.0, proto.REPLY_CALL_ENDED: "other"})
+
+    def test_an_error_reply_carrying_call_ended_raises_with_the_daemons_error(self):
+        # Owner decision 2026-10-28: only a speak that played through ends the call, so an
+        # error reply never carries the field; one that does is a daemon fault, reported with
+        # the daemon's own error.
+        replies = [({"ok": True, "phase": proto.PHASE_STARTED}, b""),
+                   ({"ok": False, "error": "boom", "kind": proto.KIND_RUNTIME,
+                     proto.REPLY_CALL_ENDED: proto.CALL_ENDED_SIGNOFF}, b"")]
+        with mock.patch.object(client, "_daemon", ("127.0.0.1", 1)), \
+                mock.patch.object(client.socket, "create_connection", return_value=mock.MagicMock()), \
+                mock.patch.object(client, "_identity_fields", return_value={}), \
+                mock.patch.object(client, "_current_persona_seen", return_value=None), \
+                mock.patch.object(client.proto, "enable_keepalive"), \
+                mock.patch.object(client.proto, "send_msg"), \
+                mock.patch.object(client.proto, "recv_msg", side_effect=replies):
+            with self.assertRaisesRegex(RuntimeError, "sent call_ended 'signoff' on an error reply; its error: boom$"):
+                client._request(proto.OP_SPEAK, {"text": "Bye."}, 10)
 
     def test_the_call_ended_line_only_with_the_field(self):
         # The error path over the wire: test_floor.TestSignOffHangUpOverTheWire.

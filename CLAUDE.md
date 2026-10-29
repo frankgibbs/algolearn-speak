@@ -38,7 +38,7 @@ owner and hold a spoken conversation.
 
 | Tool | What it does |
 |---|---|
-| `speak(text)` | The daemon synthesizes `text` with Kokoro-82M one segment (a sentence) at a time and plays each into the connected call as soon as it is made, synthesizing the next while earlier ones play (owner decision 2026-10-16). Returns once all of it has played, with the spoken duration. While it plays the owner can hold it (see "Hold on / continue" below): `[held Ns, then resumed]` on its own line comes first when it was held; an expired hold returns the expired form instead. A `[took over the call from "<project>"; ...]` line comes before all of that when this session took the call over (see "Switch of session" below), then a `[persona: ...]` line when the reply carries the project's persona (see "Personas" below). Speaks in the project's persona's voice, read again before each sentence. When it finishes it gives up the floor (see "The floor" below), except when the call ended under it. Agents use it only for the sign-off, once the owner has said they may go do the work (owner decision 2026-10-26), and do nothing more on the call after it. When it gives up the floor and no other tool op is queued, the daemon ends the call at once (owner decision 2026-10-28, see "The floor" below): the result then has `[call ended: nobody else was waiting]` on its own line after `spoke for Ns` (after the error's message on a failure), before the audio note, and the session's call expectation is cleared. |
+| `speak(text)` | The daemon synthesizes `text` with Kokoro-82M one segment (a sentence) at a time and plays each into the connected call as soon as it is made, synthesizing the next while earlier ones play (owner decision 2026-10-16). Returns once all of it has played, with the spoken duration. While it plays the owner can hold it (see "Hold on / continue" below): `[held Ns, then resumed]` on its own line comes first when it was held; an expired hold returns the expired form instead. A `[took over the call from "<project>"; ...]` line comes before all of that when this session took the call over (see "Switch of session" below), then a `[persona: ...]` line when the reply carries the project's persona (see "Personas" below). Speaks in the project's persona's voice, read again before each sentence. When it finishes it gives up the floor (see "The floor" below), except when the call ended under it. Agents use it only for the sign-off, once the owner has said they may go do the work (owner decision 2026-10-26), and do nothing more on the call after it. When it played through (fully, or held and resumed), gives up the floor and no other tool op with its client still there is queued, the daemon ends the call at once (owner decisions 2026-10-28, see "The floor" below): the result then has `[call ended: nobody else was waiting]` on its own line after `spoke for Ns`, before the audio note, and the session's call expectation is cleared. A `speak` that raised while the call is up leaves the call up, and the agent sends its sign-off again. |
 | `listen(max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | High beep (the ear is open), then records the owner's call audio until Silero VAD sees `silence_seconds` of quiet after speech (or `max_seconds` of speech), then Whisper large-v3-turbo transcribes. Once text is in hand, a rising two-note chime tells the owner their words were captured (owner decision 2026-10-16). No ear-closed beep and no spoken acknowledgement. Raises `TimeoutError` if nobody speaks within `start_timeout_seconds`. After a switch of session the switch cue and "<persona name>, <project name>, still listening" come before the ear-open beep, and the result (or the `TimeoutError` message) starts with the `[took over the call from ...]` line. Keeps the floor, a no-speech `TimeoutError` included. |
 | `converse(text, ...)` | `speak` then `listen` under one lock hold. Returns the user's words, after a `[held Ns, then resumed]` line when the speech was held. After an expired hold it does not listen and returns the expired form. The `[took over the call from ...]` line comes first after a switch of session, then the `[persona: ...]` line when there is one. Keeps the floor. An agent coming back with a report sends one `converse` and leaves it waiting in the queue, however long (owner decision 2026-10-26). |
 | `call(greeting, override_quiet_hours=False, max_seconds=120, silence_seconds=2.0, start_timeout_seconds=45)` | Telegram voice call from the algolearn.ai account to the owner (@frankgibbs35); `greeting` is the whole opening, spoken the moment they answer in the calling project's persona's voice: who is calling (by the persona's name), why, and the context, ending with a question or invitation. It must be at least 6 s when spoken (measured on the synthesized audio); a shorter one raises `ValueError` BEFORE dialing (phone never rings; owner decision 2026-10-12) telling the model to add the context of why it is calling, or, on a fresh conversation with nothing to report, to open with something playful (a joke, something funny or flirty). Never padded. Once answered, `call` immediately does the `listen` (ear-open beep, VAD, Whisper, rising chime) under the same lock hold and returns the owner's words; listen parameters and defaults match `converse`, and a listen timeout or a drop raises as in `listen` (the call stays connected on a timeout). Returns `answered\n<their words>\n(audio: telegram)`, `already connected` (greeting not spoken, no listen), `not answered (declined or no answer)`, `busy (the owner's Telegram reports a call in progress)` (Telegram discarded it as busy; the phone did not ring), `answered, then hung up during the greeting` (the owner picked up and ended it before the greeting finished; one call back right away is allowed, then the one-hour rule), `hung up` (another session's `hang_up` ended it during the greeting), `answered but audio failed to connect: <error>` (the owner picked up but media failed; the daemon container restarts itself) or `not called: quiet hours (...)`. Check order (owner decision 2026-10-23): already connected (whatever the time: the owner is on the line), quiet hours, then the greeting length, then the wait until 10 s have passed since the last call ended, then the dial. Quiet hours, an empty greeting and a too-short greeting each record the event `call_refused` (`project`, `reason`: `quiet_hours`, `empty_greeting` or `greeting_too_short`, the last with `greeting_s`); `already connected` is not a refusal and records nothing. `call_refused` belongs to no call: it carries `call_id` null and no `elapsed_s` (`TelegramLink.record_unbound_event`), and the `quiet_hours` one carries `local_time` (`HH:MM`, daemon clock). Daemon only, no protocol change. Deployed in commits d503492 and fce8f93 on 2026-10-23. |
@@ -323,40 +323,61 @@ No protocol change: the protocol stays 3.
   idle deadline as it was.
 - **Sign-off hang-up (owner decisions 2026-10-28; supersedes the agent-side
   rule of 2026-10-27, rule 4 below):** the daemon hangs up, not the agent.
-  When a `speak` gives up the floor (release reason `speak`) and no other
-  tool op is queued for the lock at that moment, the daemon ends the call at
-  once, with no grace period; with any tool op queued (another session's,
-  or this session's own) the call stays up and the floor passes as before.
-  It is a deliberate end, like `hang_up`: the session's call expectation is
-  cleared and nobody calls back. Events: `floor_release` as before, then
-  `signoff_hangup` (`project`, `waiting` 0, `outcome`); a hang-up that
-  raises records `signoff_hangup_failed` (`project`, `error`), its error is
-  the speak's result, and the expectation is cleared either way. The reply
-  (success or failure) carries `call_ended: "signoff"` and `expect` null;
-  the client adds `[call ended: nobody else was waiting]`.
+  When a `speak` that played through (fully, or held and resumed) gives up
+  the floor (release reason `speak`) and no other tool op is queued for the
+  lock at that moment, the daemon ends the call at once, with no grace
+  period; with any tool op queued (another session's, or this session's
+  own) the call stays up and the floor passes as before. It is a deliberate
+  end, like `hang_up`: the session's call expectation is cleared and nobody
+  calls back. Events: `floor_release` as before, then `signoff_hangup`
+  (`project`, `waiting` 0, `outcome`). The reply carries
+  `call_ended: "signoff"` and `expect` null; the client adds
+  `[call ended: nobody else was waiting]`.
+  Owner decisions 2026-10-28, after the code review of 7efff53:
+  - A sign-off `speak` that raised while the call is still up does not hang
+    up: it releases the floor as before (the 45 s idle lapse then applies
+    to nobody, the queue goes FIFO) and leaves the call up, so the agent
+    sends its sign-off again (the `speak` docstring says so). Its error
+    reply carries no `call_ended`.
+  - When counting the queue at the sign-off, a queued op whose client has
+    already left does not count: a queue of only departed clients counts
+    as empty, and the daemon hangs up.
+  - No exception is swallowed or replaced: the hang-up runs only after a
+    `speak` that returned, outside any exception handler, so no speak error
+    is in flight when it runs; a hang-up that raises records
+    `signoff_hangup_failed` (`project`, `error`), its own error is the
+    speak's result (the call may still be up), the expectation is cleared
+    either way, and no `call_ended` is sent.
   Design choices (2026-10-28, made in the build, within the owner's
   decisions): an HTTP transcription queued at that moment does not keep the
   call up; it stays queued and runs after the hang-up, once the lock is
-  released. Exactly which cases hang up: a `speak` that played to the end,
-  one held and resumed, and one that raised while the call stayed connected
-  (e.g. a synthesis error), each only when nothing else is queued. Never: a
-  `speak` under which the call ended (it yields nothing), an expired hold
-  (the daemon has already hung up, reason `hold_expired`), a client that
-  left during a hold (reason `client_left`, the call stays up), a `speak`
-  refused before its turn (empty text, no call), `converse`, `listen`.
-  No protocol bump: a protocol 4 client that predates the field ignores it
-  and still clears its expectation from `expect`.
-  Verified from the code (2026-10-28): `AudioLock.yield_floor`
-  (`speak_telegram_daemon.py:369`) clears the floor and counts the queued
-  tickets that carry a session (`:381`; a transcription's ticket has none)
-  under one hold of the lock's condition, while the speak still holds the
-  audio lock; `SpeakService.speak` calls `_sign_off_hang_up` (`:764`) from
-  its `finally` (`:761`) when that count is 0; the handler releases the
-  audio lock only after `run_locked` returns (`:1008`, released at `:1014`).
-  So no queued op can run between the count and the hang-up; an op that
-  arrives after the count runs after it and gets "needs a connected
-  Telegram call" (`require_call`, `:534`; the hang-up's `END_HUNG_UP`
-  clears a matching expectation, so it is not "ended during"). Not
+  released. Never a sign-off: a `speak` under which the call ended (it
+  yields nothing), an expired hold (the daemon has already hung up, reason
+  `hold_expired`), a client that left during a hold (reason `client_left`,
+  the call stays up), a `speak` refused before its turn (empty text, no
+  call), `converse`, `listen`. No protocol bump: a protocol 4 client that
+  predates the field ignores it and still clears its expectation from
+  `expect`.
+  Verified from the code (2026-10-28, after the review fixes):
+  `AudioLock.yield_floor` (`speak_telegram_daemon.py:375`) clears the floor
+  and counts the queued tickets that carry a session and whose
+  `client_left` probe is false (`:390`; a transcription's ticket has no
+  session) under one hold of the lock's condition, while the speak still
+  holds the audio lock. The probe is the handler's `_peer_left` on the
+  ticket's socket (`:1010`, `_peer_left` at `:1058`: `select` with a zero
+  timeout, then a `MSG_PEEK`), so it never blocks. `SpeakService.speak`
+  (`:748`) yields without hanging up when the speak raised (`:768`), and
+  otherwise calls `_sign_off_hang_up` (`:776`) when the count (`:774`) is
+  0; the handler releases the audio lock only after `run_locked` returns
+  (`:1025`, released at `:1031`). So no queued op can run between the
+  count and the hang-up. An op that arrives after the count (while the
+  hang-up is in progress) runs after it and gets "needs a connected
+  Telegram call" (`require_call`, `:544`; the hang-up's `END_HUNG_UP`
+  clears a matching expectation, so it is not "ended during"); the
+  instructions tell that agent to `call()` back, and `call` waits until
+  10 s have passed since the hang-up before it dials. Tested over the wire
+  in `tests/test_floor.py`
+  (`test_an_op_queued_during_the_sign_off_hang_up_finds_no_call`). Not
   deployed: the deploy is the owner's action.
 - **Visible only in `call_debug`:** events `floor_take` (`project`,
   `from_project`, the previous holder's or null) and `floor_release`
@@ -436,9 +457,10 @@ No protocol change: the protocol stays 3.
   line. Docstrings (2026-10-28): `speak` says it is only the sign-off once
   the owner has said you may go do the work, then nothing more on the call:
   the daemon hangs up when no other request is queued and the result says
-  `[call ended: nobody else was waiting]` (on an error too), otherwise the
-  next session takes the floor, and not to call `hang_up()` or call back for
-  it; `hang_up` that it is used only when the owner asks, never for the
+  `[call ended: nobody else was waiting]`, otherwise the next session
+  takes the floor, not to call `hang_up()` or call back for it, and that
+  after a sign-off that raised (other than "Telegram call ended during
+  ...") the call is still up and the `speak` is sent again; `hang_up` that it is used only when the owner asks, never for the
   sign-off; `call` that `hang_up()` is only when the owner asks and that
   the daemon hangs up after a sign-off with nobody queued (a test checks
   that no agent-facing text still tells the agent to call `status()` then
@@ -536,13 +558,15 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
   (nothing to speak). Quick ops other than the persona ops carry no
   identity. Replies to `speak`, `listen` and `converse` may carry
   `switched_from` (absent: no switch).
-- **Sign-off hang-up (2026-10-28, still protocol 4):** a `speak` reply,
-  success or failure, carries `call_ended: "signoff"` (`REPLY_CALL_ENDED`,
+- **Sign-off hang-up (2026-10-28, still protocol 4):** a successful
+  `speak` reply carries `call_ended: "signoff"` (`REPLY_CALL_ENDED`,
   `CALL_ENDED_SIGNOFF` in `speak_protocol.py`) when the daemon ended the
-  call after it, with `expect` null; absent otherwise. No version bump
-  (design choice 2026-10-28): an older protocol 4 client ignores the key
-  and still clears its expectation from `expect`; the current client
-  raises on an unknown value.
+  call after it, with `expect` null; absent otherwise, and never on an
+  error reply (owner decision 2026-10-28). No version bump (design choice
+  2026-10-28): an older protocol 4 client ignores the key and still clears
+  its expectation from `expect`. The current client raises on an unknown
+  value (naming the speak's duration), and on an error reply that carries
+  the key (with the daemon's error in its message).
 - **Personas (protocol 4):** every tool op also carries `persona_seen`
   (null or `"<persona id>:<words_revision>"`; missing is refused like a missing
   version). Before the lock the daemon assigns a new project to the house

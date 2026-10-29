@@ -262,13 +262,15 @@ class DebugControl:
 # ------------------------------------------------------------------ the audio lock
 
 class _Ticket:
-    """One queued acquire: the session id of its op, or None for an HTTP transcription.
-    Compared by identity (deque.remove)."""
+    """One queued acquire: the session id of its op, or None for an HTTP transcription, and
+    `client_left`, the non-blocking probe of its client's socket (None: no probe, the op
+    counts as present). Compared by identity (deque.remove)."""
 
-    __slots__ = ("session_id",)
+    __slots__ = ("session_id", "client_left")
 
-    def __init__(self, session_id: str | None) -> None:
+    def __init__(self, session_id: str | None, client_left: Callable[[], bool] | None) -> None:
         self.session_id = session_id
+        self.client_left = client_left
 
 
 class AudioLock:
@@ -296,10 +298,14 @@ class AudioLock:
         self._current_session: str | None = None   # the session of the op holding the lock
         self._closed = False   # close(): the daemon is going away, plain FIFO from then on
 
-    def acquire(self, tool: str, peer: str, speaker: Speaker | None) -> None:
+    def acquire(self, tool: str, peer: str, speaker: Speaker | None,
+                client_left: Callable[[], bool] | None = None) -> None:
         """`speaker` is the tool op's validated identity; None only for an HTTP transcription
-        (owner decision 8: it skips the floor and waits only for the op holding the lock)."""
-        ticket = _Ticket(None if speaker is None else speaker.session_id)
+        (owner decision 8: it skips the floor and waits only for the op holding the lock).
+        `client_left` is a non-blocking probe of the op's client socket (the handler passes
+        _peer_left on its socket); yield_floor calls it under the condition to skip queued
+        ops whose client has gone (owner decision 2026-10-28). None: no probe."""
+        ticket = _Ticket(None if speaker is None else speaker.session_id, client_left)
         with self._cond:
             self._lapse_if_due()
             self._queue.append(ticket)
@@ -370,15 +376,19 @@ class AudioLock:
         """Clears the floor when `speaker` holds it; the release() that follows then wakes
         the queue in plain FIFO order. Not the holder (or no floor): nothing to yield, None.
         After a yield, returns how many tool ops (tickets with a session) are queued at that
-        moment; HTTP transcriptions (no session) are not counted. The count and the clear
-        happen under one hold of the condition while the caller's op still holds the audio
-        lock, so no queued op can take the lock between them (SpeakService.speak's sign-off
-        hang-up relies on it, owner decision 2026-10-28)."""
+        moment whose client is still there; HTTP transcriptions (no session) are not counted,
+        and neither is a ticket whose `client_left` probe says its client has gone (owner
+        decision 2026-10-28: such an op would only be skipped once it reached the lock). The
+        probe (_peer_left: select with a zero timeout, then a MSG_PEEK) never blocks. The
+        count and the clear happen under one hold of the condition while the caller's op
+        still holds the audio lock, so no queued op can take the lock between them
+        (SpeakService.speak's sign-off hang-up relies on it, owner decision 2026-10-28)."""
         with self._cond:
             if self._floor is None or self._floor.session_id != speaker.session_id:
                 return None
             self._clear_floor(reason)
-            return sum(1 for t in self._queue if t.session_id is not None)
+            return sum(1 for t in self._queue
+                       if t.session_id is not None and not (t.client_left is not None and t.client_left()))
 
     def close(self) -> None:
         """The daemon is restarting or stopping: the floor no longer orders the queue, so
@@ -744,31 +754,37 @@ class SpeakService:
         # idle window, so it can call back first. A hold that expired or whose client left has
         # already released the floor (FLOOR_HOLD_EXPIRED, FLOOR_CLIENT_LEFT), so the yield
         # below finds nothing to yield.
-        # Owner decision 2026-10-28: when the floor is released here (reason FLOOR_SPEAK) and
-        # no tool op is queued, the daemon ends the call at once (_sign_off_hang_up), still
-        # under the audio lock (the handler releases it only after run_locked returns).
-        call_ended = False
+        # Owner decisions 2026-10-28: when a speak that played through (fully, or held and
+        # resumed) releases the floor here (reason FLOOR_SPEAK) and no tool op with a client
+        # still there is queued, the daemon ends the call at once (_sign_off_hang_up), still
+        # under the audio lock (the handler releases it only after run_locked returns). A
+        # speak that raised while the call is up releases the floor and leaves the call up,
+        # so the agent can send its sign-off again. The hang-up runs outside any exception
+        # handler, so it can never mask or replace a speak error.
         try:
             spoken = self.guard_call(sess, "speak", lambda: self._speak(sess.speaker, text, client_left))
-            reply = {"seconds": round(spoken.seconds, 3)}
-            if spoken.interruption is not None:
-                return self._hold_expired(sess, "speak", spoken, reply)
-            return {**reply, proto.REPLY_HELD_SECONDS: round(spoken.held_seconds, 1)}
         except CallEndedError:
-            call_ended = True
             raise
-        finally:
-            if not call_ended and self.lock.yield_floor(sess.speaker, FLOOR_SPEAK) == 0:
-                self._sign_off_hang_up(sess)
+        except BaseException:
+            self.lock.yield_floor(sess.speaker, FLOOR_SPEAK)
+            raise
+        reply = {"seconds": round(spoken.seconds, 3)}
+        if spoken.interruption is not None:
+            return self._hold_expired(sess, "speak", spoken, reply)   # yields FLOOR_HOLD_EXPIRED
+        waiting = self.lock.yield_floor(sess.speaker, FLOOR_SPEAK)   # None after client_left
+        if waiting == 0:
+            self._sign_off_hang_up(sess)
+        return {**reply, proto.REPLY_HELD_SECONDS: round(spoken.held_seconds, 1)}
 
     def _sign_off_hang_up(self, sess: Session) -> None:
-        """Owner decision 2026-10-28: the speak that gave up the floor ended with no other tool
-        op queued, so the daemon ends the call, as a deliberate end like hang_up(): the
-        session's expectation is cleared (nobody calls back) and the reply carries
-        REPLY_CALL_ENDED (run_locked), on a failed speak too. A queued HTTP transcription does
-        not keep the call up; it runs after the hang-up, once the lock is released. If the
-        hang-up fails, SIGNOFF_HANGUP_FAILED_EVENT is recorded and its error is the tool's
-        result (the call may still be up); the expectation is cleared either way."""
+        """Owner decisions 2026-10-28: the speak played through and gave up the floor with no
+        other tool op queued, so the daemon ends the call, as a deliberate end like hang_up():
+        the session's expectation is cleared (nobody calls back) and the reply carries
+        REPLY_CALL_ENDED (run_locked). A queued HTTP transcription does not keep the call up;
+        it runs after the hang-up, once the lock is released. Called only after a speak that
+        did not raise, so no exception is in flight. If the hang-up fails,
+        SIGNOFF_HANGUP_FAILED_EVENT is recorded and that error is the tool's result (the
+        call may still be up); the expectation is cleared either way."""
         log.info("speak: sign-off by %r with nobody queued; ending the call", sess.speaker.project)
         try:
             outcome = self.link.hang_up()
@@ -990,7 +1006,8 @@ class _Handler(socketserver.BaseRequestHandler):
             self._send(peer, _error_reply(ValueError(f"unknown op {op!r}")))
             return
         restart_reason: str | None = None
-        daemon.lock.acquire(op, peer, _speaker(req))   # validated above; the floor orders the queue by it
+        # validated above; the floor orders the queue by it; the probe lets a sign-off skip a departed client
+        daemon.lock.acquire(op, peer, _speaker(req), lambda: _peer_left(self.request))
         try:
             if _peer_left(self.request):
                 log.warning("%s from %s: the client left while queued; skipped", op, peer)
@@ -1377,7 +1394,7 @@ class SpeakDaemon:
         if sess is not None and sess.switched_from is not None:
             reply[proto.REPLY_SWITCHED_FROM] = sess.switched_from   # on a failure too: the owner heard it
         if sess is not None and sess.call_ended is not None:
-            reply[proto.REPLY_CALL_ENDED] = sess.call_ended   # on a failure too: the call is gone
+            reply[proto.REPLY_CALL_ENDED] = sess.call_ended   # set only by a sign-off that succeeded
         project = _speaker(req).project   # validated in admit, as is persona_seen
         if _persona_seen(req) != self.personas.key(project):
             reply[proto.REPLY_PERSONA] = self.personas.block(project)
