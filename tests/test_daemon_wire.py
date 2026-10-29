@@ -409,7 +409,8 @@ class TestSessionSwitchOverTheWire(unittest.TestCase):
         self.assertEqual(got, '[took over the call from "algolearn-speak"; the owner heard the switch cue and '
                               "your persona's name and this project's name first]\nhi Angie" + proto.AUDIO_NOTE)
         self.assertIn(("synthesize", "Angie, algolearn hedge"), self.engines.log)
-        self.assertEqual(self.as_session(b, client._speak_sync, "Three."), "spoke for 0.5s" + proto.AUDIO_NOTE)
+        self.assertEqual(self.as_session(b, client._converse_sync, "Three.", 120, 2.0, 45),
+                         "hi Angie" + proto.AUDIO_NOTE)   # b's turn again: no switch
         got = self.as_session(a, client._listen_sync, 120, 2.0, 45)
         self.assertEqual(got, '[took over the call from "algolearn-hedge"; the owner heard the switch cue and '
                               "your persona's name and this project's name first]\nhi Angie")
@@ -558,11 +559,11 @@ class TestPersonasOverTheWire(unittest.TestCase):
         seen = a["_seen"]
         as_session(b, client._persona_sync)
         as_session(b, client._set_persona_sync, None, {"bf_emma": 1}, 1.2, None)
-        self.assertEqual(as_session(a, client._speak_sync, "One.").split("\n")[-1], "(audio: telegram)")
-        self.assertFalse(as_session(a, client._speak_sync, "Two.").startswith("[persona"))
-        self.assertEqual(as_session(a, client._converse_sync, "Three.", 120, 2.0, 45), "hi Angie" + proto.AUDIO_NOTE)
+        self.assertEqual(as_session(a, client._converse_sync, "One.", 120, 2.0, 45), "hi Angie" + proto.AUDIO_NOTE)
         self.assertEqual(as_session(a, client._call_sync, "Hi Frank, it's Angie again.", True, 120, 2.0, 45),
                          proto.ALREADY_CONNECTED)
+        # The sign-off last: with nobody queued it ends the call (owner decision 2026-10-28).
+        self.assertFalse(as_session(a, client._speak_sync, "Two.").startswith("[persona"))
         self.assertEqual(a["_seen"], seen)
         self.assertEqual(self.daemon.personas.persona_of("algolearn-speak").speed, 1.2)
 

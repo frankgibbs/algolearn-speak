@@ -101,6 +101,9 @@ REFUSED_QUIET_HOURS, REFUSED_EMPTY_GREETING, REFUSED_SHORT_GREETING = "quiet_hou
 FLOOR_TAKE_EVENT, FLOOR_RELEASE_EVENT = "floor_take", "floor_release"
 FLOOR_SPEAK, FLOOR_IDLE, FLOOR_HANG_UP = "speak", "idle", "hang_up"
 FLOOR_HOLD_EXPIRED, FLOOR_CLIENT_LEFT = "hold_expired", "client_left"
+# The daemon ends the call after a sign-off with nobody else queued (owner decision
+# 2026-10-28, docs/DESIGN_FLOOR.md): call_debug events.
+SIGNOFF_HANGUP_EVENT, SIGNOFF_HANGUP_FAILED_EVENT = "signoff_hangup", "signoff_hangup_failed"
 # A switch caused by a bare listen says this after the project name (owner decision 2026-10-20):
 # the ear opens right after, so a name alone would give the owner no context.
 SWITCH_LISTEN_SUFFIX = ", still listening"
@@ -363,13 +366,19 @@ class AudioLock:
                                from_project=None if previous is None else previous.project)
             log.info("floor: %r takes it (from %r)", speaker.project, None if previous is None else previous.project)
 
-    def yield_floor(self, speaker: Speaker, reason: str) -> None:
+    def yield_floor(self, speaker: Speaker, reason: str) -> int | None:
         """Clears the floor when `speaker` holds it; the release() that follows then wakes
-        the queue in plain FIFO order. Not the holder (or no floor): nothing to yield."""
+        the queue in plain FIFO order. Not the holder (or no floor): nothing to yield, None.
+        After a yield, returns how many tool ops (tickets with a session) are queued at that
+        moment; HTTP transcriptions (no session) are not counted. The count and the clear
+        happen under one hold of the condition while the caller's op still holds the audio
+        lock, so no queued op can take the lock between them (SpeakService.speak's sign-off
+        hang-up relies on it, owner decision 2026-10-28)."""
         with self._cond:
             if self._floor is None or self._floor.session_id != speaker.session_id:
-                return
+                return None
             self._clear_floor(reason)
+            return sum(1 for t in self._queue if t.session_id is not None)
 
     def close(self) -> None:
         """The daemon is restarting or stopping: the floor no longer orders the queue, so
@@ -434,6 +443,7 @@ class Session:
         self.changed = False
         self.speaker = speaker
         self.switched_from: str | None = None
+        self.call_ended: str | None = None   # proto.CALL_ENDED_SIGNOFF once the daemon ended the call after a sign-off
 
     def expect(self, generation: str | None) -> None:
         self.generation = generation
@@ -731,7 +741,12 @@ class SpeakService:
         self._take_turn(sess, "speak")
         # Owner decision 2026-10-20: a speak gives up the floor when it ends, however it ends,
         # except when the call ended under it: then the floor stays with this session for the
-        # idle window, so it can call back first.
+        # idle window, so it can call back first. A hold that expired or whose client left has
+        # already released the floor (FLOOR_HOLD_EXPIRED, FLOOR_CLIENT_LEFT), so the yield
+        # below finds nothing to yield.
+        # Owner decision 2026-10-28: when the floor is released here (reason FLOOR_SPEAK) and
+        # no tool op is queued, the daemon ends the call at once (_sign_off_hang_up), still
+        # under the audio lock (the handler releases it only after run_locked returns).
         call_ended = False
         try:
             spoken = self.guard_call(sess, "speak", lambda: self._speak(sess.speaker, text, client_left))
@@ -743,8 +758,27 @@ class SpeakService:
             call_ended = True
             raise
         finally:
-            if not call_ended:
-                self.lock.yield_floor(sess.speaker, FLOOR_SPEAK)
+            if not call_ended and self.lock.yield_floor(sess.speaker, FLOOR_SPEAK) == 0:
+                self._sign_off_hang_up(sess)
+
+    def _sign_off_hang_up(self, sess: Session) -> None:
+        """Owner decision 2026-10-28: the speak that gave up the floor ended with no other tool
+        op queued, so the daemon ends the call, as a deliberate end like hang_up(): the
+        session's expectation is cleared (nobody calls back) and the reply carries
+        REPLY_CALL_ENDED (run_locked), on a failed speak too. A queued HTTP transcription does
+        not keep the call up; it runs after the hang-up, once the lock is released. If the
+        hang-up fails, SIGNOFF_HANGUP_FAILED_EVENT is recorded and its error is the tool's
+        result (the call may still be up); the expectation is cleared either way."""
+        log.info("speak: sign-off by %r with nobody queued; ending the call", sess.speaker.project)
+        try:
+            outcome = self.link.hang_up()
+        except Exception as e:
+            self.link.record_event(SIGNOFF_HANGUP_FAILED_EVENT, project=sess.speaker.project, error=tg.describe(e))
+            raise
+        finally:
+            sess.expect(None)
+        sess.call_ended = proto.CALL_ENDED_SIGNOFF
+        self.link.record_event(SIGNOFF_HANGUP_EVENT, project=sess.speaker.project, waiting=0, outcome=outcome)
 
     def listen(self, sess: Session, max_seconds: float, silence_seconds: float, start_timeout_seconds: float) -> dict:
         self.require_call(sess, "listen")
@@ -827,7 +861,7 @@ class SpeakService:
         try:
             return {"outcome": self.link.hang_up()}
         finally:
-            sess.expect(None)   # a deliberate end (the owner asked, or the agent's sign-off with nobody else): never a call-back, even if this raised
+            sess.expect(None)   # a deliberate end (the owner asked): never a call-back, even if this raised
             self.lock.yield_floor(sess.speaker, FLOOR_HANG_UP)   # a deliberate end (owner decision 2026-10-20)
 
 
@@ -1310,7 +1344,8 @@ class SpeakDaemon:
     def run_locked(self, op: str, req: dict, client_left: Callable[[], bool]) -> dict:
         """One tool op with the lock held. The reply carries "expect" when the session's
         call expectation changed (an int, or null to clear), REPLY_SWITCHED_FROM when a
-        switch of session was announced before the op's audio, and REPLY_PERSONA when the
+        switch of session was announced before the op's audio, REPLY_CALL_ENDED when the
+        daemon ended the call after a sign-off speak (owner decision 2026-10-28), and REPLY_PERSONA when the
         project's "<id>:<words_revision>" is not the one the request's persona_seen names
         (another persona, or its name or personality changed while the op was queued or
         playing). `client_left` says whether
@@ -1341,6 +1376,8 @@ class SpeakDaemon:
             reply["expect"] = sess.generation
         if sess is not None and sess.switched_from is not None:
             reply[proto.REPLY_SWITCHED_FROM] = sess.switched_from   # on a failure too: the owner heard it
+        if sess is not None and sess.call_ended is not None:
+            reply[proto.REPLY_CALL_ENDED] = sess.call_ended   # on a failure too: the call is gone
         project = _speaker(req).project   # validated in admit, as is persona_seen
         if _persona_seen(req) != self.personas.key(project):
             reply[proto.REPLY_PERSONA] = self.personas.block(project)

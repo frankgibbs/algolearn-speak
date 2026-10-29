@@ -24,7 +24,7 @@ import speak_server as client  # noqa: E402
 import speak_telegram as tg  # noqa: E402
 import speak_telegram_daemon as d  # noqa: E402
 import speak_tone  # noqa: E402
-from test_hold import NEVER_LEFT, SETTINGS, HoldServiceCase, ScriptedLink, locked_service  # noqa: E402
+from test_hold import NEVER_LEFT, SETTINGS, HoldServiceCase, ScriptedLink, ServiceLock, locked_service  # noqa: E402
 
 A = d.Speaker("session-a", "algolearn-speak")
 B = d.Speaker("session-b", "algolearn-hedge")
@@ -48,6 +48,16 @@ class CallLink(ScriptedLink):
             raise RuntimeError("call dropped while playing")
 
 
+class OthersWaitLock(ServiceLock):
+    """Another session always waits behind the op, so a speak's sign-off never ends the call
+    (owner decision 2026-10-28): these tests run several speaks on one call. The sign-off
+    hang-up itself is tested in test_floor."""
+
+    def yield_floor(self, speaker, reason):
+        queued = super().yield_floor(speaker, reason)
+        return None if queued is None else queued + 1
+
+
 class SwitchCase(HoldServiceCase):
     TEXT = "One."
 
@@ -55,6 +65,7 @@ class SwitchCase(HoldServiceCase):
         super().setUp()
         self.link = CallLink(self.log, self.clock)
         self.svc = locked_service(self.link, self.engines, SETTINGS, self.link.record_event)
+        self.svc.lock = OthersWaitLock(self.link.record_event)
 
     def placed_by(self, speaker: d.Speaker) -> None:
         """What call() does once answered: the caller's greeting is the call's first turn."""

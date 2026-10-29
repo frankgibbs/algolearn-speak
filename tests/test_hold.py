@@ -838,14 +838,15 @@ class TestClient(unittest.TestCase):
                         "pass override_quiet_hours=True without asking",
                         "without asking, set_call_debug(True), place a test call",
                         "Once he lets you go, hand the work to agents.",
-                        'After your sign-off, call status(). "busy" false and "waiting" 0 (nobody else): '
-                        "hang_up(). Otherwise leave the line open for the next session.",
-                        "hang_up() only when he asks, or after your sign-off when status() shows nobody else.",
+                        "After your sign-off, do nothing more on the call: with nobody else waiting the daemon "
+                        'hangs up ("[call ended: nobody else was waiting]"), otherwise the next session goes.',
+                        "call back. hang_up() only when he asks.",
                         'Never speak "hold on" or "continue" as a sentence by itself.'):
             self.assertIn(wording, flat)
-        self.assertNotIn("hang_up() only when he asks.", flat)
-        self.assertNotIn('"waiting" 0 (nobody queued): hang_up()', flat)   # waiting alone misses a session holding the lock
-        # The hang-up rule sits next to the sign-off rule, inside the floor section.
+        # Owner decision 2026-10-28 supersedes 2026-10-27: no status()/hang_up() step after the sign-off.
+        self.assertNotIn("After your sign-off, call status()", flat)
+        self.assertNotIn("after your sign-off when status() shows nobody else", flat)
+        # The sign-off rule sits inside the floor section.
         self.assertLess(text.index("After your sign-off"), text.index("Calls:"))
         self.assertLess(text.index("sign off with ONE speak()"), text.index("After your sign-off"))
         self.assertNotIn("15 minutes", flat)
@@ -854,21 +855,21 @@ class TestClient(unittest.TestCase):
     def test_the_docstrings_state_the_sign_off_and_coming_back(self):
         speak = self._flat(client.speak.__doc__)
         self.assertIn("once the owner has said you may go do the work", speak)
-        self.assertIn("Right after it, call status(): when `busy` is false and `waiting` is 0 (no other session "
-                      "holds the lock or is queued), hang_up(); otherwise leave the call open for the next session.",
-                      speak)
-        hang_up = self._flat(client.hang_up.__doc__)
-        self.assertIn("Use it when the owner asks you to, or right after your speak() sign-off when status() shows "
-                      "`busy` false and `waiting` 0", hang_up)
-        self.assertIn("Check it right after your speak() sign-off too: `busy` false and `waiting` 0 means "
-                      "hang_up(); otherwise leave the call open for the next session.",
-                      self._flat(client.status.__doc__))
-        self.assertIn("Hang up with `hang_up()` when the owner asks, or right after your speak() sign-off when "
-                      "status() shows `busy` false and `waiting` 0", self._flat(client.call.__doc__))
+        self.assertIn("Then do nothing more on the call: when no other request is queued as it ends, the daemon "
+                      "hangs up and the result's last line before the audio note is \"[call ended: nobody else was "
+                      "waiting]\" (on an error too); otherwise the call stays up and the next session takes the "
+                      "floor. Do not call hang_up() or call back for it.", speak)
+        self.assertIn("Use it only when the owner asks you to. After your speak() sign-off the daemon itself hangs "
+                      "up when no other request is queued, so never call it for that.",
+                      self._flat(client.hang_up.__doc__))
+        self.assertIn("Hang up with `hang_up()` only when the owner asks", self._flat(client.call.__doc__))
 
-    def test_no_text_still_limits_hang_up_to_when_the_owner_asks(self):
-        # Owner decision 2026-10-27: hang_up() is also for the sign-off with nobody else on the line.
-        stale = ("only when the owner asks", "hang_up() only when he asks.", "Use only when the owner asks")
+    def test_no_text_keeps_the_superseded_sign_off_step(self):
+        # Owner decision 2026-10-28 supersedes 2026-10-27: the daemon hangs up after the sign-off,
+        # so no text tells an agent to call status() then hang_up() after it.
+        stale = ("right after your speak() sign-off when status()", "Right after it, call status()",
+                 "Check it right after your speak() sign-off", "after your sign-off when status() shows",
+                 "After your sign-off, call status()")
         texts = {"_INSTRUCTIONS": client._INSTRUCTIONS, "_QUEUE_NOTE": client._QUEUE_NOTE,
                  "_HOLD_NOTE": client._HOLD_NOTE, "_CALL_NOTE": client._CALL_NOTE}
         texts.update({name: getattr(client, name).__doc__
@@ -883,6 +884,22 @@ class TestClient(unittest.TestCase):
         self.assertIn("listen() keeps the floor.", client.listen.__doc__)
         self.assertIn('This `busy` is not call()\'s "busy" outcome.', self._flat(client.status.__doc__))
         self.assertIn("Your request still queues behind it: leave it waiting.", self._flat(client._QUEUE_NOTE))
+
+    def test_a_sign_off_hang_up_adds_its_line_before_the_audio_note(self):
+        ended = {proto.REPLY_CALL_ENDED: proto.CALL_ENDED_SIGNOFF}
+        self.assertEqual(client._speak_result({"seconds": 2.04, "held_seconds": 0.0, **ended}),
+                         "spoke for 2.0s\n[call ended: nobody else was waiting]" + proto.AUDIO_NOTE)
+        self.assertEqual(client._speak_result({"seconds": 5.0, "held_seconds": 7.0, **ended}),
+                         "[held 7s, then resumed]\nspoke for 5.0s\n[call ended: nobody else was waiting]"
+                         + proto.AUDIO_NOTE)
+        with self.assertRaisesRegex(RuntimeError, "unknown call_ended"):
+            client._speak_result({"seconds": 1.0, "held_seconds": 0.0, proto.REPLY_CALL_ENDED: "other"})
+
+    def test_the_call_ended_line_only_with_the_field(self):
+        # The error path over the wire: test_floor.TestSignOffHangUpOverTheWire.
+        self.assertEqual(client._ended_line({proto.REPLY_CALL_ENDED: proto.CALL_ENDED_SIGNOFF}),
+                         "\n[call ended: nobody else was waiting]")
+        self.assertEqual(client._ended_line({"ok": True}), "")
 
     def test_the_client_still_imports_no_numpy_torch_or_ntgcalls(self):
         code = ("import sys, speak_server; "

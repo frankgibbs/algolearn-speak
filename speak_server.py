@@ -250,7 +250,7 @@ def _request(op: str, fields: dict, budget: float) -> dict:
             message = (f"{_persona_line(reply)}Nothing was spoken (or dialed). Rewrite your words as "
                        f"{reply[proto.REPLY_PERSONA]['name']} and send again.")
         else:   # the owner heard the announcement before the failure; a persona change is news either way
-            message = f"{_switch_line(reply)}{_persona_line(reply)}{message}"
+            message = f"{_switch_line(reply)}{_persona_line(reply)}{message}{_ended_line(reply)}"
         if kind == proto.KIND_TIMEOUT:
             raise TimeoutError(message)
         if kind == proto.KIND_VALUE:
@@ -308,6 +308,17 @@ def _persona_line(reply: dict) -> str:
     return f"[persona: you are {p['name']}{house}; voice {voice}; speed {p['speed']:g}; personality: {personality}{shared}]\n"
 
 
+def _ended_line(reply: dict) -> str:
+    """'\n[call ended: nobody else was waiting]' when the daemon ended the call after this
+    speak, the sign-off, because no other session was queued (owner decision 2026-10-28); ""
+    otherwise. It follows the result's own text (or an error's message), before the audio note."""
+    if proto.REPLY_CALL_ENDED not in reply:
+        return ""
+    if reply[proto.REPLY_CALL_ENDED] != proto.CALL_ENDED_SIGNOFF:
+        raise RuntimeError(f"speak daemon sent an unknown call_ended: {reply[proto.REPLY_CALL_ENDED]!r}")
+    return "\n[call ended: nobody else was waiting]"
+
+
 def _lead(reply: dict) -> str:
     """The lines every tool result starts with: the switch line, then the persona line."""
     return _switch_line(reply) + _persona_line(reply)
@@ -332,7 +343,7 @@ def _expired_result(reply: dict) -> str:
 def _speak_result(reply: dict) -> str:
     if proto.REPLY_INTERRUPTION in reply:
         return _lead(reply) + _expired_result(reply)
-    return f"{_lead(reply)}{_held_prefix(reply)}spoke for {reply['seconds']:.1f}s{AUDIO_NOTE}"
+    return f"{_lead(reply)}{_held_prefix(reply)}spoke for {reply['seconds']:.1f}s{_ended_line(reply)}{AUDIO_NOTE}"
 
 
 def _converse_result(reply: dict) -> str:
@@ -388,7 +399,7 @@ def _hang_up_sync() -> str:
         return f"{_persona_line(reply)}{reply['outcome']}"
     finally:
         with _expect_lock:
-            _call_generation = None   # a deliberate end (the owner asked, or the sign-off with nobody else): never a call-back, even if this raised
+            _call_generation = None   # a deliberate end (the owner asked): never a call-back, even if this raised
 
 
 def _strip(reply: dict) -> dict:
@@ -469,8 +480,8 @@ The floor (one conversation at a time):
 - When you are about to go do the work, whatever its length (even two minutes), ask him
   whether he is ready to let you go. Once he says yes, sign off with ONE speak() that
   promises to come back on the call, never "by message".
-- After your sign-off, call status(). "busy" false and "waiting" 0 (nobody else):
-  hang_up(). Otherwise leave the line open for the next session.
+- After your sign-off, do nothing more on the call: with nobody else waiting the daemon
+  hangs up ("[call ended: nobody else was waiting]"), otherwise the next session goes.
 - Coming back is owed, by voice. When the work is done, report it on the call before
   anything else, even after your context was summarized; a text is only in addition.
   Never ask whether he wants a call back. First status(). "connected": send ONE
@@ -490,8 +501,7 @@ Calls:
 - "not answered": wait an hour. "busy": call once more, then wait an hour. He hung up,
   or "answered, then hung up during the greeting": call back once right away; if that is
   not answered or ends the same way, wait an hour. "Telegram call ended during ...":
-  call back. hang_up() only when he asks, or after your sign-off when status() shows
-  nobody else.
+  call back. hang_up() only when he asks.
 - Whenever you must wait (quiet hours, the hour above, an expired hold), say in this
   terminal when you will try again and start a background timer (a background sleep).
 
@@ -618,11 +628,12 @@ _CALL_NOTE = """
     Write it as spoken prose: plain sentences, no markdown, no code. Returns the spoken duration.
 
     speak() gives up the floor. Use it only for your sign-off, once the owner has said you may
-    go do the work: one speak() that promises to come back on the call. Right after it, call
-    status(): when `busy` is false and `waiting` is 0 (no other session holds the lock or is
-    queued), hang_up(); otherwise leave the call open for the next session. A session queued
-    behind your speak() takes the lock the moment it ends, so it shows as `busy`, not in
-    `waiting`. When the work is done, come back on the call: status() first.
+    go do the work: one speak() that promises to come back on the call. Then do nothing more
+    on the call: when no other request is queued as it ends, the daemon hangs up and the
+    result's last line before the audio note is "[call ended: nobody else was waiting]" (on
+    an error too); otherwise the call stays up and the next session takes the floor. Do not
+    call hang_up() or call back for it. When the work is done, come back on the call:
+    status() first.
 """ + _HOLD_NOTE + _QUEUE_NOTE + _CALL_NOTE)
 async def speak(text: str) -> str:
     return await _run(_speak_sync, text)
@@ -744,10 +755,11 @@ async def call(greeting: str, override_quiet_hours: bool = False, max_seconds: f
     whatever the reason (a redial 1.4 s after a hang-up left the owner's
     Telegram app dropping every incoming call until it was force-quit); a
     call placed sooner waits out the rest of those 10 s, then dials.
-    Hang up with `hang_up()` when the owner asks, or right after your speak()
-    sign-off when status() shows `busy` false and `waiting` 0; the owner can
-    also hang up themselves. If the speak daemon cannot be reached this
-    raises "speak daemon at <addr> is not reachable: ...".
+    Hang up with `hang_up()` only when the owner asks; the owner can also hang
+    up themselves, and the daemon hangs up after a speak() sign-off when no
+    other request is queued ("[call ended: nobody else was waiting]"). If the
+    speak daemon cannot be reached this raises "speak daemon at <addr> is not
+    reachable: ...".
 
     To come back with a result, status() first; while the call is connected use converse(), not call().
     """
@@ -809,10 +821,9 @@ async def set_call_debug(enabled: bool) -> dict:
 
 @mcp.tool()
 async def hang_up() -> str:
-    """End the Telegram call placed by `call()`. Use it when the owner asks you to, or
-    right after your speak() sign-off when status() shows `busy` false and `waiting` 0
-    (no other session holds the lock or is queued); otherwise leave the call open for the
-    next session.
+    """End the Telegram call placed by `call()`. Use it only when the owner asks you to.
+    After your speak() sign-off the daemon itself hangs up when no other request is
+    queued, so never call it for that.
 
     Returns "hung up" or "no active call". Waits its turn in the audio lock
     queue like the other call tools.
@@ -883,10 +894,6 @@ async def status() -> dict:
     when `busy` is true or `waiting` is above 0: your converse queues and you leave it
     waiting. This `busy` is not call()'s "busy" outcome. "ringing" means another session is
     dialing: check again until "connected" (converse) or "none" (call).
-
-    Check it right after your speak() sign-off too: `busy` false and `waiting` 0 means
-    hang_up(); otherwise leave the call open for the next session. An op that has taken the
-    lock is no longer counted in `waiting`: it shows as `busy`.
     """
     return await _run(_status_sync)
 

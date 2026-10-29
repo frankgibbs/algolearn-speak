@@ -103,6 +103,14 @@ class FakeLink:
         self._state = tg.CONNECTED
         return tg.ANSWERED
 
+    def hang_up(self) -> str:   # a speak with nobody queued ends the call (owner decision 2026-10-28)
+        self.log.append(("hang_up",))
+        self._state = tg.NONE
+        return tg.HUNG_UP
+
+    def record_event(self, event: str, **fields) -> None:
+        pass
+
 
 class ServiceCase(unittest.TestCase):
     def setUp(self):
@@ -121,7 +129,8 @@ class ServiceCase(unittest.TestCase):
         # Lazy: nothing is synthesized until the link has started the stream (its call check).
         self.assertEqual(self.log, [("stream_begin",), ("stream_start", "One. Two. Three."),
                                     ("synth", 1), ("queued", 1), ("synth", 2), ("queued", 2),
-                                    ("synth", 3), ("queued", 3), ("stream_done",)])
+                                    ("synth", 3), ("queued", 3), ("stream_done",),
+                                    ("hang_up",)])   # nobody queued: the daemon ends the call
         self.assertNotIn("synthesize_whole", self.names())
 
     def test_markdown_is_stripped_before_streaming(self):
@@ -164,6 +173,7 @@ class ServiceCase(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "kokoro failed"):
             self.svc.speak(self.sess, "One. Two.", NEVER_LEFT)
         self.assertNotIn("stream_done", self.names())
+        self.assertEqual(self.log[-1], ("hang_up",))   # the failed speak gave up the floor with nobody queued
 
 
 class FakeAudio:
