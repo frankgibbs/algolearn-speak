@@ -771,7 +771,7 @@ class SpeakService:
         reply = {"seconds": round(spoken.seconds, 3)}
         if spoken.interruption is not None:
             return self._hold_expired(sess, "speak", spoken, reply)   # yields FLOOR_HOLD_EXPIRED
-        waiting = self.lock.yield_floor(sess.speaker, FLOOR_SPEAK)   # None after client_left
+        waiting = self.lock.yield_floor(sess.speaker, FLOOR_SPEAK)
         if waiting == 0:
             self._sign_off_hang_up(sess)
         return {**reply, proto.REPLY_HELD_SECONDS: round(spoken.held_seconds, 1)}

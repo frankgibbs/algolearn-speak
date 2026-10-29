@@ -146,7 +146,7 @@ INTERRUPTION_HOLD_EXPIRED = "hold_expired"
 REPLY_HELD_SECONDS, REPLY_INTERRUPTION = "held_seconds", "interruption"
 # The sign-off hang-up (owner decision 2026-10-28, docs/DESIGN_FLOOR.md): when a speak gives up
 # the floor (the sign-off) and no other tool op is queued, the daemon ends the call, and the
-# speak reply (success or failure) carries REPLY_CALL_ENDED = CALL_ENDED_SIGNOFF, with "expect"
+# speak reply that succeeded and hung up carries REPLY_CALL_ENDED = CALL_ENDED_SIGNOFF, with "expect"
 # null. Absent: the call was not ended by the sign-off. No version bump: a protocol 4 client
 # that predates it ignores the key and still clears its expectation from "expect".
 REPLY_CALL_ENDED, CALL_ENDED_SIGNOFF = "call_ended", "signoff"
