@@ -426,6 +426,7 @@ class TelegramLink:
         self._user_id: int | None = None
         self._state = NONE
         self._generation = 0
+        self._discard_claimed = 0           # generation whose phone.discardCall is sent or owned by leave_call
         self._end_reason: str | None = None
         self._ended = threading.Event()     # set when the current call ends (read from VAD threads too)
         self._ended_at: float | None = None # monotonic time the last call ended (REDIAL_SETTLE_SECONDS)
@@ -538,6 +539,60 @@ class TelegramLink:
 
         self._calls._handle_mtproto_updates = observe_mtproto
 
+        # Every ntgcalls ConnectionState change is logged. py-tgcalls 3.0.0's own handler for a
+        # connected call that drops calls self._app.discard_call(chat_id) without its required
+        # is_missed argument (handle_connection_changed.py:28 vs telethon_client.py:837); the
+        # TypeError dies unseen in run_coroutine_threadsafe (start.py), so Telegram never gets
+        # phone.discardCall, the iPhone's VoIP session stays half-open and later calls get dead
+        # air (calls 14da950c, 114c7fc6, e118cd17, 7145db87 on 2026-11-02). That drop branch is
+        # handled here instead: end the call, discard it, clear py-tgcalls' per-chat state.
+        # Private API, looked up now so a py-tgcalls upgrade that moves it fails at startup.
+        from ntgcalls import ConnectionState
+        connection_handler = self._calls._handle_connection_changed
+        wait_connect = self._calls._wait_connect
+        clear_cache = self._calls._clear_cache
+        self._get_input_call = self._calls._app.get_input_call
+        self._discard_call = self._calls._app.discard_call
+
+        async def observe_connection(chat_id, net_state):
+            # py-tgcalls runs this through run_coroutine_threadsafe and never reads the result:
+            # anything raised here would vanish like the library's own TypeError, so log it.
+            try:
+                await handle_connection(chat_id, net_state)
+            except asyncio.CancelledError:
+                raise
+            except BaseException as e:
+                log.exception("ntgcalls connection-change handling failed for chat %s: %s", chat_id, describe(e))
+                self._event("connection_handler_failed", chat_id=chat_id, error=describe(e))
+
+        async def handle_connection(chat_id, net_state):
+            state = net_state.state
+            fields = {"chat_id": chat_id, "connection": state.name, "kind": str(net_state.kind),
+                      "call_state": self._state}
+            log.info("ntgcalls connection state for chat %s: %s (call %s)", chat_id, state.name, self._state)
+            if chat_id != self._user_id or state in (ConnectionState.CONNECTING, ConnectionState.CONNECTED) \
+                    or chat_id in wait_connect:
+                self._event("connection_state", **fields)
+                await connection_handler(chat_id, net_state)
+                return
+            if self._state == RINGING:
+                # A late drop of the previous call's connection while the next one rings, before
+                # py-tgcalls registers it in _wait_connect: that call's discard was already
+                # settled, and this one must not be discarded. (Once registered, the library's
+                # own branch above handles it, as it always has.)
+                self._event("connection_state", ignored="a new call is ringing", **fields)
+                return
+            self._event("connection_state", library_drop=True, **fields)
+            if self._state == CONNECTED:
+                log.warning("call %d for %s: ntgcalls dropped the connection (%s)",
+                            self._generation, self._caller, state.name)
+                self._end_call(END_REMOTE)
+            if self._claim_discard():
+                await self._send_discard(f"ntgcalls connection {state.name}")
+            clear_cache(chat_id)
+
+        self._calls._handle_connection_changed = observe_connection
+
         # connect() + is_user_authorized(), not start(): start() would prompt on stdin for a
         # phone number if the session were revoked, which under a restart policy loops forever.
         await self._client.connect()
@@ -609,15 +664,54 @@ class TelegramLink:
             self._pump_task = None
 
     async def _leave(self) -> None:
-        """Best-effort leave_call while tearing down: a failure is logged, never raised over the real error."""
+        """Best-effort leave_call while tearing down: a failure is logged, never raised over the real error.
+        leave_call sends phone.discardCall itself, but raises NotInCallError before it when ntgcalls
+        has already dropped the call (leave_call.py:33); then the discard is sent here."""
         from pytgcalls.exceptions import NotInCallError
 
+        claimed = self._claim_discard()
         try:
             await asyncio.wait_for(self._calls.leave_call(self._user_id), HANG_UP_TIMEOUT)
         except NotInCallError:
-            pass   # already gone on the library side
+            self._event("leave_not_in_call")
+            if claimed:
+                await self._send_discard("leave_call: ntgcalls had already dropped the call")
         except BaseException as e:
-            log.error("leave_call failed while tearing the call down: %s: %s", type(e).__name__, e)
+            log.error("leave_call failed while tearing the call down: %s: %s; no separate phone.discardCall "
+                      "is sent for this call", type(e).__name__, e)
+
+    def _claim_discard(self) -> bool:
+        """On the loop thread: True once per call generation, for whichever path sends its
+        phone.discardCall (leave_call, the drop observer, or the pump seeing NotInCallError)."""
+        if self._discard_claimed == self._generation:
+            return False
+        self._discard_claimed = self._generation
+        return True
+
+    async def _send_discard(self, why: str) -> None:
+        """Send phone.discardCall for the owner's call so Telegram ends the call on both sides.
+        No input call cached means Telegram's PhoneCallDiscarded already arrived (it drops the
+        cache, telethon_client.py:149) or the cache expired (CACHE_DURATION, 1 h since the last
+        call update); both are logged. A failure is logged loudly, never retried or raised."""
+        try:
+            input_call = await self._get_input_call(self._user_id)
+            if input_call is None:
+                # The normal case after the owner hangs up (PhoneCallDiscarded came first).
+                level = logging.INFO if self._end_reason == END_REMOTE else logging.WARNING
+                log.log(level, "call %d for %s: no discard sent (%s): Telethon holds no input call, so "
+                        "Telegram already discarded it or the 1 h cache expired", self._generation, self._caller, why)
+                self._event("discard_not_sent", why=why, reason="no input call cached")
+                return
+            await asyncio.wait_for(self._discard_call(self._user_id, False), HANG_UP_TIMEOUT)
+        except BaseException as e:
+            log.error("call %d for %s: phone.discardCall FAILED (%s): %s; the owner's phone may keep a "
+                      "half-open call", self._generation, self._caller, why, describe(e))
+            self._event("discard_failed", why=why, error=describe(e))
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            return
+        log.info("call %d for %s: sent phone.discardCall (%s)", self._generation, self._caller, why)
+        self._event("discard_sent", why=why)
 
     # ------------------------------------------------------------ call / hang up
 
@@ -886,6 +980,8 @@ class TelegramLink:
         if isinstance(error, NotInCallError):
             log.info("call ended by the other side (the library dropped the call)")
             self._end_call(END_REMOTE)
+            if self._claim_discard():   # ntgcalls dropped it: nothing has told Telegram yet
+                asyncio.ensure_future(self._send_discard("the pump found the call gone from ntgcalls"))
             return
         log.error("raw-frame pump stopped (%s); ending the call", describe(error))
         self._event("pump_failed", error=describe(error))

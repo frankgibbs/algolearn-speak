@@ -51,10 +51,32 @@ class FakeTelethon:
         pass
 
 
+class FakeApp:
+    """py-tgcalls' Telethon bridge (PyTgCalls._app): its input-call cache and phone.discardCall."""
+
+    def __init__(self):
+        self.input_call = None
+        self.discards: list = []
+        self.discard_error: BaseException | None = None
+
+    async def get_input_call(self, chat_id):
+        return self.input_call
+
+    async def discard_call(self, chat_id, is_missed):
+        self.discards.append((chat_id, is_missed))
+        if self.discard_error:
+            raise self.discard_error
+        self.input_call = None   # like the library: drop_cache after the request
+
+
 class FakeCalls:
     """Scripted stand-in for PyTgCalls. `ring` is "answer", or an exception to raise from play()."""
 
     def __init__(self, client, ring="answer"):
+        self._app = FakeApp()
+        self._wait_connect: dict = {}
+        self.cleared: list = []
+        self.library_connection_changes: list = []
         self.ring = ring
         self.ring_forever = False
         self.fail_record: BaseException | None = None
@@ -77,12 +99,19 @@ class FakeCalls:
     async def _handle_mtproto_updates(self, update):
         pass
 
+    async def _handle_connection_changed(self, chat_id, net_state):
+        self.library_connection_changes.append((chat_id, net_state.state))
+
+    def _clear_cache(self, chat_id):
+        self.cleared.append(chat_id)
+
     async def start(self):
         self.mtproto_handler = self._handle_mtproto_updates   # as py-tgcalls' start() registers it
 
     async def play(self, chat_id, stream, config=None):
         self.plays.append((chat_id, stream, config))
         if config is not None:   # the ringing play()
+            self._app.input_call = ("input-call", len(self.plays))   # Telethon caches it on PhoneCallRequested
             await asyncio.sleep(0.01)
             while self.ring_forever:
                 await asyncio.sleep(0.01)
@@ -106,6 +135,7 @@ class FakeCalls:
 
     async def leave_call(self, chat_id):
         self.left += 1
+        self._app.input_call = None   # leave_call's own discard_call drops the cache
 
 
 class StubVAD:
@@ -177,6 +207,135 @@ class LinkCase(unittest.TestCase):
             if time.monotonic() > deadline:
                 self.fail("condition not met in time")
             time.sleep(0.01)
+
+
+def net(state):
+    """ntgcalls' ConnectionInfo as the connection-change callback receives it."""
+    return SimpleNamespace(state=state, kind=ntgcalls.ConnectionKind.NORMAL)
+
+
+class TestLibraryDropDiscards(LinkCase):
+    """py-tgcalls 3.0.0 drops a connected call without telling Telegram (its handler's
+    discard_call TypeError is swallowed); the link sends phone.discardCall itself, once."""
+
+    def connection(self, state, chat_id=USER_ID):
+        asyncio.run_coroutine_threadsafe(self.calls._handle_connection_changed(chat_id, net(state)),
+                                         self.link._loop).result(5)
+
+    def answered(self):
+        self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER), tg.ANSWERED)
+
+    def named(self, name):
+        return events_named(self.link, name)
+
+    def test_a_drop_ends_the_call_and_discards_it(self):
+        self.answered()
+        with self.assertLogs("speak.telegram", "INFO") as logs:
+            self.connection(ntgcalls.ConnectionState.FAILED)
+        self.assertEqual((self.link.state(), self.link.info()["end_reason"]), (tg.NONE, tg.END_REMOTE))
+        self.assertEqual(self.calls._app.discards, [(USER_ID, False)])
+        self.assertEqual(self.calls.cleared, [USER_ID])
+        self.assertEqual(self.calls.library_connection_changes, [])   # its broken branch never runs
+        (drop,) = [e for e in self.named("connection_state") if e.get("library_drop")]
+        self.assertEqual((drop["connection"], drop["caller"]["session_id"]), ("FAILED", "feedc0de"))
+        self.assertEqual(self.named("discard_sent")[0]["why"], "ntgcalls connection FAILED")
+        self.assertTrue(any("ntgcalls connection state for chat 4242: FAILED" in m for m in logs.output))
+        time.sleep(0.05)
+        self.assertEqual(len(self.calls._app.discards), 1)
+
+    def test_the_pump_seeing_the_drop_first_discards_once(self):
+        from pytgcalls.exceptions import NotInCallError
+        self.answered()
+        self.calls.fail_send = NotInCallError()
+        self.wait_until(lambda: self.calls._app.discards)
+        self.connection(ntgcalls.ConnectionState.CLOSED)   # the library's callback, late
+        self.assertEqual(self.calls._app.discards, [(USER_ID, False)])
+        self.assertEqual(self.named("discard_sent")[0]["why"], "the pump found the call gone from ntgcalls")
+        self.assertEqual(self.calls.cleared, [USER_ID])
+
+    def test_hang_up_after_a_silent_drop_sends_the_discard(self):
+        from pytgcalls.exceptions import NotInCallError
+        self.answered()
+
+        async def gone(chat_id):   # leave_call raises before its own discard_call (leave_call.py:33)
+            raise NotInCallError()
+        self.calls.leave_call = gone
+        self.assertEqual(self.link.hang_up(), tg.HUNG_UP)
+        self.assertEqual(self.calls._app.discards, [(USER_ID, False)])
+        self.assertEqual(len(self.named("leave_not_in_call")), 1)
+
+    def test_a_normal_hang_up_leaves_the_discard_to_leave_call(self):
+        self.answered()
+        self.assertEqual(self.link.hang_up(), tg.HUNG_UP)
+        self.connection(ntgcalls.ConnectionState.CLOSED)   # leaving closes the connection
+        self.assertEqual((self.calls.left, self.calls._app.discards), (1, []))
+        self.assertEqual(self.named("discard_sent"), [])
+
+    def test_a_failed_discard_is_logged_loudly_and_not_retried(self):
+        self.answered()
+        self.calls._app.discard_error = RuntimeError("CALL_PEER_INVALID")
+        with self.assertLogs("speak.telegram", "ERROR") as logs:
+            self.connection(ntgcalls.ConnectionState.TIMEOUT)
+        self.assertIn("phone.discardCall FAILED (ntgcalls connection TIMEOUT): RuntimeError: CALL_PEER_INVALID",
+                      "\n".join(logs.output))
+        self.assertEqual(self.named("discard_failed")[0]["error"], "RuntimeError: CALL_PEER_INVALID")
+        self.assertEqual(len(self.calls._app.discards), 1)
+        self.assertEqual(self.link.state(), tg.NONE)
+
+    def test_an_error_in_the_observer_is_logged_not_lost(self):
+        self.answered()
+        with mock.patch.object(self.link, "_end_call", side_effect=RuntimeError("boom")), \
+                self.assertLogs("speak.telegram", "ERROR") as logs:
+            self.connection(ntgcalls.ConnectionState.FAILED)
+        self.assertIn("connection-change handling failed for chat 4242: RuntimeError: boom", "\n".join(logs.output))
+        self.assertEqual(self.named("connection_handler_failed")[0]["error"], "RuntimeError: boom")
+
+    def test_a_failed_input_call_lookup_is_a_failed_discard(self):
+        self.answered()
+
+        async def lookup_fails(chat_id):
+            raise RuntimeError("lookup failed")
+        with mock.patch.object(self.link, "_get_input_call", lookup_fails), \
+                self.assertLogs("speak.telegram", "ERROR") as logs:
+            self.connection(ntgcalls.ConnectionState.FAILED)
+        self.assertIn("phone.discardCall FAILED (ntgcalls connection FAILED): RuntimeError: lookup failed",
+                      "\n".join(logs.output))
+        self.assertEqual(self.calls._app.discards, [])
+
+    def test_no_cached_input_call_is_reported(self):
+        self.answered()
+        self.calls._app.input_call = None   # Telegram's PhoneCallDiscarded already dropped it
+        self.connection(ntgcalls.ConnectionState.CLOSED)
+        self.assertEqual(self.calls._app.discards, [])
+        self.assertEqual(self.named("discard_not_sent")[0]["reason"], "no input call cached")
+
+    def test_connecting_states_go_to_the_library(self):
+        self.calls._wait_connect[USER_ID] = object()
+        for state in (ntgcalls.ConnectionState.CONNECTING, ntgcalls.ConnectionState.CONNECTED,
+                      ntgcalls.ConnectionState.FAILED):
+            self.connection(state)
+        self.connection(ntgcalls.ConnectionState.FAILED, chat_id=-100)   # another chat
+        self.assertEqual(self.calls.library_connection_changes,
+                         [(USER_ID, ntgcalls.ConnectionState.CONNECTING), (USER_ID, ntgcalls.ConnectionState.CONNECTED),
+                          (USER_ID, ntgcalls.ConnectionState.FAILED), (-100, ntgcalls.ConnectionState.FAILED)])
+        self.assertEqual(len(self.named("connection_state")), 4)
+        self.assertEqual(self.calls._app.discards, [])
+
+    def test_a_late_drop_while_the_next_call_rings_is_ignored(self):
+        self.calls.ring_forever = True
+        t = threading.Thread(target=lambda: self._call_quietly())
+        t.start()
+        self.wait_until(lambda: self.link.state() == tg.RINGING)
+        self.connection(ntgcalls.ConnectionState.CLOSED)
+        self.assertEqual((self.link.state(), self.calls._app.discards, self.calls.cleared), (tg.RINGING, [], []))
+        self.link.hang_up()
+        t.join(5)
+
+    def _call_quietly(self):
+        try:
+            self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        except BaseException:
+            pass
 
 
 class TestCallAnswered(LinkCase):
