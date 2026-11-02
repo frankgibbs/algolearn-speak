@@ -88,7 +88,8 @@ daemon = [
     { name = "faster-whisper" },
     { name = "kokoro" },
     { name = "misaki", extra = ["en"] },
-    { name = "ntgcalls" },
+    { name = "ntgcalls", version = "3.0.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "ntgcalls", version = "3.0.5+dev.f302ea8a", source = { path = "vendor/ntgcalls-3.0.5+dev.f302ea8a-cp312-cp312-manylinux_2_28_x86_64.whl" }, marker = "sys_platform == 'linux'" },
     { name = "numpy" },
     { name = "py-tgcalls" },
     { name = "scipy" },
@@ -107,7 +108,8 @@ requires-dist = [
     { name = "kokoro", marker = "extra == 'daemon'", specifier = "==0.9.4" },
     { name = "mcp", specifier = ">=2.1,<3" },
     { name = "misaki", extras = ["en"], marker = "extra == 'daemon'", specifier = "==0.9.4" },
-    { name = "ntgcalls", marker = "extra == 'daemon'", specifier = "==3.0.2" },
+    { name = "ntgcalls", marker = "sys_platform == 'linux' and extra == 'daemon'", path = "vendor/ntgcalls-3.0.5+dev.f302ea8a-cp312-cp312-manylinux_2_28_x86_64.whl" },
+    { name = "ntgcalls", marker = "sys_platform != 'linux' and extra == 'daemon'", specifier = "==3.0.5" },
     { name = "numpy", marker = "extra == 'daemon'", specifier = ">=1.26" },
     { name = "py-tgcalls", marker = "extra == 'daemon'", specifier = "==3.0.0" },
     { name = "scipy", marker = "extra == 'daemon'", specifier = ">=1.11" },
@@ -1014,15 +1016,31 @@ wheels = [
 
 [[package]]
 name = "ntgcalls"
-version = "3.0.2"
+version = "3.0.5"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e0/9f/2fd050ea71b1eca6809df267a3619147475fb171cd79094c240e6d7c91f1/ntgcalls-3.0.2.tar.gz", hash = "sha256:53bd3ca7ae0d0d46e3ce0f7521f0bdaed1fb47f47d11c859334246c0e0887b56", size = 20640840, upload-time = "2026-10-06T19:57:08.829Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ea/8b/fad68c19b834d86fd40e12bfaed1efd6a7ab0c76cf16b76fa568e572a045/ntgcalls-3.0.2-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:28a519f2baa7098dc321a70125026b7e792cb4e6b140af5b0d7d03ad1a226162", size = 11012807, upload-time = "2026-10-06T19:56:11.616Z" },
-    { url = "https://files.pythonhosted.org/packages/6d/61/c63de41482762689babe9735f5812319e7a262d43db67dcbd127e7842a0a/ntgcalls-3.0.2-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:396919c4b18b89b7f87e48914fe482fdb30ac6625d2c39be8036b90f5d2f655d", size = 38484043, upload-time = "2026-10-06T19:56:15.896Z" },
-    { url = "https://files.pythonhosted.org/packages/04/43/29755f4e9a1c07b16c5e05df85308e6e35bf4c7b270c52677d7db12d896a/ntgcalls-3.0.2-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:2cf8ce88ad93d24e95c1deaaf132e294f9019e90fdc209f72d1409a53bec7328", size = 42567838, upload-time = "2026-10-06T19:56:20.733Z" },
-    { url = "https://files.pythonhosted.org/packages/7b/45/f482ad457ab548254ebce8a15a4d88989b6813df94c75f23fdd6bba4ea66/ntgcalls-3.0.2-cp312-cp312-win_amd64.whl", hash = "sha256:cf239fa01afb08592f783fa455cb910f08ca611ccd38054af7bc767023a65cf5", size = 11008735, upload-time = "2026-10-06T19:56:23.963Z" },
+resolution-markers = [
+    "sys_platform != 'linux'",
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/af/6c/05016f20c9fc0e23298ef868ba47cb1089990becb35b09b71812706d7de5/ntgcalls-3.0.5.tar.gz", hash = "sha256:24b2783ccf71fe1526f7c130f5b40a8b990d21db61616a07156ccc46bc030def", size = 20721540, upload-time = "2026-10-19T21:54:15.836Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9e/14/7541b283120ade94cbe2a2b7648b9108c7bf31d9a3fe3cbcecd576b3bef2/ntgcalls-3.0.5-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:e69353979ea0804409f388f20b8f01af92d177e4b2fdc804a8c1f3c9acd63bcd", size = 11048444, upload-time = "2026-10-19T21:53:34.385Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/ee/6ba5526a7dd5713bd4fe294073179305a89fd63e04adede2f15a99b7c9ff/ntgcalls-3.0.5-cp312-cp312-win_amd64.whl", hash = "sha256:593f489ad5a47b008463e21b65f369351dbb8947de8af82055cd1765fc51d89f", size = 11044788, upload-time = "2026-10-19T21:53:43.682Z" },
+]
+
+[[package]]
+name = "ntgcalls"
+version = "3.0.5+dev.f302ea8a"
+source = { path = "vendor/ntgcalls-3.0.5+dev.f302ea8a-cp312-cp312-manylinux_2_28_x86_64.whl" }
+resolution-markers = [
+    "sys_platform == 'linux'",
+]
+wheels = [
+    { filename = "ntgcalls-3.0.5+dev.f302ea8a-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:f1cd5c5736be00494d45e91e2ecbec855185cacf07583c04b4f93421eb0b800c" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "pytest", marker = "extra == 'test'", specifier = ">=6.0" }]
+provides-extras = ["test"]
 
 [[package]]
 name = "num2words"
@@ -1341,7 +1359,8 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
     { name = "deprecation" },
-    { name = "ntgcalls" },
+    { name = "ntgcalls", version = "3.0.5", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
+    { name = "ntgcalls", version = "3.0.5+dev.f302ea8a", source = { path = "vendor/ntgcalls-3.0.5+dev.f302ea8a-cp312-cp312-manylinux_2_28_x86_64.whl" }, marker = "sys_platform == 'linux'" },
 ]
 wheels = [
     { url = "https://files.pythonhosted.org/packages/de/94/e2a63c588d9caf3198ba9637d0ccff5c19895a9f7d50087f4679492df662/py_tgcalls-3.0.0-py3-none-any.whl", hash = "sha256:c736066f3f79804f6f128231f4adad228e6aefb3418a473e0a52175c0a8baf49", size = 85503, upload-time = "2026-09-25T13:31:11.171Z" },

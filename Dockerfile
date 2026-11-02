@@ -30,6 +30,8 @@ WORKDIR /app
 # Dependencies first (cached across code changes), exactly as locked: --locked fails the build
 # when uv.lock does not match pyproject.toml.
 COPY pyproject.toml uv.lock ./
+# ntgcalls built from upstream commit f302ea8a (pyproject.toml explains why); uv.lock pins its hash.
+COPY vendor/ntgcalls-3.0.5+dev.f302ea8a-cp312-cp312-manylinux_2_28_x86_64.whl vendor/
 RUN uv sync --locked --extra daemon --no-install-project --python 3.12
 
 # The code. .dockerignore keeps .env, .git, .venv, tests and docs out of the build context.
