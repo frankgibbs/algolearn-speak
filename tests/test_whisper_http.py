@@ -23,7 +23,7 @@ import numpy as np
 
 import speak_protocol as proto
 import speak_telegram_daemon as d
-from test_hold import temp_personas
+from test_hold import temp_missed, temp_personas
 
 
 class FakeEngines:
@@ -76,7 +76,7 @@ class HttpCase(unittest.TestCase):
     def setUp(self):
         self.engines = FakeEngines()
         self.link = FakeLink()
-        self.daemon = d.SpeakDaemon(self.link, self.engines, temp_personas(), SETTINGS, d.DebugControl(), port=0, http_port=0)
+        self.daemon = d.SpeakDaemon(self.link, self.engines, temp_personas(), temp_missed(), SETTINGS, d.DebugControl(), port=0, http_port=0)
         self.link.daemon = self.daemon
         self.daemon.start()
         self.addCleanup(self.daemon.stop)
@@ -416,7 +416,7 @@ class TestPeerLeft(unittest.TestCase):
 class TestStartup(unittest.TestCase):
     def test_nothing_binds_before_the_link_has_started(self):
         link = FakeLink()
-        daemon = d.SpeakDaemon(link, FakeEngines(), temp_personas(), SETTINGS, d.DebugControl(), port=0, http_port=0)
+        daemon = d.SpeakDaemon(link, FakeEngines(), temp_personas(), temp_missed(), SETTINGS, d.DebugControl(), port=0, http_port=0)
         link.daemon = daemon
         daemon.start()
         self.addCleanup(daemon.stop)
@@ -426,7 +426,7 @@ class TestStartup(unittest.TestCase):
         class FailingLink(FakeLink):
             def start(self):
                 raise RuntimeError("telegram login revoked")
-        daemon = d.SpeakDaemon(FailingLink(), FakeEngines(), temp_personas(), SETTINGS, d.DebugControl(), port=0, http_port=0)
+        daemon = d.SpeakDaemon(FailingLink(), FakeEngines(), temp_personas(), temp_missed(), SETTINGS, d.DebugControl(), port=0, http_port=0)
         with self.assertRaises(RuntimeError):
             daemon.start()
         self.assertIsNone(daemon._server)
@@ -441,7 +441,7 @@ class TestStartup(unittest.TestCase):
         with socket.socket() as probe:   # a free port for 8765's stand-in, checked free after the failure
             probe.bind(("0.0.0.0", 0))
             tool_port = probe.getsockname()[1]
-        daemon = d.SpeakDaemon(FakeLink(), FakeEngines(), temp_personas(), SETTINGS, d.DebugControl(), port=tool_port,
+        daemon = d.SpeakDaemon(FakeLink(), FakeEngines(), temp_personas(), temp_missed(), SETTINGS, d.DebugControl(), port=tool_port,
                                http_port=taken)
         daemon.link.daemon = daemon
         with self.assertRaises(OSError):
@@ -453,7 +453,7 @@ class TestStartup(unittest.TestCase):
 
     def test_the_tool_port_still_answers(self):
         link = FakeLink()
-        daemon = d.SpeakDaemon(link, FakeEngines(), temp_personas(), SETTINGS, d.DebugControl(), port=0, http_port=0)
+        daemon = d.SpeakDaemon(link, FakeEngines(), temp_personas(), temp_missed(), SETTINGS, d.DebugControl(), port=0, http_port=0)
         link.daemon = daemon
         daemon.start()
         self.addCleanup(daemon.stop)
@@ -463,7 +463,7 @@ class TestStartup(unittest.TestCase):
         self.assertIs(reply["ok"], True)
 
     def test_default_ports(self):
-        daemon = d.SpeakDaemon(FakeLink(), FakeEngines(), temp_personas(), SETTINGS, d.DebugControl())
+        daemon = d.SpeakDaemon(FakeLink(), FakeEngines(), temp_personas(), temp_missed(), SETTINGS, d.DebugControl())
         self.assertEqual((daemon.port, daemon.http_port), (8765, 9000))
 
 

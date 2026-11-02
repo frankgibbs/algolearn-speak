@@ -95,8 +95,12 @@ OP_PING, OP_STATUS, OP_DEBUG, OP_SET_DEBUG = "ping", "status", "debug", "set_deb
 OP_SPEAK, OP_LISTEN, OP_CONVERSE, OP_CALL, OP_HANG_UP = "speak", "listen", "converse", "call", "hang_up"
 OP_PERSONA, OP_PERSONA_NEW, OP_PERSONA_SET, OP_PERSONA_ADD = "persona", "persona_new", "persona_set", "persona_add"
 PERSONA_OPS = frozenset({OP_PERSONA, OP_PERSONA_NEW, OP_PERSONA_SET, OP_PERSONA_ADD})   # versioned, identity, no lock
-QUICK_OPS = frozenset({OP_PING, OP_STATUS, OP_DEBUG, OP_SET_DEBUG}) | PERSONA_OPS
-VERSIONLESS_OPS = frozenset({OP_STATUS, OP_DEBUG, OP_SET_DEBUG})   # served to a client of any protocol
+# The unreturned missed calls (owner decision 2026-11-02): reply {"missed_calls": [{"session_id",
+# "project", "persona", "time", "first_time", "outcome", "missed"}]}. Read-only and versionless like
+# status. No version bump: an older client never sends it, and an older daemon answers it "unknown op".
+OP_MISSED_CALLS = "missed_calls"
+QUICK_OPS = frozenset({OP_PING, OP_STATUS, OP_DEBUG, OP_SET_DEBUG, OP_MISSED_CALLS}) | PERSONA_OPS
+VERSIONLESS_OPS = frozenset({OP_STATUS, OP_DEBUG, OP_SET_DEBUG, OP_MISSED_CALLS})   # served to a client of any protocol
 LOCKED_OPS = frozenset({OP_SPEAK, OP_LISTEN, OP_CONVERSE, OP_CALL, OP_HANG_UP})
 VOICED_OPS = frozenset({OP_SPEAK, OP_CONVERSE, OP_CALL})   # refused before the lock on a stale persona_seen
 PHASE_STARTED = "started"

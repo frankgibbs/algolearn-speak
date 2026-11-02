@@ -36,7 +36,7 @@ import speak_protocol as proto  # noqa: E402
 import speak_server as client  # noqa: E402
 import speak_telegram as tg  # noqa: E402
 import speak_telegram_daemon as d  # noqa: E402
-from test_speak_telegram import LinkCase, events_named, sine, speech_frames  # noqa: E402
+from test_speak_telegram import CALLER, LinkCase, events_named, sine, speech_frames  # noqa: E402
 
 RATE = 24000
 SILENCE = bytes(tg.FRAME_BYTES)
@@ -69,7 +69,7 @@ class Classifier:
 class WatchCase(LinkCase):
     def setUp(self):
         super().setUp()
-        self.link.call(np.zeros(100, dtype=np.float32), RATE)
+        self.link.call(np.zeros(100, dtype=np.float32), RATE, CALLER)
 
     def loud(self, frames):
         return [f for f in frames if f != SILENCE]
@@ -362,6 +362,14 @@ class Clock:
 TEST_VOICES = ["af_bella", "af_heart", "am_adam", "bf_emma", "bm_george"]
 
 
+def temp_missed() -> d.MissedCalls:
+    """An empty missed-calls list in a fresh temporary directory (removed with the store)."""
+    tmp = tempfile.mkdtemp(prefix="speak-missed-")
+    store = d.MissedCalls.open(os.path.join(tmp, "missed_calls.json"), zoneinfo.ZoneInfo("America/Los_Angeles"))
+    weakref.finalize(store, shutil.rmtree, tmp, True)
+    return store
+
+
 def temp_personas(record_event=lambda event, **fields: None) -> sp.PersonaStore:
     """A persona store in a fresh temporary directory (removed with the store), seeded with
     Angie on af_heart at 1.0 as the daemon seeds it."""
@@ -508,7 +516,7 @@ for _name in ("speak", "listen", "converse", "call", "hang_up"):
 def locked_service(link, engines, settings: dict, record_event, personas: sp.PersonaStore | None = None) -> LockedService:
     """`personas` defaults to a fresh store whose events are not recorded (the link's event
     list stays the service's own)."""
-    return LockedService(link, engines, personas if personas is not None else temp_personas(), settings,
+    return LockedService(link, engines, personas if personas is not None else temp_personas(), temp_missed(), settings,
                          ServiceLock(record_event))
 
 
@@ -698,7 +706,8 @@ class TestPhraseSettings(unittest.TestCase):
         env = {"SPEAK_KOKORO_MODEL": "m", "SPEAK_VOICE": "af_heart", "SPEAK_SPEED": "1.0",
                "SPEAK_WHISPER_MODEL": "w", "SPEAK_LANGUAGE": "en", "SPEAK_QUIET_HOURS": "22:00-07:00",
                "SPEAK_HOLD_PHRASE": "hold on", "SPEAK_RESUME_PHRASE": "continue", "TZ": "America/Los_Angeles",
-               "SPEAK_PERSONAS_FILE": "/var/lib/speak/personas.json"}
+               "SPEAK_PERSONAS_FILE": "/var/lib/speak/personas.json",
+               "SPEAK_MISSED_CALLS_FILE": "/var/lib/speak/missed_calls.json"}
         with mock.patch.dict(os.environ, env):
             self.assertEqual(d.load_settings()["phrases"], {"hold on": proto.CMD_HOLD, "continue": proto.CMD_RESUME})
         env.pop("SPEAK_HOLD_PHRASE")

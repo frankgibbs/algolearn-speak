@@ -287,7 +287,7 @@ class TestPersonaVoices(SwitchCase):
     def test_the_greeting_is_in_the_callers_voice(self):
         self.link._state = tg.NONE
 
-        def dial(audio, rate):   # the greeting is synthesized before the dial; stop there
+        def dial(audio, rate, caller):   # the greeting is synthesized before the dial; stop there
             raise RuntimeError("not dialed in this test")
         self.link.call = dial
         with self.assertRaisesRegex(RuntimeError, "not dialed"):

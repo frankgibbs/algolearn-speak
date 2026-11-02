@@ -27,9 +27,10 @@ services:
       SPEAK_HOLD_PHRASE: "hold on"       # said alone while a persona speaks: it stops and holds
       SPEAK_RESUME_PHRASE: "continue"    # said alone while held: it restarts the cut sentence
       SPEAK_PERSONAS_FILE: /var/lib/speak/personas.json   # docs/DESIGN_PERSONAS.md; seeded with Angie when missing
+      SPEAK_MISSED_CALLS_FILE: /var/lib/speak/missed_calls.json   # unreturned missed calls; created empty when missing
     volumes:
       - speak_models:/root/.cache/huggingface   # models download once, not on every rebuild
-      - speak_state:/var/lib/speak              # the persona registry survives rebuilds
+      - speak_state:/var/lib/speak              # the persona registry and missed calls survive rebuilds
     stop_grace_period: 30s            # a hang-up (<= 10 s) and the disconnect (<= 5 s) finish first
     deploy:
       resources:

@@ -29,7 +29,7 @@ import speak_server as client  # noqa: E402
 import speak_telegram as tg  # noqa: E402
 import speak_telegram_daemon as d  # noqa: E402
 from test_daemon_wire import ID_A, ID_B, TurnLink, as_session, seen_key, short_floor  # noqa: E402
-from test_hold import NEVER_LEFT, SETTINGS, FakeEngines, HoldServiceCase, ScriptedLink, locked_service, temp_personas  # noqa: E402
+from test_hold import NEVER_LEFT, SETTINGS, FakeEngines, HoldServiceCase, ScriptedLink, locked_service, temp_missed, temp_personas  # noqa: E402
 
 A = d.Speaker("session-a", "algolearn-speak")
 B = d.Speaker("session-b", "algolearn-hedge")
@@ -358,7 +358,7 @@ class DialLink(ScriptedLink):
         self.outcome = tg.ANSWERED
         self.no_speech = False
 
-    def call(self, audio, rate) -> str:
+    def call(self, audio, rate, caller) -> str:
         self.log.append(("dial",))
         if self.outcome == tg.ANSWERED:
             self._state = tg.CONNECTED
@@ -685,7 +685,7 @@ class WireCase(unittest.TestCase):
     def setUp(self):
         self.link = GateLink()
         self.engines = FakeEngines([])
-        self.daemon = d.SpeakDaemon(self.link, self.engines, temp_personas(), SETTINGS, d.DebugControl(), port=0,
+        self.daemon = d.SpeakDaemon(self.link, self.engines, temp_personas(), temp_missed(), SETTINGS, d.DebugControl(), port=0,
                                     http_port=0)
         short_floor(self.daemon, self.link, self.IDLE)
         self.daemon.start()

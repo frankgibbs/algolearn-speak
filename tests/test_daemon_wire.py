@@ -25,7 +25,7 @@ import speak_protocol as proto  # noqa: E402
 import speak_server as client  # noqa: E402
 import speak_telegram as tg  # noqa: E402
 import speak_telegram_daemon as d  # noqa: E402
-from test_hold import SETTINGS, FakeEngines, temp_personas  # noqa: E402
+from test_hold import SETTINGS, FakeEngines, temp_missed, temp_personas  # noqa: E402
 
 ID_A = {proto.FIELD_SESSION_ID: "session-a", proto.FIELD_PROJECT: "algolearn-speak"}
 ID_B = {proto.FIELD_SESSION_ID: "session-b", proto.FIELD_PROJECT: "algolearn-hedge"}
@@ -112,7 +112,7 @@ class HoldingLink:
 class DaemonCase(unittest.TestCase):
     def setUp(self):
         self.link = HoldingLink()
-        self.daemon = d.SpeakDaemon(self.link, FakeEngines([]), temp_personas(), SETTINGS, d.DebugControl(), port=0, http_port=0)
+        self.daemon = d.SpeakDaemon(self.link, FakeEngines([]), temp_personas(), temp_missed(), SETTINGS, d.DebugControl(), port=0, http_port=0)
         self.daemon.start()
         self.addCleanup(self.daemon.stop)
         self.addr = ("127.0.0.1", self.daemon._server.server_address[1])
@@ -351,7 +351,7 @@ class TurnLink:
     def record_unbound_event(self, event: str, **fields) -> None:
         self.events.record(None, event, **fields)
 
-    def call(self, audio, rate) -> str:
+    def call(self, audio, rate, caller) -> str:
         self.generation += 1
         self._state = tg.CONNECTED
         self.log.append("greeting")
@@ -380,7 +380,7 @@ class TestSessionSwitchOverTheWire(unittest.TestCase):
     def setUp(self):
         self.link = TurnLink()
         self.engines = FakeEngines([])
-        self.daemon = d.SpeakDaemon(self.link, self.engines, temp_personas(), SETTINGS, d.DebugControl(), port=0, http_port=0)
+        self.daemon = d.SpeakDaemon(self.link, self.engines, temp_personas(), temp_missed(), SETTINGS, d.DebugControl(), port=0, http_port=0)
         short_floor(self.daemon, self.link, 0.2)   # B's ops wait out A's floor (docs/DESIGN_FLOOR.md)
         self.daemon.start()
         self.addCleanup(self.daemon.stop)
@@ -457,7 +457,7 @@ class TestPersonasOverTheWire(unittest.TestCase):
     def setUp(self):
         self.link = TurnLink()
         self.engines = FakeEngines([])
-        self.daemon = d.SpeakDaemon(self.link, self.engines, temp_personas(), SETTINGS, d.DebugControl(), port=0,
+        self.daemon = d.SpeakDaemon(self.link, self.engines, temp_personas(), temp_missed(), SETTINGS, d.DebugControl(), port=0,
                                     http_port=0)
         self.daemon.start()
         self.addCleanup(self.daemon.stop)

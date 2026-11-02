@@ -21,6 +21,8 @@ Telegram call placed by that daemon; there is no local microphone or speaker.
                   -> change this project's persona (docs/DESIGN_PERSONAS.md)
   status()        -> whether the tools are busy, how many requests are queued,
                      and the call state
+  missed_calls()  -> the unreturned missed calls: which sessions' calls the owner
+                     missed and that have not talked with him since
   call_debug()    -> the daemon's recent call events and log tail
   set_call_debug()-> toggle the daemon's DEBUG logging at runtime
 
@@ -427,6 +429,10 @@ def _set_call_debug_sync(enabled: bool) -> dict:
         return _strip(_request(proto.OP_SET_DEBUG, {"enabled": enabled}, QUICK_REPLY_TIMEOUT_SECONDS))
     except DaemonUnreachable as e:
         return {"daemon": f"unreachable: {e}"}
+
+
+def _missed_calls_sync() -> dict:
+    return _strip(_request(proto.OP_MISSED_CALLS, {}, QUICK_REPLY_TIMEOUT_SECONDS))
 
 
 def _persona_sync() -> dict:
@@ -877,6 +883,22 @@ async def set_persona(name: str | None = None, voice: dict[str, float] | None = 
 """)
 async def add_to_personality(note: str) -> dict:
     return await _run(_add_to_personality_sync, note)
+
+
+@mcp.tool()
+async def missed_calls() -> dict:
+    """The unreturned missed calls: every session whose call the owner did not answer, that
+    found him busy, or that he hung up on during the greeting, and that has not talked with
+    him on a connected call since. No time window: it is who is still waiting on him.
+
+    Returns `{"protocol": n, "missed_calls": [{"session_id", "project", "persona", "time",
+    "first_time", "outcome", "missed"}]}`, oldest `time` first: `persona` is the name the
+    call was placed as, `time` and `outcome` are the latest miss (local time), `first_time`
+    the first since the session last talked with him, `missed` how many. A session leaves
+    the list when it next speaks, listens or converses on a connected call, or its call()
+    is answered. Never blocks on the audio lock; raises when the daemon is unreachable.
+    """
+    return await _run(_missed_calls_sync)
 
 
 @mcp.tool()

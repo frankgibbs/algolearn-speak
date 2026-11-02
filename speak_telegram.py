@@ -115,6 +115,22 @@ class Classified:
 
 
 @dataclasses.dataclass(frozen=True)
+class Caller:
+    """Who placed a call (owner decision 2026-11-02): every call comes from one Telegram
+    account, so each call's events carry this as "caller" and its log lines name it, so a
+    missed call says which session placed it."""
+    persona: str      # the persona name the greeting was spoken as
+    project: str      # the client's project (folder basename)
+    session_id: str   # the client process's session id
+
+    def fields(self) -> dict:
+        return {"persona": self.persona, "project": self.project, "session_id": self.session_id}
+
+    def __str__(self) -> str:
+        return f"{self.persona} ({self.project}, session {self.session_id})"
+
+
+@dataclasses.dataclass(frozen=True)
 class PlayOutcome:
     """play_watched's result. `command` is None when everything played."""
     command: str | None
@@ -424,6 +440,7 @@ class TelegramLink:
         self._incoming_seen = False
         self._call_id: str | None = None
         self._call_t0 = 0.0
+        self._caller: Caller | None = None   # who placed the current/last call; set with _call_id
         self._accepted = False   # Telegram confirmed the callee accepted this call (see _start)
         # Amplitude diagnostics (all touched on the loop thread only). Frames are always counted;
         # the events are recorded only while debug is on (set_debug sets audio_stats), so they can't
@@ -447,6 +464,7 @@ class TelegramLink:
         """Record a call event for the current call (elapsed seconds since it was requested)."""
         if self._call_id is not None:
             fields["elapsed_s"] = round(time.monotonic() - self._call_t0, 3)
+            fields["caller"] = self._caller.fields()   # set with _call_id, never without it
         self.events.record(self._call_id, event, **fields)
 
     def record_event(self, event: str, **fields) -> None:
@@ -603,11 +621,14 @@ class TelegramLink:
 
     # ------------------------------------------------------------ call / hang up
 
-    def call(self, greeting: np.ndarray, rate: int) -> str:
+    def call(self, greeting: np.ndarray, rate: int, caller: Caller) -> str:
+        """Dial the owner with `greeting`; `caller` tags every event of the call and its log lines."""
+        if not isinstance(caller, Caller):
+            raise TypeError(f"caller must be a Caller, got {caller!r}")
         budget = REDIAL_SETTLE_SECONDS + RING_TIMEOUT_SECONDS + CONNECT_GRACE_SECONDS + len(greeting) / rate + 15.0
-        return self._run(self._call(greeting, rate), budget, "placing the call")
+        return self._run(self._call(greeting, rate, caller), budget, "placing the call")
 
-    async def _call(self, greeting: np.ndarray, rate: int) -> str:
+    async def _call(self, greeting: np.ndarray, rate: int, caller: Caller) -> str:
         from pytgcalls.exceptions import CallBusy, CallDeclined, CallDiscarded, TimedOutAnswer
         from pytgcalls.types import CallConfig, ExternalMedia, MediaStream, RecordStream
         from pytgcalls.types.raw import AudioParameters
@@ -631,8 +652,9 @@ class TelegramLink:
             for st in (self._in_stats, self._out_stats, self._out_audio_stats, self._opener_out_stats):
                 st.reset()
             self._out_silence_frames = 0
-            self._call_id, self._call_t0 = uuid.uuid4().hex[:8], time.monotonic()
+            self._call_id, self._call_t0, self._caller = uuid.uuid4().hex[:8], time.monotonic(), caller
             self._event("requested", generation=self._generation, target=self.target)
+            log.info("call %d (%s): dialing for %s", self._generation, self._call_id, caller)
             if self.audio_stats:
                 self._event("opener_written", duration_s=round(opener_seconds, 3), **wav_stats(opener))
             self._state = RINGING
@@ -643,12 +665,12 @@ class TelegramLink:
             except CallBusy as e:
                 # Telegram discarded the call as busy: the owner is on another call, or their app
                 # is still ending the previous one. Its own outcome, never "not answered".
-                log.info("call not placed: CallBusy")
+                log.info("call not placed for %s: CallBusy", caller)
                 self._event("busy", error=describe(e))
                 self._end_call(END_BUSY)
                 return BUSY
             except (CallDeclined, TimedOutAnswer, CallDiscarded) as e:
-                log.info("call not answered: %s", type(e).__name__)
+                log.info("call not answered for %s: %s", caller, type(e).__name__)
                 self._event({CallDeclined: "declined", TimedOutAnswer: "timeout",
                              CallDiscarded: "discarded"}[type(e)], error=describe(e))
                 self._end_call(END_NOT_ANSWERED)
@@ -658,7 +680,7 @@ class TelegramLink:
                     return await self._audio_failed(e)
                 # No accepted/confirmed update for this call: py-tgcalls' clear_call raised this
                 # because the call was cleared before the callee took it (declined/discarded).
-                log.info("call not answered: TelegramServerError before the callee accepted")
+                log.info("call not answered for %s: TelegramServerError before the callee accepted", caller)
                 self._event("discarded_before_accept", error=describe(e))
                 self._end_call(END_NOT_ANSWERED)
                 return NOT_ANSWERED
@@ -703,7 +725,7 @@ class TelegramLink:
         finally:
             os.unlink(opener)
         self._event("connected")
-        log.info("call %d connected; raw-frame pump running", self._generation)
+        log.info("call %d connected for %s; raw-frame pump running", self._generation, caller)
         return ANSWERED
 
     async def _redial_settle(self) -> None:
@@ -758,8 +780,10 @@ class TelegramLink:
         is its own outcome, not a decline (owner decision 2026-10-12)."""
         if self._end_reason == END_HUNG_UP:
             self._event("hung_up_by_us_during_greeting")
+            log.info("call %d for %s: hung up by us during the greeting", self._generation, self._caller)
             return HUNG_UP
         self._event("hung_up_during_greeting")
+        log.info("call %d for %s: the owner hung up during the greeting", self._generation, self._caller)
         return HUNG_UP_DURING_GREETING
 
     async def _audio_failed(self, error: BaseException) -> str:
@@ -767,7 +791,7 @@ class TelegramLink:
         discard the call and report it distinctly from "not answered". The daemon then exits so
         compose's restart policy restarts it with fresh ntgcalls state (see SpeakDaemon)."""
         message = describe(error)
-        log.error("call %d: answered but audio failed to connect: %s", self._generation, message)
+        log.error("call %d for %s: answered but audio failed to connect: %s", self._generation, self._caller, message)
         self._event("audio_failed", error=message)
         await self._leave()
         self._end_call(END_FAILED)

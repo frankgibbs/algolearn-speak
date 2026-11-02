@@ -98,7 +98,7 @@ class FakeLink:
             self._state = tg.NONE
         return self.record_result
 
-    def call(self, audio, rate) -> str:
+    def call(self, audio, rate, caller) -> str:
         self.log.append(("dial", len(audio)))
         self._state = tg.CONNECTED
         return tg.ANSWERED

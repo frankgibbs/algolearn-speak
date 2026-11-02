@@ -22,6 +22,14 @@ persona's name or personality changed) is refused with the persona block, so not
 spoken or dialed in words written for another persona. A voice or speed change never
 refuses a turn: it is applied per sentence.
 
+Missed calls (owner decision 2026-11-02): every call comes from one Telegram account, so
+each call's events and log lines name the caller (persona, project, session id), and a call
+that was not answered, was busy, or that the owner hung up during the greeting puts its
+session on the MissedCalls list (the file SPEAK_MISSED_CALLS_FILE on the speak_state volume),
+"who is still waiting on the owner". The session leaves it the next time it talks with the
+owner on a connected call. The list is the quick op `missed_calls` and GET /missed-calls on
+port 9000.
+
 A second listener on HTTP 0.0.0.0:9000 replaces the retired whisper-service with
 its API (owner decision 2026-10-16): `POST /` takes raw 16 kHz mono int16 PCM and
 returns `{"text": ...}`, `GET /health` returns `{"status": "ok", "model", "device"}`.
@@ -87,7 +95,7 @@ DEBUG_LOGGERS = ("speak", "pytgcalls", "ntgcalls", "telethon")   # ntgcalls' nat
 REQUIRED_TELEGRAM_ENV = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_CALL_TARGET")
 REQUIRED_SPEAK_ENV = ("SPEAK_KOKORO_MODEL", "SPEAK_VOICE", "SPEAK_SPEED", "SPEAK_WHISPER_MODEL",
                       "SPEAK_LANGUAGE", "SPEAK_QUIET_HOURS", "SPEAK_HOLD_PHRASE", "SPEAK_RESUME_PHRASE",
-                      "SPEAK_PERSONAS_FILE", "TZ")
+                      "SPEAK_PERSONAS_FILE", "SPEAK_MISSED_CALLS_FILE", "TZ")
 BIND_HOST = "0.0.0.0"   # open to the LAN by design (owner decision 4); no auth, no TLS
 WHISPER_HTTP_PORT = 9000   # the retired whisper-service's port, so its clients need no change
 TRANSCRIBE_TOOL = "transcribe"   # how status names an HTTP transcription holding the audio lock
@@ -104,6 +112,12 @@ FLOOR_HOLD_EXPIRED, FLOOR_CLIENT_LEFT = "hold_expired", "client_left"
 # The daemon ends the call after a sign-off with nobody else queued (owner decision
 # 2026-10-28, docs/DESIGN_FLOOR.md): call_debug events.
 SIGNOFF_HANGUP_EVENT, SIGNOFF_HANGUP_FAILED_EVENT = "signoff_hangup", "signoff_hangup_failed"
+# Missed calls (owner decision 2026-11-02): the call() outcomes that put the calling session on
+# the list. HUNG_UP (another session's hang_up ended the ring) and an audio failure (the owner
+# answered) are not misses.
+MISSED_OUTCOMES = frozenset({tg.NOT_ANSWERED, tg.BUSY, tg.HUNG_UP_DURING_GREETING})
+MISSED_FILE_VERSION = 1
+MISSED_FIELDS = ("session_id", "project", "persona", "time", "first_time", "outcome", "missed")
 # A switch caused by a bare listen says this after the project name (owner decision 2026-10-20):
 # the ear opens right after, so a name alone would give the owner no context.
 SWITCH_LISTEN_SUFFIX = ", still listening"
@@ -429,6 +443,113 @@ class AudioLock:
         log.info("floor: %r releases it (%s), %d waiting", floor.project, reason, len(self._queue))
 
 
+# ------------------------------------------------------------------ missed calls
+
+class MissedCalls:
+    """The unreturned missed calls (owner decision 2026-11-02): one entry per client session
+    whose call was not answered, was busy, or was hung up during the greeting, kept until
+    that session next talks with the owner on a connected call. No time window: the list is
+    "who is still waiting on the owner".
+
+    Keyed by session id, not project: several sessions share a project (one folder), so a
+    project key would let one session's conversation clear another's missed call. The id
+    is generated once per client process (speak_server.init_identity), so it survives a
+    context summary but not a client restart; an entry from a session that has since gone
+    stays until removed by hand from the file.
+
+    Entry: {"session_id", "project", "persona" (the name the call was placed as), "time" (the
+    latest miss, local ISO), "first_time", "outcome" (the latest call() outcome), "missed"
+    (misses since the session last talked with the owner)}. Persisted as JSON
+    {"version": 1, "missed": [entries]} with the persona store's atomic write (<file>.tmp,
+    fsync, os.replace, directory fsync); a missing file starts the list empty and is
+    created, an unreadable or malformed one stops the daemon. Thread-safe: tool ops write
+    it under the audio lock, quick ops and the HTTP API read it without."""
+
+    def __init__(self, path: str, tz: datetime.tzinfo, entries: dict[str, dict]) -> None:
+        self.path = path
+        self.tz = tz
+        self._entries = entries
+        self._lock = threading.Lock()
+
+    @classmethod
+    def open(cls, path: str, tz: datetime.tzinfo) -> "MissedCalls":
+        directory = os.path.dirname(path) or "."
+        if not os.path.isdir(directory):
+            raise RuntimeError(f"SPEAK_MISSED_CALLS_FILE {path!r}: directory {directory!r} does not exist")
+        if not os.path.exists(path):
+            store = cls(path, tz, {})
+            store._write({})
+            log.info("missed calls: %s did not exist; created empty", path)
+            return store
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or data.get("version") != MISSED_FILE_VERSION or not isinstance(
+                data.get("missed"), list):
+            raise RuntimeError(f"missed calls file {path!r} is not version {MISSED_FILE_VERSION} "
+                               f"{{\"version\", \"missed\": [...]}}: {data!r}")
+        entries: dict[str, dict] = {}
+        for entry in data["missed"]:
+            if not isinstance(entry, dict) or set(entry) != set(MISSED_FIELDS):
+                raise RuntimeError(f"missed calls file {path!r}: bad entry {entry!r} (fields {MISSED_FIELDS})")
+            if entry["session_id"] in entries:
+                raise RuntimeError(f"missed calls file {path!r}: session {entry['session_id']!r} appears twice")
+            entries[entry["session_id"]] = entry
+        log.info("missed calls: %d unreturned in %s", len(entries), path)
+        return cls(path, tz, entries)
+
+    def _write(self, entries: dict[str, dict]) -> None:
+        """Atomic write, then the swap: memory changes only once the file has."""
+        tmp = self.path + ".tmp"
+        body = {"version": MISSED_FILE_VERSION, "missed": sorted(entries.values(), key=lambda e: e["time"])}
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(body, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.path)
+        self._entries = entries
+        fd = os.open(os.path.dirname(self.path) or ".", os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def record(self, caller: tg.Caller, outcome: str) -> dict:
+        """The session's call was missed: add it, or update its entry (latest time and outcome,
+        one more miss). Returns the entry."""
+        if outcome not in MISSED_OUTCOMES:
+            raise ValueError(f"{outcome!r} is not a missed-call outcome")
+        now = datetime.datetime.now(self.tz).isoformat(timespec="seconds")
+        with self._lock:
+            entries = {k: dict(v) for k, v in self._entries.items()}
+            previous = entries.get(caller.session_id)
+            entry = {"session_id": caller.session_id, "project": caller.project, "persona": caller.persona,
+                     "time": now, "first_time": previous["first_time"] if previous else now,
+                     "outcome": outcome, "missed": previous["missed"] + 1 if previous else 1}
+            entries[caller.session_id] = entry
+            self._write(entries)
+        log.info("missed call recorded for %s: %s (%d unreturned for this session)", caller, outcome,
+                 entry["missed"])
+        return entry
+
+    def clear(self, speaker: "Speaker", why: str) -> dict | None:
+        """The session talked with the owner on a connected call: its entry (if any) is removed
+        and returned. No entry: nothing is written."""
+        with self._lock:
+            if speaker.session_id not in self._entries:
+                return None
+            entries = {k: dict(v) for k, v in self._entries.items()}
+            entry = entries.pop(speaker.session_id)
+            self._write(entries)
+        log.info("missed call returned for %s (%s, session %s): %s", entry["persona"], speaker.project,
+                 speaker.session_id, why)
+        return entry
+
+    def list(self) -> list[dict]:
+        """The unreturned missed calls, oldest latest-miss first."""
+        with self._lock:
+            return sorted((dict(e) for e in self._entries.values()), key=lambda e: e["time"])
+
+
 # ------------------------------------------------------------------ the tools
 
 @dataclasses.dataclass(frozen=True)
@@ -515,10 +636,12 @@ class SpeakService:
     Every method runs with the audio lock held; `lock` is that AudioLock, for the floor
     (take_floor where the turn moves, yield_floor where an op gives the floor up)."""
 
-    def __init__(self, link, engines: Engines, personas: PersonaStore, settings: dict, lock: AudioLock) -> None:
+    def __init__(self, link, engines: Engines, personas: PersonaStore, missed: MissedCalls, settings: dict,
+                 lock: AudioLock) -> None:
         self.link = link
         self.engines = engines
         self.personas = personas
+        self.missed = missed
         self.lock = lock
         self.quiet_hours = settings["SPEAK_QUIET_HOURS"]
         self.quiet_window = settings["quiet_window"]
@@ -624,6 +747,7 @@ class SpeakService:
             sess.switched_from = previous[1].project
         self._turn = (key, sess.speaker)
         self.lock.take_floor(sess.speaker)   # the floor moves with the turn
+        self.missed.clear(sess.speaker, f"{tool} on call {key}")   # talking with the owner: no longer waiting
 
     # -- audio
 
@@ -856,16 +980,26 @@ class SpeakService:
                 "and end with a question. Lengthen it with the context of why you are calling. If this is a fresh "
                 "conversation with nothing to report, open with something playful instead: a joke, something "
                 "funny or flirty.")
-        outcome = self.link.call(audio, TTS_RATE)
+        caller = tg.Caller(self.personas.persona_of(sess.speaker.project).name, sess.speaker.project,
+                           sess.speaker.session_id)
+        outcome = self.link.call(audio, TTS_RATE, caller)
         if outcome in (tg.ANSWERED, tg.ALREADY_CONNECTED):
             sess.expect(self.key(self.link.info()["generation"]))
         else:
             sess.expect(None)
+        if outcome in MISSED_OUTCOMES:
+            try:
+                self.missed.record(caller, outcome)
+            except Exception as e:   # never hides the outcome: the agent must still know the call was missed
+                raise RuntimeError(f"call outcome: {outcome}; recording the missed call failed: "
+                                   f"{type(e).__name__}: {e}") from e
         if outcome != tg.ANSWERED:
             return {"outcome": outcome}
         # The greeting is this call's first turn: the caller's next speak is not a switch.
         self._turn = (self.key(self.link.info()["generation"]), sess.speaker)
         self.lock.take_floor(sess.speaker)   # owner decision 2026-10-20: an answered call gives the caller the floor
+        # The owner picked up the greeting: this session is no longer waiting on him.
+        self.missed.clear(sess.speaker, f"call {self.key(self.link.info()['generation'])} answered")
         # Answered: the greeting has played; listen for the owner's reply under the same lock
         # hold (as converse does) so no other session slips in between. A listen timeout or a
         # drop raises, exactly as in listen; on a timeout the call stays connected.
@@ -1103,7 +1237,7 @@ class _WhisperHandler(BaseHTTPRequestHandler):
     FastAPI's 404/405 `{"detail": ...}` replies and its redirect of a trailing slash."""
 
     protocol_version = "HTTP/1.1"   # keep-alive, as uvicorn; every reply carries Content-Length
-    ROUTES = {"/": "POST", "/health": "GET"}
+    ROUTES = {"/": "POST", "/health": "GET", "/missed-calls": "GET"}
     timeout = HTTP_TIMEOUT_SECONDS   # StreamRequestHandler.setup applies it as the socket timeout
 
     def setup(self) -> None:
@@ -1147,6 +1281,8 @@ class _WhisperHandler(BaseHTTPRequestHandler):
                             {"Allow": self.ROUTES[path]})
             elif path == "/health":
                 self._health()
+            elif path == "/missed-calls":
+                self._missed_calls()
             else:
                 self._transcribe(body)
             return
@@ -1201,6 +1337,11 @@ class _WhisperHandler(BaseHTTPRequestHandler):
         self._reply(200, _json_bytes({"status": "ok", "model": daemon.service.engines.whisper_model,
                                       "device": WHISPER_DEVICE}), "application/json")
 
+    def _missed_calls(self) -> None:
+        """GET /missed-calls: the unreturned missed calls (MissedCalls.list), as the quick op returns them."""
+        daemon: SpeakDaemon = self.server.daemon  # type: ignore[attr-defined]
+        self._reply(200, _json_bytes({"missed_calls": daemon.missed.list()}), "application/json")
+
     def _transcribe(self, body: bytes) -> None:
         daemon: SpeakDaemon = self.server.daemon  # type: ignore[attr-defined]
         peer = self.client_address[0]
@@ -1245,13 +1386,15 @@ class _WhisperHTTPServer(ThreadingHTTPServer):
 class SpeakDaemon:
     """Owns the link, the engines, the audio lock, the TCP server and the HTTP whisper API."""
 
-    def __init__(self, link, engines: Engines, personas: PersonaStore, settings: dict, debug: DebugControl,
+    def __init__(self, link, engines: Engines, personas: PersonaStore, missed: MissedCalls, settings: dict,
+                 debug: DebugControl,
                  port: int = proto.DAEMON_PORT, on_restart: Callable[[str], None] | None = None,
                  http_port: int = WHISPER_HTTP_PORT) -> None:
         self.link = link
         self.personas = personas
+        self.missed = missed
         self.lock = AudioLock(link.record_event)
-        self.service = SpeakService(link, engines, personas, settings, self.lock)
+        self.service = SpeakService(link, engines, personas, missed, settings, self.lock)
         self.port = port
         self.http_port = http_port
         self.on_restart = on_restart   # main(): exit 1 so compose restarts the container
@@ -1342,6 +1485,8 @@ class SpeakDaemon:
             return {proto.REPLY_PERSONA: self.personas.add(project, req.get("note"))}
         if op == proto.OP_PING:
             return {}
+        if op == proto.OP_MISSED_CALLS:
+            return {"missed_calls": self.missed.list()}
         if op == proto.OP_STATUS:
             busy, current_tool, waiting = self.lock.snapshot()
             return {"busy": busy, "current_tool": current_tool, "waiting": waiting, "call": link.info()}
@@ -1469,7 +1614,8 @@ def main() -> None:
         link = build_link(telegram_env)
         personas = PersonaStore.open(settings["SPEAK_PERSONAS_FILE"], engines.voices, settings["SPEAK_VOICE"],
                                      settings["SPEAK_SPEED"], settings["tz"], link.record_event)
-        daemon = SpeakDaemon(link, engines, personas, settings, debug, on_restart=restart)
+        missed = MissedCalls.open(settings["SPEAK_MISSED_CALLS_FILE"], settings["tz"])
+        daemon = SpeakDaemon(link, engines, personas, missed, settings, debug, on_restart=restart)
         daemon.start()
         stop.wait()
         daemon.stop()
