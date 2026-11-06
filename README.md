@@ -9,7 +9,7 @@ It has two parts:
 - **A speak daemon**, one per network, in a Docker container on a Linux host
   with an NVIDIA GPU. It holds the Telegram login and places the call, runs
   Kokoro-82M (speech synthesis) and Whisper large-v3-turbo through
-  faster-whisper (transcription) on the GPU at full precision, and Silero VAD
+  faster-whisper (transcription) on the GPU (Kokoro fp32, Whisper int8_float16), and Silero VAD
   (end of speech) on the CPU. It listens on TCP port 8765.
 - **A thin MCP client** on every computer that runs Claude Code. It has no
   models and opens no audio device; each tool is one request to the daemon.
@@ -23,7 +23,8 @@ make the daemon call you. Run it only on a network you trust.
 ## Requirements
 
 Daemon host:
-- Linux with an NVIDIA GPU (about 5-6 GB of free VRAM at fp32), the NVIDIA
+- Linux with an NVIDIA GPU (about 2.6 GB resident, 2.8 GB peak, projected
+  from the 2026-11-06 measurements in docs/DESIGN_REMOTE_DAEMON.md section 12), the NVIDIA
   driver (CUDA 12.6 or newer), Docker with Compose and the NVIDIA Container
   Toolkit.
 - A second Telegram account to call from, with its API keys and a Telethon

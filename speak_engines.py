@@ -1,13 +1,15 @@
-"""Kokoro (TTS) and Whisper (STT) on CUDA, both at full precision, for the speak
-daemon (docs/DESIGN_REMOTE_DAEMON.md section 6).
+"""Kokoro (TTS) and Whisper (STT) on CUDA for the speak daemon
+(docs/DESIGN_REMOTE_DAEMON.md section 6).
 
 - TTS: kokoro's reference PyTorch `KPipeline` (hexgrad/Kokoro-82M), fp32 on the GPU.
-- STT: faster-whisper (CTranslate2) large-v3-turbo, compute_type float32 on the GPU,
+- STT: faster-whisper (CTranslate2) large-v3-turbo, compute_type int8_float16 on the GPU,
   greedy decoding, no built-in VAD (Silero has already gated the audio).
 
-Owner decision 2026-10-15: both models run at full precision. No CPU fallback:
+Owner decision 2026-10-15: both models at full precision. Superseded for Whisper on
+2026-11-06 (docs/DESIGN_REMOTE_DAEMON.md section 12): Whisper runs int8_float16 so the
+Ring vision model fits on GPU0 next to the daemon; Kokoro stays fp32. No CPU fallback:
 `device="cuda"` raises when no GPU is visible, and a model that loads in any other
-dtype fails the load.
+dtype or compute type fails the load.
 
 Voices (docs/DESIGN_PERSONAS.md, owner decisions 2026-10-22): the English voice packs of
 the Kokoro repo, exactly ENGLISH_VOICES, are loaded on the CPU at start; each synthesis takes
@@ -35,7 +37,7 @@ log = logging.getLogger("speak.engines")
 TTS_RATE = 24_000              # Kokoro output rate
 STT_RATE = 16_000              # Whisper input rate
 SENTENCE_SPLIT = r"(?<=[.!?])\s+"
-WHISPER_COMPUTE_TYPE = "float32"
+WHISPER_COMPUTE_TYPE = "int8_float16"   # int8 weights, fp16 math (docs/DESIGN_REMOTE_DAEMON.md section 12)
 WHISPER_DEVICE = "cuda"        # also reported by the daemon's GET /health (port 9000)
 BLEND_CACHE_SIZE = 64          # voice blends kept (docs/DESIGN_PERSONAS.md 4.5)
 # The English voices of hexgrad/Kokoro-82M (ids starting af_, am_, bf_, bm_; owner decision 14),
@@ -125,6 +127,12 @@ class Engines:
             raise RuntimeError(f"Kokoro loaded with parameter dtypes {dtypes}; fp32 is required")
         self._whisper = WhisperModel(self.whisper_model, device=WHISPER_DEVICE, device_index=0,
                                      compute_type=WHISPER_COMPUTE_TYPE)
+        # CTranslate2 4.8.3 raises on an explicitly requested compute type the device lacks, and
+        # model.compute_type reports the type it resolved. The check guards against a release that
+        # resolves the request to another type: fail the load instead of running unmeasured.
+        if self._whisper.model.compute_type != WHISPER_COMPUTE_TYPE:
+            raise RuntimeError(f"Whisper loaded with compute_type {self._whisper.model.compute_type!r}; "
+                               f"{WHISPER_COMPUTE_TYPE!r} is required")
         # Warm both so the first speak/listen does not pay CUDA kernel selection.
         self.synthesize("Ready.", Voice(self.voice_pack(((default_voice, 1.0),)), default_speed))
         self.transcribe(np.zeros(STT_RATE, dtype=np.float32))

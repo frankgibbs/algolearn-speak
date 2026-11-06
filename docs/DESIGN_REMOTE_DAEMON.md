@@ -515,7 +515,8 @@ state supports this:
 **STT: `faster-whisper==1.2.1`** (CTranslate2).
 - Today: `mlx-whisper` with `mlx-community/whisper-large-v3-turbo`.
 - After: model `large-v3-turbo`, `device="cuda"`, `compute_type="float32"`
-  (Owner decision 2026-10-15: both models at full precision),
+  (Owner decision 2026-10-15: both models at full precision; for Whisper,
+  superseded on 2026-11-06 by `compute_type="int8_float16"`, section 12),
   `beam_size=1`, `language="en"`, `vad_filter=False`.
 - Why:
   - It is the same model as today (Owner decision 6).
@@ -573,6 +574,9 @@ service, and compose restarts the container.
 | **Daemon total** | **~4.6–5.8 GB** | Estimate (the sum of the rows above) |
 | **GPU0 during cutover** (both running) | **~8.5–9.7 GB of 12.0 GB used** | 3.85 GB measured + the daemon estimate |
 | **GPU0 after whisper-service is retired** | **~4.6–5.8 GB used; ~6.2–7.4 GB free** | Daemon estimate only. That free memory is for the planned image-gallery manager |
+
+Section 12 has the measured VRAM of each component (2026-11-06) and the
+change of Whisper to `int8_float16`, which supersedes the Whisper row.
 
 Section 9 replaces every estimate here with a measurement:
 `nvidia-smi --query-compute-apps` after warm-up and after a 60 s listen.
@@ -772,6 +776,7 @@ text of this design where they differ (the sections above are updated to
 match):
 - Both models at full precision: faster-whisper `compute_type="float32"`,
   Kokoro fp32. `Engines.load` refuses a Kokoro load in any other dtype.
+  (Superseded for Whisper on 2026-11-06: `int8_float16`, section 12.)
 - Only the speak daemon runs on GPU0; `whisper-service` is retired later by
   the owner.
 - The Linux Telegram re-test of section 9 step 5 is skipped before the build.
@@ -811,7 +816,7 @@ API, so its clients need no change:
 - The port binds after Telegram connects, with 8765.
 
 Differences from the old service (Decision): `/health` reports the model the
-daemon actually runs (`large-v3-turbo` fp32, not `large-v3` fp16);
+daemon actually runs (`large-v3-turbo`, not `large-v3` fp16; int8_float16 since section 12);
 transcription uses `Engines.transcribe`, whose decoding settings match the
 old service (`language="en"`, `beam_size=1`, `vad_filter=False`) but which
 joins segment texts with no separator (the old service joined them with a
@@ -831,3 +836,100 @@ Hardening, a deliberate departure from the old service, which had no limits
   (above httpx's 5 s keep-alive expiry, so the client closes an idle
   connection first); a body that stalls is logged and answered `408`. TCP
   keepalive is on, as on 8765.
+
+## 12. Whisper at int8_float16 (2026-11-06)
+
+**Owner decision (Frank, on a call, 2026-11-06).** Cut the GPU memory the
+daemon holds on GPU0, so the Ring vision model (Qwen3-VL-8B Q4_K_M under
+llama-server, `lan/security/ring-vision-alerts-design.md` in the algolearn
+workspace) fits on GPU0 next to it and GPU1 stays free for gpuq. That
+design's fit gate: GPU0's peak during a live call, summed over every process,
+plus the vision model's peak, must be at most 11.0 GiB (11,264 MiB); it
+estimates the vision model at about 6.7-7.2 GiB (6,861-7,373 MiB).
+
+**The change.** faster-whisper runs `compute_type="int8_float16"` (int8
+weights, fp16 activations) instead of `float32`. `Engines.load` refuses a
+Whisper whose CTranslate2 model reports any other compute type. Verified
+(code review, ctranslate2 4.8.3): an explicitly requested compute type the
+device lacks raises `ValueError`, and `model.compute_type` reports the type
+CTranslate2 resolved (`int8` reads back `int8_float32`); the check guards
+against a release that resolves the request to another type. Kokoro stays fp32, on the
+GPU, unchanged. This supersedes the 2026-10-15 full-precision decision for
+Whisper only. It is deployed only on the owner's word, during a test call.
+
+**Measured (2026-11-06).** A throwaway container from the deployed image
+(`algolearn-speak-telegram:latest`, built from 55c8f00) on patrick's idle
+GPU1, the HF cache volume mounted read-only, the same load and transcribe
+calls as `Engines`. Device memory by NVML, minus the 379 MiB NVML reports on
+the empty card. Each compute type in a fresh process. Six clips at 16 kHz
+(4-28 s, 294 words, five speakers from YouTube recordings and one cloned
+voice), each transcribed three times; the call simulation is 40 Kokoro
+syntheses (single voices and random five-voice blends, 3-100 words) with a
+transcription every fourth.
+
+Where the memory goes with `float32` (the daemon today):
+
+| Component | MiB |
+|---|---|
+| CUDA context (torch) | 130 |
+| Kokoro-82M weights, fp32 | 334 |
+| Kokoro warm-up (torch's caching allocator, kernels) | 294 |
+| Whisper large-v3-turbo weights at float32 (CTranslate2) | 3,872 |
+| Whisper warm-up | 8 |
+| Kokoro on long text (torch cache grows to 1,100 reserved, 555 allocated) | 488 |
+| The call simulation (more Kokoro cache) | 8 |
+| **After the call simulation** | **5,134** |
+
+The deployed daemon read 5,436 MiB on 2026-11-06 (nvidia-smi, per process),
+302 MiB above the simulation: Kokoro's torch cache after weeks of real calls.
+
+The model on disk (`mobiuslabsgmbh/faster-whisper-large-v3-turbo`,
+`model.bin` 1,617,884,929 bytes for 809 M parameters) is stored in float16,
+so `float32` upcasts it and adds no weight precision.
+
+| compute_type | After warm-up | After the call simulation | Peak | Change |
+|---|---|---|---|---|
+| float32 (today) | 4,638 | 5,134 | 5,326 | — |
+| float16 | 2,852 | 3,348 | 3,444 | −1,786 |
+| bfloat16 | 2,852 | 3,342 | 3,438 | −1,792 |
+| **int8_float16 (chosen)** | **1,828** | **2,324** | **2,452** | **−2,810** |
+| int8_float32 | 1,854 | 2,344 | 2,568 | −2,790 |
+
+Transcription time (median of 3), and words changed against `float32`:
+
+| Clip | float32 | float16 | int8_float16 |
+|---|---|---|---|
+| 4 s | 0.52 s | 0.27 s | 0.24 s |
+| 8 s | 0.58 s | 0.31 s | 0.28 s |
+| 12 s | 0.63 s | 0.34 s | 0.30 s |
+| 14 s | 0.66 s | 0.36 s | 0.32 s |
+| 20 s | 1.27 s | 0.69 s | 0.41 s |
+| 28 s | 0.76 s | 0.43 s | 0.38 s |
+| Words changed, of 294 | — | 0 (all six identical) | 1 (0.34 %) |
+
+The one word: "go back home like a couple days after" became "go back home a
+couple days after". The other `int8_float16` differences are punctuation and
+case only ("shape, and" / "shape. And", a trailing "..."). `bfloat16`
+changed 4 words and `int8_float32` 2. Kokoro's synthesis time is unchanged
+(0.50 s for 36.5 s of audio). The 20 s clip is slower than the 28 s clip at
+every compute type, in every run, so it is not noise; its transcript is a
+little longer (84 words against 78), and the cause was not investigated
+further.
+
+**Projected GPU0 after the change** (the measured savings applied to the
+deployed 5,436 MiB, one reading before any call; GPU0's peak during a live
+call is measured separately, by the vision design's whole-GPU0 nvidia-smi
+recording across a 5-minute Telegram call with speech both ways):
+
+| | float32 (today) | float16 | int8_float16 |
+|---|---|---|---|
+| Daemon resident | 5,436 | ~3,650 | ~2,626 |
+| Daemon peak (resident + the measured ~200 MiB transcription peak) | ~5,636 | ~3,850 | ~2,830 |
+| Room under the 11,264 MiB gate | ~5,628 | ~7,414 | ~8,434 |
+| Margin over the vision model's 7,373 MiB upper estimate | −1,745 | ~41 | ~1,061 |
+
+`float16` loses nothing against today's transcripts but clears the gate by
+about 41 MiB at the vision model's upper estimate; `int8_float16` clears it
+by about 1 GiB, at the cost of the one-word change above. That margin is why
+`int8_float16` is the compute type built.
+

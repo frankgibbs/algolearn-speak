@@ -8,7 +8,7 @@ each turn, reads the transcript as a tool result, and continues.
 **Two parts (docs/DESIGN_REMOTE_DAEMON.md):**
 - **The speak daemon**, one per LAN, in the `speak-telegram` container on
   patrick (192.168.86.31), on GPU0. It owns the Telegram login and the call,
-  Kokoro (TTS) and faster-whisper (STT) on CUDA at full precision (fp32),
+  Kokoro (TTS, fp32) and faster-whisper (STT, int8_float16) on CUDA,
   Silero VAD on the CPU, the one audio lock, and all of the tool logic. It
   listens on TCP `0.0.0.0:8765`.
 - **The thin MCP client** (`speak_server.py`), one per Claude Code session on
@@ -519,9 +519,10 @@ and `set_call_debug` raises `speak daemon at <addr> is not reachable: ...`.
   announcement; `load_voices` and `voice_pack` for the English packs and
   blends; every synthesis takes a `Voice`, pack and speed), and
   `split_sentences`, the same sentence split Kokoro indexes. Kokoro `KPipeline` (hexgrad/Kokoro-82M) and
-  faster-whisper `WhisperModel` (compute_type `float32`) on `cuda`. The load
-  raises if CUDA is missing, Kokoro's weights are not all fp32, or Kokoro's
-  espeak-ng fallback did not load.
+  faster-whisper `WhisperModel` (compute_type `int8_float16`, docs/DESIGN_REMOTE_DAEMON.md
+  section 12) on `cuda`. The load raises if CUDA is missing, Kokoro's weights are not
+  all fp32, Whisper runs any other compute type, or Kokoro's espeak-ng fallback did not
+  load.
 - `speak_telegram.py`: `TelegramLink`, the call itself (Telethon + py-tgcalls +
   ntgcalls): dial, opener file, 10 ms raw-frame pump, Silero VAD on the
   owner's audio, and the hold watch (`play_watched`, `watch_for`,
@@ -627,7 +628,7 @@ stdlib `http.server`). Known client: `scratch/voice-claude/livekit_agent.py`
   `Allow`, an unknown path `404` `{"detail":"Not Found"}`, a trailing slash
   `307` to the other spelling. HTTP/1.1 keep-alive and chunked bodies.
 - It reuses the loaded Whisper engine (`Engines.transcribe`: large-v3-turbo
-  fp32, `language=SPEAK_LANGUAGE` (en), `beam_size=1`, `vad_filter=False`).
+  int8_float16, `language=SPEAK_LANGUAGE` (en), `beam_size=1`, `vad_filter=False`).
   No new model, no new container, no new setting.
 - Every transcription waits in the same FIFO audio lock as the tool ops
   (status shows `transcribe (<ip>)`), so inference never overlaps call audio;
