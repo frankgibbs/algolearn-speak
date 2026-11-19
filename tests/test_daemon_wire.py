@@ -88,7 +88,7 @@ class HoldingLink:
     def record_unbound_event(self, event: str, **fields) -> None:
         self.events.record(None, event, **fields)
 
-    def play_watched(self, segments, rate, classify, accept):
+    def play_watched(self, segments, rate, classify, accept, pulse_colour):
         tag, _audio = next(iter(segments))
         return tg.PlayOutcome(proto.CMD_HOLD, 100, tag, 0.1)
 
@@ -205,8 +205,8 @@ class TestStatusAgainstAnOtherDaemon(unittest.TestCase):
         self.assertIn(f"daemon protocol {proto.PROTOCOL_VERSION + 1}", got["call"])
 
     def test_a_persona_op_on_a_daemon_that_does_not_know_it_reports_the_protocol_mismatch(self):
-        bodies = {proto.OP_PERSONA: (client._persona_sync,), proto.OP_PERSONA_NEW: (client._new_persona_sync,),
-                  proto.OP_PERSONA_SET: (client._set_persona_sync, None, None, 1.1, None),
+        bodies = {proto.OP_PERSONA: (client._persona_sync,), proto.OP_PERSONA_NEW: (client._new_persona_sync, "00E0E0"),
+                  proto.OP_PERSONA_SET: (client._set_persona_sync, None, None, 1.1, None, None),
                   proto.OP_PERSONA_ADD: (client._add_to_personality_sync, "Dry humor.")}
         for op, (fn, *args) in bodies.items():
             # What a protocol-3 daemon sends for an op it does not know (no version in an error).
@@ -351,16 +351,16 @@ class TurnLink:
     def record_unbound_event(self, event: str, **fields) -> None:
         self.events.record(None, event, **fields)
 
-    def call(self, audio, rate, caller) -> str:
+    def call(self, audio, rate, caller, pulse_colour) -> str:
         self.generation += 1
         self._state = tg.CONNECTED
         self.log.append("greeting")
         return tg.ANSWERED
 
-    def play(self, audio, rate, speech_from=None) -> None:
+    def play(self, audio, rate, speech_from=None, pulse_colour=None) -> None:
         self.log.append(("play", len(audio)))
 
-    def play_watched(self, segments, rate, classify, accept):
+    def play_watched(self, segments, rate, classify, accept, pulse_colour):
         n = sum(len(a) for _tag, a in segments)
         self.log.append("speech")
         return tg.PlayOutcome(None, n, None, n / rate)
@@ -494,7 +494,7 @@ class TestPersonasOverTheWire(unittest.TestCase):
         with self.assertRaises(ValueError) as cm:
             as_session(a, client._call_sync, "Hi Frank, it's me, calling about the build.", True, 120, 2.0, 45)
         self.assertEqual(str(cm.exception),
-                         "[persona: you are Angie, the house persona; voice af_heart 1; speed 1; personality: (none yet)]\n"
+                         "[persona: you are Angie, the house persona; voice af_heart 1; speed 1; pulse colour FFB000; personality: (none yet)]\n"
                          "Nothing was spoken (or dialed). Rewrite your words as Angie and send again.")
         self.assertEqual((self.link.generation, self.link.log), (0, []))   # never dialed
         self.assertEqual(a["_seen"], self.daemon.personas.key("algolearn-speak"))
@@ -507,7 +507,7 @@ class TestPersonasOverTheWire(unittest.TestCase):
         a, b = dict(ID_A), dict(ID_A, **{proto.FIELD_SESSION_ID: "session-a2"})
         self.connect(a)
         as_session(b, client._persona_sync)
-        as_session(b, client._set_persona_sync, "Nova", None, None, None)   # a's persona changes under it
+        as_session(b, client._set_persona_sync, "Nova", None, None, None, None)   # a's persona changes under it
         played = list(self.link.log)
         for fn, args in ((client._speak_sync, ("One.",)), (client._converse_sync, ("One.", 120, 2.0, 45)),
                          (client._call_sync, ("Hi Frank, it's Angie again.", True, 120, 2.0, 45))):
@@ -534,14 +534,14 @@ class TestPersonasOverTheWire(unittest.TestCase):
         a, b = dict(ID_A), dict(ID_A, **{proto.FIELD_SESSION_ID: "session-a2"})
         self.connect(a)
         as_session(b, client._persona_sync)
-        as_session(b, client._set_persona_sync, "Nova", None, None, None)
+        as_session(b, client._set_persona_sync, "Nova", None, None, None, None)
         self.assertEqual(as_session(a, client._listen_sync, 120, 2.0, 45),
-                         "[persona: you are Nova, the house persona; voice af_heart 1; speed 1; personality: (none yet)]\n"
+                         "[persona: you are Nova, the house persona; voice af_heart 1; speed 1; pulse colour FFB000; personality: (none yet)]\n"
                          "hi Angie")
         self.assertEqual(as_session(a, client._listen_sync, 120, 2.0, 45), "hi Angie")   # seen now: no line
         as_session(b, client._add_to_personality_sync, "Dry humor.")
         self.assertEqual(as_session(a, client._hang_up_sync),
-                         "[persona: you are Nova, the house persona; voice af_heart 1; speed 1; personality: Dry humor.]\n"
+                         "[persona: you are Nova, the house persona; voice af_heart 1; speed 1; pulse colour FFB000; personality: Dry humor.]\n"
                          + tg.HUNG_UP)
 
     def test_the_reply_carries_the_persona_only_when_it_changed(self):
@@ -558,7 +558,7 @@ class TestPersonasOverTheWire(unittest.TestCase):
         self.connect(a)
         seen = a["_seen"]
         as_session(b, client._persona_sync)
-        as_session(b, client._set_persona_sync, None, {"bf_emma": 1}, 1.2, None)
+        as_session(b, client._set_persona_sync, None, {"bf_emma": 1}, 1.2, None, None)
         self.assertEqual(as_session(a, client._converse_sync, "One.", 120, 2.0, 45), "hi Angie" + proto.AUDIO_NOTE)
         self.assertEqual(as_session(a, client._call_sync, "Hi Frank, it's Angie again.", True, 120, 2.0, 45),
                          proto.ALREADY_CONNECTED)
@@ -618,7 +618,7 @@ class TestPersonasOverTheWire(unittest.TestCase):
 class TestPersonaLine(unittest.TestCase):
     """The client's result lines: the switch line, then the persona line, then the held line."""
 
-    BLOCK = {"id": "p1", "words_revision": 3, "name": "Nova", "house": False, "voice": {"af_bella": 0.7, "bf_emma": 0.3}, "speed": 1.1,
+    BLOCK = {"id": "p1", "words_revision": 3, "name": "Nova", "house": False, "voice": {"af_bella": 0.7, "bf_emma": 0.3}, "speed": 1.1, "pulse_colour": "FF40A0",
              "personality": ["Dry humor.", "Short answers."], "shared_with": ["algolearn-hedge"]}
 
     def test_the_persona_line_comes_after_the_switch_line_and_before_the_held_line(self):
@@ -627,7 +627,7 @@ class TestPersonaLine(unittest.TestCase):
         self.assertEqual(client._speak_result(reply).split("\n"), [
             '[took over the call from "algolearn-hedge"; the owner heard the switch cue and your persona\'s name '
             "and this project's name first]",
-            "[persona: you are Nova; voice af_bella 0.7, bf_emma 0.3; speed 1.1; personality: Dry humor. / "
+            "[persona: you are Nova; voice af_bella 0.7, bf_emma 0.3; speed 1.1; pulse colour FF40A0; personality: Dry humor. / "
             "Short answers.; shared with algolearn-hedge]",
             "[held 12s, then resumed]",
             "spoke for 2.0s", "(audio: telegram)"])

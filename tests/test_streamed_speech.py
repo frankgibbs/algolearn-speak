@@ -73,15 +73,16 @@ class FakeLink:
     def state(self) -> str:
         return self._state
 
-    def play(self, audio, rate, speech_from=None) -> None:
+    def play(self, audio, rate, speech_from=None, pulse_colour=None) -> None:
         self.log.append(("play", len(audio)))
         if self._state != tg.CONNECTED:
             raise tg.CallEnded("the Telegram call ended during playback")
         if self.fail_play:
             raise RuntimeError("playback failed on a connected call")
 
-    def play_watched(self, segments, rate, classify, accept) -> tg.PlayOutcome:
+    def play_watched(self, segments, rate, classify, accept, pulse_colour) -> tg.PlayOutcome:
         self.log.append(("stream_begin",))
+        self.watched_colour = pulse_colour
         samples = 0
         for n, (_tag, seg) in enumerate(segments, 1):
             self.log.append(("queued", n))
@@ -98,7 +99,7 @@ class FakeLink:
             self._state = tg.NONE
         return self.record_result
 
-    def call(self, audio, rate, caller) -> str:
+    def call(self, audio, rate, caller, pulse_colour) -> str:
         self.log.append(("dial", len(audio)))
         self._state = tg.CONNECTED
         return tg.ANSWERED

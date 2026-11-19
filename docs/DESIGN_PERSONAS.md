@@ -286,6 +286,7 @@ for diagnostics. It adds one noun:
       "name": "Nova",
       "voice": {"af_heart": 0.7, "af_bella": 0.3},
       "speed": 1.0,
+      "pulse_colour": "00E0E0",
       "personality": [
         {"text": "Calm, terse, numbers first.", "project": "algolearn-kalshi",
          "added": "2026-10-22T14:03:11-07:00"}
@@ -309,6 +310,15 @@ Design (2026-10-22):
   weight above 0, at most 4 voices (Owner decisions 14, 15). Stored normalized so the
   weights sum to 1 (rounded to 4 decimals; the largest weight absorbs the rounding).
 - `speed`: a number from 0.5 to 2.0 (Owner decision 15).
+- `pulse_colour`: required, six upper-case hex digits `RRGGBB` (input of either case is
+  stored upper-case); any colour is allowed. It is the colour proxmox01's case lights
+  pulse in while this persona speaks: the daemon puts it in every `pulse2` datagram
+  (lan `gpu/case-fan-loop/DESIGN-voice-pulse.md`, DECISION 7). DECISION (Frank,
+  2026-11-18): every persona has one, set through `new_persona` and `set_persona` like the
+  voice and speed and shown by `persona()`; a persona file without it is refused at load.
+  The seeded house persona Angie gets `FFB000`. Initial colours for the existing
+  personas (PM choice): Lester `80FF00`, Angie `FFB000`, Victoria `FF40A0`, Kim `00E0E0`,
+  Jaidyn `FF80FF`.
 - `personality`: an ordered list of entries `{text, project, added}`. The project that
   added the entry is kept so a persona review can say where each line came from. The
   total text is capped at 4000 characters (Owner decision 15).
@@ -322,7 +332,8 @@ Design (2026-10-22):
 - `projects`: project name (exactly the string the client sends as `project`) to
   persona id.
 - Validation, on load and on every change: `schema == 1`; every voice id in the daemon's
-  voice list; weights positive and normalized; at most 4 voices; speed in range; names
+  voice list; weights positive and normalized; at most 4 voices; speed in range; `pulse_colour`
+  present and `RRGGBB`; names
   valid and unique; every project pointer and `house` name an existing persona;
   personality within the cap. Any
   failure on load stops the daemon; on a change it raises `ValueError` to the tool and
@@ -497,8 +508,8 @@ they are versioned (refused on a protocol mismatch) and carry `session_id` and
 | Op | Tool | Effect |
 |---|---|---|
 | `persona` | `persona()` | Returns the project's block, every persona (name, voice, speed, projects), the voice ids, the speed range and the number of pool names left. Changes nothing. |
-| `persona_new` | `new_persona()` | Creates a persona from the pool with the defaults, points this project at it (moving it off any persona it had), records `persona_assign`. |
-| `persona_set` | `set_persona(name=None, voice=None, speed=None, personality=None)` | See below. |
+| `persona_new` | `new_persona(pulse_colour)` | Creates a persona from the pool with the defaults and the given `pulse_colour` (required), points this project at it (moving it off any persona it had), records `persona_assign`. |
+| `persona_set` | `set_persona(name=None, voice=None, speed=None, personality=None, pulse_colour=None)` | See below. |
 | `persona_add` | `add_to_personality(note)` | Appends `{note, project, now}` to the persona's personality; raises past the cap with "the personality is full; ask the owner for a persona review". |
 
 `set_persona` rules:
@@ -516,9 +527,11 @@ they are versioned (refused on a protocol mismatch) and carry `session_id` and
 - `personality` is the whole note as a list of strings and replaces it; it exists for
   the persona review (Owner decision 8). Each kept line keeps its original `project` and
   `added` when its text is unchanged; new lines are stamped with this project.
-- A change of name or personality raises `words_revision`; a voice or speed change does
-  not (Design (2026-10-22)). Every change writes the file, records `persona_change` (`persona`,
-  `fields`, `project`, and the old and new values for name, voice and speed), and
+- `pulse_colour` is `RRGGBB` in either case. It changes only the case-light colour.
+- A change of name or personality raises `words_revision`; a voice, speed or pulse colour
+  change does not (Design (2026-10-22)). Every change writes the file, records
+  `persona_change` (`persona`, `fields`, `project`, and the old and new values for name,
+  voice, speed and pulse colour), and
   returns the new block.
 
 ### 4.10 Interaction with the floor, the switch and the whisper API

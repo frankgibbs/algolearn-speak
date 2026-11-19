@@ -77,7 +77,8 @@ REPLY_SWITCHED_FROM = "switched_from"
 
 # Personas (docs/DESIGN_PERSONAS.md, owner decisions 2026-10-22). The block in REPLY_PERSONA:
 # {"id", "words_revision", "name", "house" (true on the house persona, which never grows its
-# personality on its own), "voice": {id: weight}, "speed", "personality": [text, ...],
+# personality on its own), "voice": {id: weight}, "speed", "pulse_colour" (RRGGBB, the case
+# lights' colour while it speaks), "personality": [text, ...],
 # "shared_with": [other projects]}.
 FIELD_PERSONA_SEEN = "persona_seen"
 REPLY_PERSONA = "persona"
@@ -85,6 +86,7 @@ PERSONA_SPEED_MIN, PERSONA_SPEED_MAX = 0.5, 2.0
 PERSONA_POOL = ("Angie", "Nova", "Ruby", "Hazel", "Paige", "Stella", "Gwen", "Willow", "Margo", "Juno",
                 "Tess", "Fiona")
 PERSONA_SEED_NAME = "Angie"
+PERSONA_SEED_PULSE_COLOUR = "FFB000"   # the seeded house persona's case-light colour (PM choice 2026-11-18)
 PERSONA_NAME_MAX = 12            # a name is one word of 2 to 12 letters
 PERSONALITY_MAX_CHARS = 4000
 PERSONA_MAX_VOICES = 4

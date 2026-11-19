@@ -41,9 +41,10 @@ class CallLink(ScriptedLink):
     def info(self) -> dict:
         return {**super().info(), "generation": self.generation}
 
-    def play(self, audio, rate, speech_from=None) -> None:
+    def play(self, audio, rate, speech_from=None, pulse_colour=None) -> None:
         self.log.append(("cue", len(audio)))
         self.speech_from = speech_from
+        self.pulse_colour = pulse_colour
         if self.drop_on_play:
             self._state = tg.NONE
             raise RuntimeError("call dropped while playing")
@@ -259,7 +260,7 @@ class TestPersonaVoices(SwitchCase):
         super().setUp()
         self.personas = self.svc.personas
         self.personas.ensure("algolearn-hedge")
-        self.personas.new("algolearn-hedge")
+        self.personas.new("algolearn-hedge", "00E0E0")
         self.personas.set("algolearn-hedge", voice={"bf_emma": 3, "am_adam": 1})
         self.personas.set("algolearn-hedge", speed=1.3)
         self.hedge = self.personas.persona_of("algolearn-hedge")
@@ -280,6 +281,21 @@ class TestPersonaVoices(SwitchCase):
         (event,) = self.switches()
         self.assertEqual((event["to_persona"], event["spoken"]), (self.hedge.name, spoken))
 
+    def test_the_case_lights_take_the_speaking_personas_colour(self):
+        # DECISION (Frank, 2026-11-18): the announcement, the speech and the greeting pulse in the
+        # persona's pulse_colour.
+        self.placed_by(A)
+        self.svc.speak(self.req_sess(B), self.TEXT, NEVER_LEFT)
+        self.assertEqual((self.link.pulse_colour, self.link.watched_colour), ("00E0E0", "00E0E0"))
+        self.personas.set("algolearn-hedge", pulse_colour="FF80FF")
+        self.svc.speak(self.req_sess(B), self.TEXT, NEVER_LEFT)
+        self.assertEqual(self.link.watched_colour, "FF80FF")
+        self.link._state = tg.NONE
+        dialed = []
+        self.link.call = lambda audio, rate, caller, pulse_colour: dialed.append(pulse_colour) or tg.NOT_ANSWERED
+        self.svc.call(self.req_sess(B), "Hi Frank, it's the hedge bot with news.", True, 120, 2.0, 45)
+        self.assertEqual(dialed, ["FF80FF"])
+
     def test_a_bare_listen_switch_keeps_the_suffix_after_the_persona(self):
         self.placed_by(A)
         self.svc.listen(self.req_sess(B), 120, 2.0, 45)
@@ -288,7 +304,7 @@ class TestPersonaVoices(SwitchCase):
     def test_the_greeting_is_in_the_callers_voice(self):
         self.link._state = tg.NONE
 
-        def dial(audio, rate, caller):   # the greeting is synthesized before the dial; stop there
+        def dial(audio, rate, caller, pulse_colour):   # the greeting is synthesized before the dial; stop there
             raise RuntimeError("not dialed in this test")
         self.link.call = dial
         with self.assertRaisesRegex(RuntimeError, "not dialed"):

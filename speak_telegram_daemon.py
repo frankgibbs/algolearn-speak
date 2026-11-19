@@ -14,7 +14,7 @@ their final reply. Quick ops (`ping`, `status`, `debug`, `set_debug`, and the
 persona ops) never touch the lock, so they answer while a call is ringing or connected.
 
 Personas (docs/DESIGN_PERSONAS.md, owner decisions 2026-10-22): every project speaks as
-a persona (a name, a voice blend, a speed and a personality) kept in the PersonaStore
+a persona (a name, a voice blend, a speed, a pulse colour and a personality) kept in the PersonaStore
 (speak_personas.py, the file SPEAK_PERSONAS_FILE on the speak_state volume). Before the
 lock, a project with no persona is assigned to the house persona, and a speak, converse
 or call whose persona_seen is stale (the project moved to another persona, or its
@@ -741,7 +741,8 @@ class SpeakService:
             cue = switch_pcm()
             audio = np.concatenate([cue, self.engines.synthesize(spoken, voice)])
             # The spoken part pulses the case lights; the cue in front of it does not.
-            self.guard_call(sess, tool, lambda: self.link.play(audio, TTS_RATE, speech_from=len(cue)))
+            self.guard_call(sess, tool, lambda: self.link.play(audio, TTS_RATE, speech_from=len(cue),
+                                                               pulse_colour=persona.pulse_colour))
             self.link.record_event(SESSION_SWITCH_EVENT, tool=tool, from_project=previous[1].project,
                                    to_project=sess.speaker.project, to_persona=persona.name, spoken=spoken,
                                    announce_s=round(len(audio) / TTS_RATE, 2))
@@ -789,7 +790,10 @@ class SpeakService:
         segments = _Segments(self.engines.synthesize_segments(text, lambda: self._voice(speaker.project)))
         start, seconds, held = 0, 0.0, 0.0
         while True:
-            out = self.link.play_watched(segments.from_sentence(start), TTS_RATE, self.classify, proto.CMD_HOLD)
+            # The case lights take the persona's colour at the start of each utterance.
+            colour = self.personas.persona_of(speaker.project).pulse_colour
+            out = self.link.play_watched(segments.from_sentence(start), TTS_RATE, self.classify, proto.CMD_HOLD,
+                                         colour)
             seconds += out.seconds
             if out.command is None:
                 return Spoken(seconds, held)
@@ -983,9 +987,9 @@ class SpeakService:
                 "and end with a question. Lengthen it with the context of why you are calling. If this is a fresh "
                 "conversation with nothing to report, open with something playful instead: a joke, something "
                 "funny or flirty.")
-        caller = tg.Caller(self.personas.persona_of(sess.speaker.project).name, sess.speaker.project,
-                           sess.speaker.session_id)
-        outcome = self.link.call(audio, TTS_RATE, caller)
+        persona = self.personas.persona_of(sess.speaker.project)
+        caller = tg.Caller(persona.name, sess.speaker.project, sess.speaker.session_id)
+        outcome = self.link.call(audio, TTS_RATE, caller, persona.pulse_colour)
         if outcome in (tg.ANSWERED, tg.ALREADY_CONNECTED):
             sess.expect(self.key(self.link.info()["generation"]))
         else:
@@ -1480,11 +1484,11 @@ class SpeakDaemon:
             if op == proto.OP_PERSONA:
                 return self.personas.overview(project)
             if op == proto.OP_PERSONA_NEW:
-                return {proto.REPLY_PERSONA: self.personas.new(project)}
+                return {proto.REPLY_PERSONA: self.personas.new(project, req.get("pulse_colour"))}
             if op == proto.OP_PERSONA_SET:
                 return {proto.REPLY_PERSONA: self.personas.set(
                     project, name=req.get("name"), voice=req.get("voice"), speed=req.get("speed"),
-                    personality=req.get("personality"))}
+                    personality=req.get("personality"), pulse_colour=req.get("pulse_colour"))}
             return {proto.REPLY_PERSONA: self.personas.add(project, req.get("note"))}
         if op == proto.OP_PING:
             return {}

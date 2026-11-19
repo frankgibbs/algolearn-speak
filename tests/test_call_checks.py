@@ -117,7 +117,7 @@ class TestUnboundEvents(LinkCase):
     elapsed_s, though the link still remembers that call's id."""
 
     def test_an_unbound_event_after_a_call_carries_no_call_id(self):
-        self.assertEqual(self.link.call(np.zeros(2400, dtype=np.float32), 24000, CALLER), tg.ANSWERED)
+        self.assertEqual(self.link.call(np.zeros(2400, dtype=np.float32), 24000, CALLER, "80FF00"), tg.ANSWERED)
         self.remote_hang_up()
         self.wait_until(lambda: self.link.state() == tg.NONE)
         (ended,) = events_named(self.link, "ended")

@@ -39,6 +39,7 @@ import datetime
 import logging
 import os
 import queue
+import re
 import socket
 import tempfile
 import threading
@@ -407,8 +408,10 @@ def silero_vad_factory(silence_seconds: float):
 #
 # proxmox01's case lights pulse with the persona's voice (lan/gpu/case-fan-loop/DESIGN-voice-pulse.md).
 # The link sends one UDP datagram per 30 ms of persona speech to the receiver there:
-#   pulse1 <utterance id> <seq> <RMS dBFS, one decimal, or -inf>
-#   pulse1 <utterance id> <seq> end
+#   pulse2 <utterance id> <seq> <RRGGBB> <RMS dBFS, one decimal, or -inf>
+#   pulse2 <utterance id> <seq> <RRGGBB> end
+# RRGGBB is the speaking persona's pulse_colour (DECISION Frank, 2026-11-18), taken when the
+# utterance begins; the receiver pulses that one colour, brightness riding the level.
 # Each utterance's id is its wall-clock start in ms, kept strictly above the previous id of this run,
 # so ids rise across utterances and restarts and stay near the current time (never far behind a
 # datagram sent by hand). The receiver's idle reset covers a wall clock stepped back.
@@ -418,6 +421,15 @@ def silero_vad_factory(silence_seconds: float):
 
 PULSE_WINDOW_FRAMES = 3                         # 30 ms of call audio per level
 PULSE_WINDOW_SECONDS = PULSE_WINDOW_FRAMES / 100
+PULSE_COLOUR_RE = re.compile(r"[0-9A-F]{6}")
+
+
+def check_pulse_colour(colour) -> str:
+    """The colour a pulsed utterance carries: six upper-case hex digits (the persona store's
+    form). Raises ValueError, before anything is queued on the call."""
+    if not isinstance(colour, str) or not PULSE_COLOUR_RE.fullmatch(colour):
+        raise ValueError(f"pulse colour {colour!r} is not six upper-case hex digits RRGGBB")
+    return colour
 
 
 def pulse_level(pcm: np.ndarray) -> float:
@@ -440,7 +452,7 @@ def pulse_envelope(audio: np.ndarray, rate: int) -> list[float]:
     return [pulse_level(audio[i:i + step]) for i in range(0, len(audio), step)]
 
 
-def pulse_datagram(utterance: int, seq: int, level: float | None) -> bytes:
+def pulse_datagram(utterance: int, seq: int, colour: str, level: float | None) -> bytes:
     """One datagram; level None is the utterance's end."""
     if level is None:
         body = "end"
@@ -448,7 +460,7 @@ def pulse_datagram(utterance: int, seq: int, level: float | None) -> bytes:
         body = "-inf"
     else:
         body = f"{level:.1f}"
-    return f"pulse1 {utterance} {seq} {body}".encode("ascii")
+    return f"pulse2 {utterance} {seq} {colour} {body}".encode("ascii")
 
 
 def parse_pulse_target(value: str) -> tuple[str, int]:
@@ -483,8 +495,9 @@ class _PulseUtterance:
     speech (the session-switch cue); frames count once the first speech frame is sent, and from then
     on the silence of gaps and pauses counts too, so the lights dip between words."""
 
-    def __init__(self, utterance: int, skip_bytes: int) -> None:
+    def __init__(self, utterance: int, colour: str, skip_bytes: int) -> None:
         self.id = utterance
+        self.colour = colour
         self.seq = 0
         self.skip_bytes = skip_bytes
         self.started = False
@@ -818,14 +831,16 @@ class TelegramLink:
 
     # ------------------------------------------------------------ call / hang up
 
-    def call(self, greeting: np.ndarray, rate: int, caller: Caller) -> str:
-        """Dial the owner with `greeting`; `caller` tags every event of the call and its log lines."""
+    def call(self, greeting: np.ndarray, rate: int, caller: Caller, pulse_colour: str) -> str:
+        """Dial the owner with `greeting`; `caller` tags every event of the call and its log lines.
+        The greeting pulses the case lights in `pulse_colour` (the caller's persona's)."""
         if not isinstance(caller, Caller):
             raise TypeError(f"caller must be a Caller, got {caller!r}")
+        check_pulse_colour(pulse_colour)
         budget = REDIAL_SETTLE_SECONDS + RING_TIMEOUT_SECONDS + CONNECT_GRACE_SECONDS + len(greeting) / rate + 15.0
-        return self._run(self._call(greeting, rate, caller), budget, "placing the call")
+        return self._run(self._call(greeting, rate, caller, pulse_colour), budget, "placing the call")
 
-    async def _call(self, greeting: np.ndarray, rate: int, caller: Caller) -> str:
+    async def _call(self, greeting: np.ndarray, rate: int, caller: Caller, pulse_colour: str) -> str:
         from pytgcalls.exceptions import CallBusy, CallDeclined, CallDiscarded, TimedOutAnswer
         from pytgcalls.types import CallConfig, ExternalMedia, MediaStream, RecordStream
         from pytgcalls.types.raw import AudioParameters
@@ -891,7 +906,7 @@ class TelegramLink:
             finally:
                 self._ring_task = None
             self._event("answered_media_connected", opener_s=round(opener_seconds, 3))  # the greeting file starts playing now
-            self._pulse_task = asyncio.create_task(self._pulse_greeting(greeting_levels))
+            self._pulse_task = asyncio.create_task(self._pulse_greeting(greeting_levels, pulse_colour))
             # Answered. Anything that fails from here tears the call down: never a live,
             # half-built call with no pump.
             try:
@@ -1097,20 +1112,27 @@ class TelegramLink:
         self._end_call(END_FAILED)
         asyncio.ensure_future(self._leave())
 
-    def play(self, audio: np.ndarray, rate: int, speech_from: int | None = None) -> None:
+    def play(self, audio: np.ndarray, rate: int, speech_from: int | None = None,
+             pulse_colour: str | None = None) -> None:
         """Queue `audio` on the call and return once it has all been sent. Raises CallEnded.
         `speech_from` is the sample of `audio` where persona speech starts (the session-switch
-        announcement after its cue): from there on it pulses the case lights. None: a cue, no pulse."""
+        announcement after its cue): from there on it pulses the case lights in `pulse_colour`,
+        which comes with it. Both None: a cue, no pulse."""
+        if (speech_from is None) != (pulse_colour is None):
+            raise ValueError("speech_from and pulse_colour go together: both for speech, neither for a cue")
+        if pulse_colour is not None:
+            check_pulse_colour(pulse_colour)
         pcm = to_call_pcm(audio, rate)
         skip = None if speech_from is None else round(speech_from * CALL_RATE / rate) * 2 * CALL_CHANNELS
-        self._run(self._play(pcm, skip), len(pcm) / (FRAME_BYTES * 100) + 30.0, "playing audio into the call")
+        self._run(self._play(pcm, skip, pulse_colour), len(pcm) / (FRAME_BYTES * 100) + 30.0,
+                  "playing audio into the call")
 
-    async def _play(self, pcm: bytes, pulse_skip: int | None = None) -> None:
+    async def _play(self, pcm: bytes, pulse_skip: int | None, pulse_colour: str | None) -> None:
         self._require_pump()
         self._lag_max, self._lag_stalls = 0.0, 0
         self._drained.clear()
         if pulse_skip is not None:
-            self._pulse_begin(pulse_skip)
+            self._pulse_begin(pulse_colour, pulse_skip)
         self._outgoing.extend(pcm)
         self._event("playback_queued", audio_ms=len(pcm) // FRAME_BYTES * 10)
         try:
@@ -1152,17 +1174,17 @@ class TelegramLink:
                             "are only counted", describe(e))
                 self._event("pulse_send_failed", error=describe(e))
 
-    def _pulse_begin(self, skip_bytes: int) -> _PulseUtterance:
+    def _pulse_begin(self, colour: str, skip_bytes: int) -> _PulseUtterance:
         if self._pulse_utt is not None:   # one utterance at a time: close the one still open
             self._pulse_end()
         # The id is the utterance's wall-clock start in ms, strictly above the last one: two
         # utterances begun in the same ms (or a wall clock stepped back) still get rising ids.
         self._pulse_last_id = max(time.time_ns() // 1_000_000, self._pulse_last_id + 1)
-        self._pulse_utt = _PulseUtterance(self._pulse_last_id, skip_bytes)
+        self._pulse_utt = _PulseUtterance(self._pulse_last_id, colour, skip_bytes)
         return self._pulse_utt
 
     def _pulse_level(self, u: _PulseUtterance, level: float) -> None:
-        self._pulse_send(pulse_datagram(u.id, u.seq, level))
+        self._pulse_send(pulse_datagram(u.id, u.seq, u.colour, level))
         u.seq += 1
 
     def _pulse_frame(self, u: _PulseUtterance, frame: bytes, audio: bool) -> None:
@@ -1194,12 +1216,12 @@ class TelegramLink:
             self._pulse_level(u, pulse_level(np.frombuffer(b"".join(u.window), dtype=np.int16)))
             u.window.clear()
         if u.seq:
-            self._pulse_send(pulse_datagram(u.id, u.seq, None))
+            self._pulse_send(pulse_datagram(u.id, u.seq, u.colour, None))
 
-    async def _pulse_greeting(self, levels: list[float]) -> None:
+    async def _pulse_greeting(self, levels: list[float], colour: str) -> None:
         """The greeting plays as a file outside the pump: send its precomputed envelope on the
         same 30 ms clock from the moment the file starts. _end_call cancels it (and sends the end)."""
-        u = self._pulse_begin(0)
+        u = self._pulse_begin(colour, 0)
         u.started = True
         t0 = time.monotonic()
         try:
@@ -1216,7 +1238,7 @@ class TelegramLink:
 
     # ------------------------------------------------------------ streamed audio out
 
-    def play_stream(self, segments: Iterable[np.ndarray], rate: int) -> float:
+    def play_stream(self, segments: Iterable[np.ndarray], rate: int, pulse_colour: str) -> float:
         """Play audio that is produced segment by segment (owner decision 2026-10-16,
         docs/DESIGN_STREAMED_SPEECH.md). Each segment is queued on the call the moment
         `segments` yields it, while the earlier ones play; the iterator runs on the calling
@@ -1226,8 +1248,10 @@ class TelegramLink:
         With no connected call this raises CallEnded before `segments` is touched. Any
         failure after that (the producer raised, the call ended, a timeout) clears what is
         still queued, so nothing plays after the error, records an aborted
-        speech_stream_done, and propagates. Raises RuntimeError if `segments` is empty."""
-        self._run(self._stream_begin(), STREAM_STEP_TIMEOUT, "starting streamed playback")
+        speech_stream_done, and propagates. Raises RuntimeError if `segments` is empty. The
+        speech pulses the case lights in `pulse_colour`."""
+        check_pulse_colour(pulse_colour)
+        self._run(self._stream_begin(pulse_colour), STREAM_STEP_TIMEOUT, "starting streamed playback")
         samples = 0
         queued_seconds = 0.0
         try:
@@ -1250,11 +1274,11 @@ class TelegramLink:
             raise
         return samples / rate
 
-    async def _stream_begin(self) -> None:
+    async def _stream_begin(self, pulse_colour: str) -> None:
         self._require_pump()
         self._lag_max, self._lag_stalls = 0.0, 0
         self._stream = _Stream()
-        self._pulse_begin(0)
+        self._pulse_begin(pulse_colour, 0)
 
     async def _stream_add(self, pcm: bytes, produce_s: float) -> None:
         st = self._stream
@@ -1304,7 +1328,7 @@ class TelegramLink:
     # ------------------------------------------------------------ watched audio out (hold on / continue)
 
     def play_watched(self, segments: Iterable[tuple[object, np.ndarray]], rate: int,
-                     classify: Callable[[np.ndarray], Classified], accept: str) -> PlayOutcome:
+                     classify: Callable[[np.ndarray], Classified], accept: str, pulse_colour: str) -> PlayOutcome:
         """play_stream, while watching the owner's audio for the `accept` command
         (docs/DESIGN_INTERRUPT.md, Release 2). `segments` yields (tag, audio); the tag of
         the segment playing at a cut comes back in the outcome. The watch runs between
@@ -1315,8 +1339,10 @@ class TelegramLink:
         event records how much had played and the command latency, and the outcome names
         the command. Otherwise everything plays and the outcome's command is None.
         Raises CallEnded on a drop; any failure clears what is queued, records an aborted
-        speech_stream_done and propagates, as play_stream."""
-        self._run(self._stream_begin(), STREAM_STEP_TIMEOUT, "starting watched playback")
+        speech_stream_done and propagates, as play_stream. The speech pulses the case lights in
+        `pulse_colour`."""
+        check_pulse_colour(pulse_colour)
+        self._run(self._stream_begin(pulse_colour), STREAM_STEP_TIMEOUT, "starting watched playback")
         marks: list[tuple[object, int]] = []   # (tag, cumulative call-PCM bytes at its end)
         total = 0
         queued_seconds = 0.0

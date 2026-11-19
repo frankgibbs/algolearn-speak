@@ -85,6 +85,25 @@ class TestSeedAndLoad(StoreCase):
         with self.assertRaisesRegex(RuntimeError, "speed 3.0 must be a number from 0.5 to 2.0"):
             self.open()
 
+    def test_a_persona_without_a_pulse_colour_is_refused_on_load(self):
+        # DECISION (Frank, 2026-11-18): pulse_colour is required on every persona.
+        self.open()
+        reg = self.on_disk()
+        self.assertEqual(next(iter(reg["personas"].values()))["pulse_colour"], "FFB000")   # Angie's seed
+        del next(iter(reg["personas"].values()))["pulse_colour"]
+        self.write(reg)
+        with self.assertRaisesRegex(RuntimeError, "has keys .*expected .*pulse_colour"):
+            self.open()
+
+    def test_a_malformed_pulse_colour_is_refused_on_load(self):
+        self.open()
+        reg = self.on_disk()
+        for bad in ("80ff00", "80FF0", "#80FF00", 8454912):
+            next(iter(reg["personas"].values()))["pulse_colour"] = bad
+            self.write(reg)
+            with self.assertRaisesRegex(RuntimeError, "pulse_colour .* is not six upper-case hex digits"):
+                self.open()
+
     def test_a_dangling_project_or_house_pointer_is_refused_on_load(self):
         self.open()
         reg = self.on_disk()
@@ -168,7 +187,7 @@ class TestAssignment(StoreCase):
 
     def test_moving_a_project_onto_another_persona_by_name(self):
         store = self.store("algolearn-speak", "algolearn-hedge")
-        other = store.new("algolearn-hedge")["name"]
+        other = store.new("algolearn-hedge", "00E0E0")["name"]
         moved = store.set("algolearn-speak", name=other.upper())   # case-insensitive
         self.assertEqual((moved["name"], moved["shared_with"]), (other, ["algolearn-hedge"]))
         self.assertEqual(self.events[-1], (sp.PERSONA_ASSIGN_EVENT, {"project": "algolearn-speak", "persona": other,
@@ -176,7 +195,7 @@ class TestAssignment(StoreCase):
 
     def test_names_are_unique_ignoring_case(self):
         store = self.store("algolearn-speak", "algolearn-hedge")
-        pid = store.new("algolearn-hedge")["id"]
+        pid = store.new("algolearn-hedge", "00E0E0")["id"]
         broken = json.loads(json.dumps(store._registry))
         broken["personas"][pid]["name"] = "ANGIE"
         with self.assertRaisesRegex(ValueError, "persona name 'ANGIE' is used by"):
@@ -220,7 +239,7 @@ class TestAssignment(StoreCase):
         store.add("algolearn-hedge", "Dry humor.")
         self.assertNotEqual(store.key("algolearn-speak"), key)
         key = store.key("algolearn-speak")
-        store.new("algolearn-hedge")
+        store.new("algolearn-hedge", "00E0E0")
         moved = store.set("algolearn-speak", name=store.block("algolearn-hedge")["name"])
         self.assertNotEqual(store.key("algolearn-speak"), key)
         self.assertEqual(store.key("algolearn-speak"), proto.persona_key(moved))
@@ -232,16 +251,16 @@ class TestAssignment(StoreCase):
         self.assertTrue(store.block("algolearn-speak")["house"])
         store.set("algolearn-speak", name="Juno")
         self.assertTrue(store.block("algolearn-hedge")["house"])
-        self.assertFalse(store.new("algolearn-hedge")["house"])
+        self.assertFalse(store.new("algolearn-hedge", "00E0E0")["house"])
         houses = {p["name"]: p["house"] for p in store.overview("algolearn-hedge")["personas"]}
         self.assertEqual(houses, {"Juno": True, store.block("algolearn-hedge")["name"]: False})
 
     def test_pool_exhaustion_raises(self):
         store = self.store("p")
         for _ in range(len(proto.PERSONA_POOL) - 1):
-            store.new("p")
+            store.new("p", "00E0E0")
         with self.assertRaisesRegex(ValueError, "every pool name is in use; ask the owner for a name"):
-            store.new("p")
+            store.new("p", "00E0E0")
         self.assertEqual(store.overview("p")["pool_left"], 0)
 
 
@@ -273,6 +292,28 @@ class TestValidation(StoreCase):
         for weight in (0, -1, True, "1"):
             with self.assertRaisesRegex(ValueError, "must be a number above 0"):
                 sp.normalize_voice({"af_bella": weight}, VOICES)
+
+    def test_pulse_colour_is_set_like_speed(self):
+        store = self.store("algolearn-speak", "algolearn-hedge")
+        key = store.key("algolearn-speak")
+        block = store.set("algolearn-speak", pulse_colour="ff40a0")   # any case in, upper case stored
+        self.assertEqual(block["pulse_colour"], "FF40A0")
+        self.assertEqual(store.persona_of("algolearn-hedge").pulse_colour, "FF40A0")   # the shared persona
+        self.assertEqual(store.key("algolearn-speak"), key)   # the sound, not the words: no refusal
+        self.assertEqual(self.on_disk()["personas"][block["id"]]["pulse_colour"], "FF40A0")
+        overview = store.overview("algolearn-speak")
+        self.assertEqual(overview["personas"][0]["pulse_colour"], "FF40A0")
+        for bad in ("80FF0", "#80FF00", "GGGGGG", 8454912):
+            with self.assertRaisesRegex(ValueError, "pulse_colour"):
+                store.set("algolearn-speak", pulse_colour=bad)
+        with self.assertRaisesRegex(ValueError, "name cannot be combined"):
+            store.set("algolearn-speak", name="Juno", pulse_colour="00E0E0")
+
+    def test_a_new_persona_takes_its_pulse_colour(self):
+        store = self.store("algolearn-speak")
+        self.assertEqual(store.new("algolearn-speak", "00e0e0")["pulse_colour"], "00E0E0")
+        with self.assertRaisesRegex(ValueError, "pulse_colour"):
+            store.new("algolearn-speak", None)
 
     def test_the_speed_range(self):
         self.assertEqual((sp.check_speed(0.5), sp.check_speed(2)), (0.5, 2.0))

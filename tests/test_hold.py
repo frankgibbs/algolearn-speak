@@ -69,7 +69,7 @@ class Classifier:
 class WatchCase(LinkCase):
     def setUp(self):
         super().setUp()
-        self.link.call(np.zeros(100, dtype=np.float32), RATE, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), RATE, CALLER, "80FF00")
 
     def loud(self, frames):
         return [f for f in frames if f != SILENCE]
@@ -91,7 +91,7 @@ class TestPlayWatched(WatchCase):
     def test_everything_plays_when_nobody_speaks(self):
         a, b = sine(0.2), sine(0.3, 660.0)
         n0 = len(self.calls.frames)
-        out = self.link.play_watched(iter([("a", a), ("b", b)]), RATE, Classifier("hold"), proto.CMD_HOLD)
+        out = self.link.play_watched(iter([("a", a), ("b", b)]), RATE, Classifier("hold"), proto.CMD_HOLD, "80FF00")
         pcm = tg.to_call_pcm(a, RATE) + tg.to_call_pcm(b, RATE)
         self.assertEqual(out, tg.PlayOutcome(None, len(pcm), None, 0.5))
         self.assertEqual(b"".join(self.loud(self.calls.frames[n0:])), pcm)
@@ -105,7 +105,7 @@ class TestPlayWatched(WatchCase):
         a, b = sine(2.0), sine(2.0, 660.0)
         n0 = len(self.calls.frames)
         t = self.owner_says(say(1.0, 0.5))
-        out = self.link.play_watched(iter([("a", a), ("b", b)]), RATE, classify, proto.CMD_HOLD)
+        out = self.link.play_watched(iter([("a", a), ("b", b)]), RATE, classify, proto.CMD_HOLD, "80FF00")
         t.join(5)
         self.assertEqual(out.command, proto.CMD_HOLD)
         self.assertEqual(out.cut_tag, "a")   # cut inside the first 2 s segment
@@ -131,7 +131,7 @@ class TestPlayWatched(WatchCase):
     def test_the_transcript_is_recorded_while_debug_is_on(self):
         self.link.audio_stats = True
         t = self.owner_says(say(1.0, 0.5))
-        self.link.play_watched(iter([("a", sine(2.0))]), RATE, Classifier(None, "hello there"), proto.CMD_HOLD)
+        self.link.play_watched(iter([("a", sine(2.0))]), RATE, Classifier(None, "hello there"), proto.CMD_HOLD, "80FF00")
         t.join(5)
         (c,) = self.candidates()
         self.assertEqual((c["text"], c["matched"], c["acted"]), ("hello there", None, False))
@@ -139,7 +139,7 @@ class TestPlayWatched(WatchCase):
     def _dropped(self, frames: list[bytes]) -> tuple[dict, Classifier]:
         classify = Classifier("hold")
         t = self.owner_says(frames)
-        out = self.link.play_watched(iter([("a", sine(2.5))]), RATE, classify, proto.CMD_HOLD)
+        out = self.link.play_watched(iter([("a", sine(2.5))]), RATE, classify, proto.CMD_HOLD, "80FF00")
         t.join(5)
         self.assertIsNone(out.command)   # played to the end
         (c,) = self.candidates()
@@ -166,7 +166,7 @@ class TestPlayWatched(WatchCase):
         frames = say(1.0, 1.0, tail=0.0) + speech_frames(0.7, loud=False) + speech_frames(0.5) \
             + speech_frames(0.6, loud=False)
         t = self.owner_says(frames)
-        out = self.link.play_watched(iter([("a", sine(3.0))]), RATE, classify, proto.CMD_HOLD)
+        out = self.link.play_watched(iter([("a", sine(3.0))]), RATE, classify, proto.CMD_HOLD, "80FF00")
         t.join(5)
         first, second = self.candidates()
         self.assertEqual(first["result"], "transcribed")   # 1.0 s after 1.0 s of quiet: a candidate
@@ -178,7 +178,7 @@ class TestPlayWatched(WatchCase):
     def test_continue_while_playing_does_nothing(self):
         t = self.owner_says(say(1.0, 0.5))
         out = self.link.play_watched(iter([("a", sine(2.0))]), RATE, Classifier(proto.CMD_RESUME, "continue"),
-                                     proto.CMD_HOLD)
+                                     proto.CMD_HOLD, "80FF00")
         t.join(5)
         self.assertIsNone(out.command)
         (c,) = self.candidates()
@@ -187,7 +187,7 @@ class TestPlayWatched(WatchCase):
     def test_a_drop_during_watched_playback_raises_call_ended(self):
         threading.Timer(0.3, self.remote_hang_up).start()
         with self.assertRaises(tg.CallEnded):
-            self.link.play_watched(iter([("a", sine(2.0))]), RATE, Classifier(None), proto.CMD_HOLD)
+            self.link.play_watched(iter([("a", sine(2.0))]), RATE, Classifier(None), proto.CMD_HOLD, "80FF00")
         self.assertFalse(self.link._watching)
         (done,) = events_named(self.link, "speech_stream_done")
         self.assertTrue(done["aborted"])
@@ -198,7 +198,7 @@ class TestPlayWatched(WatchCase):
             raise RuntimeError("kokoro failed")
 
         with self.assertRaisesRegex(RuntimeError, "kokoro failed"):
-            self.link.play_watched(produce(), RATE, Classifier(None), proto.CMD_HOLD)
+            self.link.play_watched(produce(), RATE, Classifier(None), proto.CMD_HOLD, "80FF00")
         self.assertFalse(self.link._watching)
         self.assertEqual(self.link._outgoing, bytearray())
 
@@ -211,7 +211,7 @@ class TestPlayWatched(WatchCase):
             self.push_incoming(say(1.0, 0.5))
         t = threading.Thread(target=owner)
         t.start()
-        out = self.link.play_watched(iter([("a", a), ("b", b)]), RATE, Classifier("hold"), proto.CMD_HOLD)
+        out = self.link.play_watched(iter([("a", a), ("b", b)]), RATE, Classifier("hold"), proto.CMD_HOLD, "80FF00")
         t.join(5)
         self.assertEqual((out.command, out.cut_tag), (proto.CMD_HOLD, "b"))
         a_bytes = len(tg.to_call_pcm(a, RATE))
@@ -220,7 +220,7 @@ class TestPlayWatched(WatchCase):
 
     def test_a_cut_after_the_last_mark_has_no_cut_segment(self):
         # Everything queued has played (remaining == 0): no segment was cut.
-        self.link._run(self.link._stream_begin(), 5, "begin")
+        self.link._run(self.link._stream_begin("80FF00"), 5, "begin")
         out = self.link._cut(tg._Hit(proto.CMD_HOLD, time.monotonic()), [("a", 100), ("b", 200)], 200)
         self.assertEqual(out, tg.PlayOutcome(proto.CMD_HOLD, 200, None, 200 / (tg.FRAME_BYTES * 100)))
         (cut,) = events_named(self.link, "playback_cut")
@@ -231,7 +231,7 @@ class TestPlayWatched(WatchCase):
             self.calls.stall_send = 0.2   # the pump sends one frame every 0.2 s: 0.2 s of audio takes 4 s
             self.addCleanup(setattr, self.calls, "stall_send", 0.0)
             with self.assertRaisesRegex(TimeoutError, "playing watched audio did not finish within 0s"):
-                self.link.play_watched(iter([("a", sine(0.2))]), RATE, Classifier(None), proto.CMD_HOLD)
+                self.link.play_watched(iter([("a", sine(0.2))]), RATE, Classifier(None), proto.CMD_HOLD, "80FF00")
         self.assertFalse(self.link._watching)
         self.assertEqual(self.link._outgoing, bytearray())
         (done,) = events_named(self.link, "speech_stream_done")
@@ -252,7 +252,7 @@ class TestPlayWatchedWithoutCall(LinkCase):
             yield "a", sine(0.1)
 
         with self.assertRaisesRegex(tg.CallEnded, "no connected"):
-            self.link.play_watched(produce(), RATE, Classifier(None), proto.CMD_HOLD)
+            self.link.play_watched(produce(), RATE, Classifier(None), proto.CMD_HOLD, "80FF00")
         self.assertEqual(touched, [])
         with self.assertRaises(tg.CallEnded):
             self.link.watch_for(1.0, Classifier(None), proto.CMD_RESUME, NEVER_LEFT)
@@ -440,7 +440,8 @@ class ScriptedLink:
     def state(self) -> str:
         return self._state
 
-    def play_watched(self, segments, rate, classify, accept):
+    def play_watched(self, segments, rate, classify, accept, pulse_colour):
+        self.watched_colour = pulse_colour
         tags = []
         cut = self.cuts.pop(0) if self.cuts else None
         it = iter(segments)
@@ -469,7 +470,7 @@ class ScriptedLink:
         self.log.append(("record",))
         return np.zeros(eng.STT_RATE, dtype=np.float32)
 
-    def play(self, audio, rate, speech_from=None) -> None:
+    def play(self, audio, rate, speech_from=None, pulse_colour=None) -> None:
         self.log.append(("cue",))
 
     def hang_up(self) -> str:

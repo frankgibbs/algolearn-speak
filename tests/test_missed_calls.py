@@ -136,7 +136,7 @@ class TestServiceMissedCalls(FloorServiceCase):
 
     def test_the_link_is_told_who_is_calling(self):
         seen = []
-        self.link.call = lambda audio, rate, caller: seen.append(caller) or tg.NOT_ANSWERED
+        self.link.call = lambda audio, rate, caller, pulse_colour: seen.append(caller) or tg.NOT_ANSWERED
         self.svc.call(self.req(B), GREETING, True, 120, 2.0, 45)
         self.assertEqual(seen, [tg.Caller("Angie", "algolearn-hedge", "session-b")])
 
@@ -172,7 +172,7 @@ class TestServiceMissedCalls(FloorServiceCase):
 
 class TestLinkTagsTheCaller(LinkCase):
     def test_every_event_of_the_call_names_the_caller(self):
-        self.assertEqual(self.link.call(np.zeros(2400, dtype=np.float32), 24000, CALLER), tg.ANSWERED)
+        self.assertEqual(self.link.call(np.zeros(2400, dtype=np.float32), 24000, CALLER, "80FF00"), tg.ANSWERED)
         self.remote_hang_up()
         self.wait_until(lambda: self.link.state() == tg.NONE)
         bound = [e for e in self.link.events.recent(500) if e["call_id"] is not None]
@@ -184,7 +184,7 @@ class TestLinkTagsTheCaller(LinkCase):
 
     def test_a_call_without_a_caller_is_refused(self):
         with self.assertRaises(TypeError):
-            self.link.call(np.zeros(2400, dtype=np.float32), 24000, None)
+            self.link.call(np.zeros(2400, dtype=np.float32), 24000, None, "80FF00")
 
 
 class NoCallLink:

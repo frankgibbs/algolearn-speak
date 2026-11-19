@@ -358,7 +358,7 @@ class DialLink(ScriptedLink):
         self.outcome = tg.ANSWERED
         self.no_speech = False
 
-    def call(self, audio, rate, caller) -> str:
+    def call(self, audio, rate, caller, pulse_colour) -> str:
         self.log.append(("dial",))
         if self.outcome == tg.ANSWERED:
             self._state = tg.CONNECTED
@@ -666,10 +666,10 @@ class GateLink(TurnLink):
             self.hang_up_gate.wait(10)
         return super().hang_up()
 
-    def play_watched(self, segments, rate, classify, accept):
+    def play_watched(self, segments, rate, classify, accept, pulse_colour):
         if self.speech_gate is not None:
             self.speech_gate.wait(10)
-        return super().play_watched(segments, rate, classify, accept)
+        return super().play_watched(segments, rate, classify, accept, pulse_colour)
 
     def record(self, max_seconds, silence_seconds, start_timeout_seconds, cue, rate):
         if self.gate is not None:

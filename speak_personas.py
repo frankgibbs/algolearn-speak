@@ -1,4 +1,4 @@
-"""The persona registry: a name, a voice blend, a speed and a personality per project.
+"""The persona registry: a name, a voice blend, a speed, a pulse colour and a personality per project.
 
 Design: docs/DESIGN_PERSONAS.md (owner decisions 2026-10-22). Stdlib only, no CUDA, no
 Telegram and no audio, so it is tested directly like `speak_protocol`.
@@ -6,7 +6,7 @@ Telegram and no audio, so it is tested directly like `speak_protocol`.
 The registry is one JSON file (`SPEAK_PERSONAS_FILE`, on the `speak_state` volume), schema 1:
 
     {"schema": 1,
-     "personas": {id: {"name", "voice": {voice id: weight}, "speed",
+     "personas": {id: {"name", "voice": {voice id: weight}, "speed", "pulse_colour",
                        "personality": [{"text", "project", "added"}], "words_revision", "created"}},
      "projects": {project: id},
      "house": id}
@@ -14,6 +14,10 @@ The registry is one JSON file (`SPEAK_PERSONAS_FILE`, on the `speak_state` volum
 - Every project that has spoken to the daemon points at exactly one persona; a project with
   no entry is assigned to the house persona (the one seeded as Angie, followed by id, so a
   rename keeps it the house persona) on its first identity-carrying request (`ensure`).
+- `pulse_colour` (DECISION Frank, 2026-11-18) is the RRGGBB the case lights on proxmox01 pulse
+  while this persona speaks (lan/gpu/case-fan-loop/DESIGN-voice-pulse.md). Required on every
+  persona; any colour is allowed; stored upper case. Like voice and speed it leaves
+  `words_revision` as it is.
 - `words_revision` rises only when something an agent's words depend on changes: the
   persona's name or personality. A voice or speed change leaves it as it is, since the daemon
   applies those per sentence (docs/DESIGN_PERSONAS.md 4.7, Design 2026-10-22). A project's
@@ -53,6 +57,7 @@ import speak_protocol as proto
 log = logging.getLogger("speak-personas")
 
 SCHEMA = 1
+PULSE_COLOUR_RE = re.compile(r"[0-9A-F]{6}")
 NAME_RE = re.compile(rf"[A-Za-z]{{2,{proto.PERSONA_NAME_MAX}}}")
 WEIGHT_DECIMALS = 4
 
@@ -73,6 +78,7 @@ class Persona:
     name: str
     voice: tuple[tuple[str, float], ...]
     speed: float
+    pulse_colour: str
     words_revision: int
 
     @property
@@ -99,6 +105,13 @@ def check_speed(speed) -> float:
         raise ValueError(f"speed {speed!r} must be a number from {proto.PERSONA_SPEED_MIN} "
                          f"to {proto.PERSONA_SPEED_MAX}")
     return float(speed)
+
+
+def check_pulse_colour(colour) -> str:
+    """A pulse colour "RRGGBB" (six hex digits, either case), upper-cased; raises ValueError."""
+    if not isinstance(colour, str) or not PULSE_COLOUR_RE.fullmatch(colour.upper()):
+        raise ValueError(f"pulse_colour {colour!r} must be six hex digits RRGGBB, e.g. 80FF00")
+    return colour.upper()
 
 
 def normalize_voice(voice, voices: Iterable[str]) -> dict[str, float]:
@@ -146,7 +159,7 @@ def validate(registry, voices: Iterable[str]) -> None:
     for pid, p in personas.items():
         if not isinstance(p, dict):
             raise ValueError(f"persona {pid!r} is not an object")
-        expected = {"name", "voice", "speed", "personality", "words_revision", "created"}
+        expected = {"name", "voice", "speed", "pulse_colour", "personality", "words_revision", "created"}
         if set(p) != expected:
             raise ValueError(f"persona {pid!r} has keys {sorted(p)}, expected {sorted(expected)}")
         check_name(p["name"])
@@ -170,6 +183,8 @@ def validate(registry, voices: Iterable[str]) -> None:
             check_speed(p["speed"])
         except ValueError as e:
             raise ValueError(f"persona {pid!r}: {e}") from None
+        if not isinstance(p["pulse_colour"], str) or not PULSE_COLOUR_RE.fullmatch(p["pulse_colour"]):
+            raise ValueError(f"persona {pid!r}: pulse_colour {p['pulse_colour']!r} is not six upper-case hex digits")
         revision = p["words_revision"]
         if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
             raise ValueError(f"persona {pid!r}: words_revision must be an integer of 1 or more")
@@ -235,7 +250,8 @@ class PersonaStore:
         if not os.path.exists(path):
             store = cls(path, {}, voices, default_voice, default_speed, tz, record_event)
             pid = secrets.token_hex(4)
-            registry = {"schema": SCHEMA, "personas": {pid: store._fresh(proto.PERSONA_SEED_NAME)},
+            registry = {"schema": SCHEMA, "personas": {pid: store._fresh(proto.PERSONA_SEED_NAME,
+                                                                         proto.PERSONA_SEED_PULSE_COLOUR)},
                         "projects": {}, "house": pid}
             validate(registry, voices)
             store._persist(registry)
@@ -269,7 +285,8 @@ class PersonaStore:
         with self._lock:
             pid = self._pid(project)
             p = self._registry["personas"][pid]
-            return Persona(pid, p["name"], tuple(p["voice"].items()), p["speed"], p["words_revision"])
+            return Persona(pid, p["name"], tuple(p["voice"].items()), p["speed"], p["pulse_colour"],
+                           p["words_revision"])
 
     def key(self, project: str) -> str:
         """The project's current "<id>:<words_revision>"."""
@@ -286,7 +303,7 @@ class PersonaStore:
         with self._lock:
             reg = self._registry
             personas = [{"name": p["name"], "house": pid == reg["house"], "voice": dict(p["voice"]),
-                         "speed": p["speed"],
+                         "speed": p["speed"], "pulse_colour": p["pulse_colour"],
                          "projects": sorted(pr for pr, pid2 in reg["projects"].items() if pid2 == pid)}
                         for pid, p in reg["personas"].items()]
             return {proto.REPLY_PERSONA: self._block(project), "personas": personas, "voices": list(self.voices),
@@ -295,9 +312,10 @@ class PersonaStore:
 
     # ------------------------------------------------------------ changes
 
-    def new(self, project: str) -> dict:
-        """A brand-new persona with a random unused pool name and the default voice and speed;
-        the project moves onto it (persona_assign how new). Returns the block."""
+    def new(self, project: str, pulse_colour) -> dict:
+        """A brand-new persona with a random unused pool name, the default voice and speed and
+        `pulse_colour`; the project moves onto it (persona_assign how new). Returns the block."""
+        colour = check_pulse_colour(pulse_colour)
         with self._lock:
             left = self._pool_left()
             if not left:
@@ -309,24 +327,26 @@ class PersonaStore:
             old = self._registry["personas"][self._pid(project)]["name"]
 
             def change(r: dict) -> None:
-                r["personas"][pid] = self._fresh(name)
+                r["personas"][pid] = self._fresh(name, colour)
                 r["projects"][project] = pid
             self._commit(change)
             block = self._block(project)
         self._record_event(PERSONA_ASSIGN_EVENT, project=project, persona=name, how="new", **{"from": old})
         return block
 
-    def set(self, project: str, name=None, voice=None, speed=None, personality=None) -> dict:
+    def set(self, project: str, name=None, voice=None, speed=None, personality=None, pulse_colour=None) -> dict:
         """Change the project's persona (docs/DESIGN_PERSONAS.md 4.9). `name` alone moves the
         project onto the persona of that name (case-insensitive), or renames its own persona
-        for every project sharing it when no other persona has the name. `voice`, `speed` and
-        `personality` (the whole note as a list of lines) change the persona for every project
+        for every project sharing it when no other persona has the name. `voice`, `speed`,
+        `pulse_colour` and `personality` (the whole note as a list of lines) change the persona for every project
         using it; only a change to the personality's texts raises words_revision (the same
         list again does not). Returns the block."""
-        if name is not None and (voice is not None or speed is not None or personality is not None):
-            raise ValueError("name cannot be combined with voice, speed or personality; one change per call")
-        if name is None and voice is None and speed is None and personality is None:
-            raise ValueError("nothing to change: pass name, voice, speed or personality")
+        others = (voice, speed, personality, pulse_colour)
+        if name is not None and any(v is not None for v in others):
+            raise ValueError("name cannot be combined with voice, speed, pulse_colour or personality; "
+                             "one change per call")
+        if name is None and all(v is None for v in others):
+            raise ValueError("nothing to change: pass name, voice, speed, pulse_colour or personality")
         if name is not None:
             return self._set_name(project, check_name(name))
         with self._lock:
@@ -334,9 +354,10 @@ class PersonaStore:
             p = self._registry["personas"][pid]
             new_voice = normalize_voice(voice, self.voices) if voice is not None else None
             new_speed = check_speed(speed) if speed is not None else None
+            new_colour = check_pulse_colour(pulse_colour) if pulse_colour is not None else None
             new_personality = self._replace_personality(p["personality"], personality, project) \
                 if personality is not None else None
-            fields = [f for f, v in (("voice", new_voice), ("speed", new_speed),
+            fields = [f for f, v in (("voice", new_voice), ("speed", new_speed), ("pulse_colour", new_colour),
                                      ("personality", new_personality)) if v is not None]
 
             def change(r: dict) -> None:
@@ -345,6 +366,8 @@ class PersonaStore:
                     q["voice"] = new_voice
                 if new_speed is not None:
                     q["speed"] = new_speed
+                if new_colour is not None:
+                    q["pulse_colour"] = new_colour
                 if new_personality is not None:
                     if [e["text"] for e in new_personality] != [e["text"] for e in q["personality"]]:
                         q["words_revision"] += 1
@@ -443,16 +466,16 @@ class PersonaStore:
         p = reg["personas"][pid]
         return {"id": pid, "words_revision": p["words_revision"], "name": p["name"],
                 "house": pid == reg["house"], "voice": dict(p["voice"]),
-                "speed": p["speed"], "personality": [e["text"] for e in p["personality"]],
+                "speed": p["speed"], "pulse_colour": p["pulse_colour"], "personality": [e["text"] for e in p["personality"]],
                 "shared_with": sorted(pr for pr, q in reg["projects"].items() if q == pid and pr != project)}
 
     def _pool_left(self) -> list[str]:
         used = {p["name"].casefold() for p in self._registry["personas"].values()}
         return [n for n in proto.PERSONA_POOL if n.casefold() not in used]
 
-    def _fresh(self, name: str) -> dict:
+    def _fresh(self, name: str, pulse_colour: str) -> dict:
         return {"name": name, "voice": {self.default_voice: 1.0}, "speed": float(self.default_speed),
-                "personality": [], "words_revision": 1, "created": self._now()}
+                "pulse_colour": pulse_colour, "personality": [], "words_revision": 1, "created": self._now()}
 
     def _now(self) -> str:
         return datetime.datetime.now(self._tz).isoformat(timespec="seconds")
@@ -492,4 +515,5 @@ class PersonaStore:
     def _record_change(self, project: str, fields: list[str], old: dict, new: dict) -> None:
         self._record_event(PERSONA_CHANGE_EVENT, persona=new["name"], fields=fields, project=project,
                            old_name=old["name"], new_name=new["name"], old_voice=old["voice"],
-                           new_voice=new["voice"], old_speed=old["speed"], new_speed=new["speed"])
+                           new_voice=new["voice"], old_speed=old["speed"], new_speed=new["speed"],
+                           old_pulse_colour=old["pulse_colour"], new_pulse_colour=new["pulse_colour"])

@@ -298,7 +298,7 @@ def _switch_line(reply: dict) -> str:
 
 
 def _persona_line(reply: dict) -> str:
-    """'[persona: you are <Name>; voice ...; speed ...; personality: ...]\n' when the reply
+    """'[persona: you are <Name>; voice ...; speed ...; pulse colour ...; personality: ...]\n' when the reply
     carries this project's persona (new to this session, or its name or personality changed);
     "" otherwise. On the house persona it says "you are <Name>, the house persona", so the agent
     knows not to add to its personality on its own. Comes after the switch line and before the
@@ -310,7 +310,8 @@ def _persona_line(reply: dict) -> str:
     personality = " / ".join(p["personality"]) if p["personality"] else "(none yet)"
     shared = f"; shared with {', '.join(p['shared_with'])}" if p["shared_with"] else ""
     house = ", the house persona" if p["house"] else ""
-    return f"[persona: you are {p['name']}{house}; voice {voice}; speed {p['speed']:g}; personality: {personality}{shared}]\n"
+    return (f"[persona: you are {p['name']}{house}; voice {voice}; speed {p['speed']:g}; "
+            f"pulse colour {p['pulse_colour']}; personality: {personality}{shared}]\n")
 
 
 def _ended_line(reply: dict) -> str:
@@ -439,14 +440,15 @@ def _persona_sync() -> dict:
     return _strip(_request(proto.OP_PERSONA, {}, QUICK_REPLY_TIMEOUT_SECONDS))
 
 
-def _new_persona_sync() -> dict:
-    return _strip(_request(proto.OP_PERSONA_NEW, {}, QUICK_REPLY_TIMEOUT_SECONDS))
+def _new_persona_sync(pulse_colour: str) -> dict:
+    return _strip(_request(proto.OP_PERSONA_NEW, {"pulse_colour": pulse_colour}, QUICK_REPLY_TIMEOUT_SECONDS))
 
 
 def _set_persona_sync(name: str | None, voice: dict[str, float] | None, speed: float | None,
-                      personality: list[str] | None) -> dict:
+                      personality: list[str] | None, pulse_colour: str | None) -> dict:
     return _strip(_request(proto.OP_PERSONA_SET, {"name": name, "voice": voice, "speed": speed,
-                                                  "personality": personality}, QUICK_REPLY_TIMEOUT_SECONDS))
+                                                  "personality": personality, "pulse_colour": pulse_colour},
+                           QUICK_REPLY_TIMEOUT_SECONDS))
 
 
 def _add_to_personality_sync(note: str) -> dict:
@@ -844,9 +846,9 @@ async def hang_up() -> str:
 
 
 @mcp.tool()
-@_doc("""Your project's persona (name, voice blend, speed, personality, the projects sharing it), every persona, and the voice ids and speed range you may use.
+@_doc("""Your project's persona (name, voice blend, speed, pulse colour, personality, the projects sharing it), every persona, and the voice ids and speed range you may use.
 
-    Returns `{"persona": {...}, "personas": [{"name", "house", "voice", "speed", "projects"}],
+    Returns `{"persona": {...}, "personas": [{"name", "house", "voice", "speed", "pulse_colour", "projects"}],
     "voices": [ids], "speed_range": [min, max], "pool_left": n}`. Never waits for the call.
 """)
 async def persona() -> dict:
@@ -854,25 +856,27 @@ async def persona() -> dict:
 
 
 @mcp.tool()
-@_doc("""Give your project a brand-new persona with an unused name from the pool and the default voice; returns it.
+@_doc("""Give your project a brand-new persona with an unused name from the pool, the default voice and `pulse_colour`; returns it.
 
-    Raises ValueError "every pool name is in use; ask the owner for a name" when the pool
-    is used up.
+    `pulse_colour` (required) is the RRGGBB the case lights pulse while it speaks, e.g. "80FF00";
+    any colour is allowed. Raises ValueError "every pool name is in use; ask the owner for a
+    name" when the pool is used up.
 """)
-async def new_persona() -> dict:
-    return await _run(_new_persona_sync)
+async def new_persona(pulse_colour: str) -> dict:
+    return await _run(_new_persona_sync, pulse_colour)
 
 
 @mcp.tool()
-@_doc("""Change your persona: name alone moves your project onto the persona of that name, or renames yours (for every project sharing it) when no persona has it; voice {id: weight} and speed change how it sounds for every project using it from the next sentence; personality [lines] replaces the note (persona review).
+@_doc("""Change your persona: name alone moves your project onto the persona of that name, or renames yours (for every project sharing it) when no persona has it; voice {id: weight} and speed change how it sounds for every project using it from the next sentence; pulse_colour changes the case lights' colour from its next utterance; personality [lines] replaces the note (persona review).
 
     `name` (one word of 2 to 12 letters) cannot be combined with the others. `voice` takes
     1 to 4 English voice ids from `persona()` with positive weights (normalized to sum 1);
-    `speed` is within `persona()`'s speed_range.
+    `speed` is within `persona()`'s speed_range; `pulse_colour` is RRGGBB (six hex digits,
+    any colour).
 """)
 async def set_persona(name: str | None = None, voice: dict[str, float] | None = None, speed: float | None = None,
-                      personality: list[str] | None = None) -> dict:
-    return await _run(_set_persona_sync, name, voice, speed, personality)
+                      personality: list[str] | None = None, pulse_colour: str | None = None) -> dict:
+    return await _run(_set_persona_sync, name, voice, speed, personality, pulse_colour)
 
 
 @mcp.tool()

@@ -238,7 +238,7 @@ class TestLibraryDropDiscards(LinkCase):
                                          self.link._loop).result(5)
 
     def answered(self):
-        self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER), tg.ANSWERED)
+        self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00"), tg.ANSWERED)
 
     def named(self, name):
         return events_named(self.link, name)
@@ -348,14 +348,14 @@ class TestLibraryDropDiscards(LinkCase):
 
     def _call_quietly(self):
         try:
-            self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+            self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         except BaseException:
             pass
 
 
 class TestCallAnswered(LinkCase):
     def test_answer_flow_matches_the_spike(self):
-        outcome = self.link.call(np.zeros(2400, dtype=np.float32), 24000, CALLER)
+        outcome = self.link.call(np.zeros(2400, dtype=np.float32), 24000, CALLER, "80FF00")
         self.assertEqual(outcome, tg.ANSWERED)
         self.assertEqual(self.link.state(), tg.CONNECTED)
         (uid1, opener, config), (uid2, raw, no_config) = self.calls.plays
@@ -367,12 +367,12 @@ class TestCallAnswered(LinkCase):
         self.assertEqual(self.calls.frames[0], bytes(tg.FRAME_BYTES))
 
     def test_already_connected(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
-        self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER), tg.ALREADY_CONNECTED)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
+        self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00"), tg.ALREADY_CONNECTED)
         self.assertEqual(len(self.calls.plays), 2)   # no second dial
 
     def test_play_sends_the_audio_paced_and_returns(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         n_before = len(self.calls.frames)
         tone = (0.3 * np.sin(2 * np.pi * 440 * np.arange(12000) / 24000)).astype(np.float32)  # 0.5 s
         t0 = time.monotonic()
@@ -383,7 +383,7 @@ class TestCallAnswered(LinkCase):
         self.assertEqual(len(loud), 50)    # 0.5 s = 50 frames of 10 ms
 
     def test_remote_hang_up_ends_everything(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.remote_hang_up()
         self.assertEqual(self.link.state(), tg.NONE)
         n = len(self.calls.frames)
@@ -393,18 +393,18 @@ class TestCallAnswered(LinkCase):
             self.link.play(np.zeros(100, dtype=np.float32), 24000)
 
     def test_hang_up_during_play_raises_call_ended(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         threading.Timer(0.1, self.remote_hang_up).start()
         with self.assertRaisesRegex(tg.CallEnded, "during playback"):
             self.link.play(np.zeros(48000, dtype=np.float32), 24000)   # 2 s
 
     def test_other_chats_are_ignored(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.emit(ChatUpdate(USER_ID + 1, ChatUpdate.Status.DISCARDED_CALL))
         self.assertEqual(self.link.state(), tg.CONNECTED)
 
     def test_hang_up(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.assertEqual(self.link.hang_up(), tg.HUNG_UP)
         self.assertEqual(self.calls.left, 1)
         self.assertEqual(self.link.state(), tg.NONE)
@@ -413,7 +413,7 @@ class TestCallAnswered(LinkCase):
 
 class TestReviewFindings(LinkCase):
     def test_a_dead_pump_ends_the_call(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.calls.fail_send = RuntimeError("ntgcalls exploded")
         self.wait_until(lambda: self.link.state() == tg.NONE)
         self.assertEqual(self.link.info()["end_reason"], tg.END_FAILED)
@@ -423,14 +423,14 @@ class TestReviewFindings(LinkCase):
 
     def test_library_dropping_the_call_is_a_remote_end(self):
         from pytgcalls.exceptions import NotInCallError
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.calls.fail_send = NotInCallError()   # the owner hung up; the pump notices first
         self.wait_until(lambda: self.link.state() == tg.NONE)
         self.assertEqual(self.link.info()["end_reason"], tg.END_REMOTE)
 
     def test_our_hang_up_is_recorded_even_when_the_pump_notices_first(self):
         from pytgcalls.exceptions import NotInCallError
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         calls = self.calls
 
         async def leave(chat_id):   # like the library: leaving makes send_frame fail
@@ -445,14 +445,14 @@ class TestReviewFindings(LinkCase):
     def test_failure_after_answer_tears_the_call_down(self):
         self.calls.fail_record = RuntimeError("TelegramServerError")
         with self.assertRaisesRegex(RuntimeError, "TelegramServerError"):
-            self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+            self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.assertEqual(self.link.state(), tg.NONE)
         self.assertEqual(self.calls.left, 1)
 
     def test_hang_up_during_the_greeting_is_its_own_outcome(self):
         with mock.patch.object(tg, "OPENER_TAIL_SECONDS", 0.5):
             threading.Timer(0.2, self.remote_hang_up).start()
-            self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER), tg.HUNG_UP_DURING_GREETING)
+            self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00"), tg.HUNG_UP_DURING_GREETING)
         self.assertEqual(len(self.calls.plays), 1)   # never switched to raw frames
         self.assertEqual(self.link.state(), tg.NONE)
         self.assertIn("hung_up_during_greeting", [e["event"] for e in self.link.events.recent(50)])
@@ -460,13 +460,13 @@ class TestReviewFindings(LinkCase):
     def test_hang_up_from_another_session_during_the_greeting_is_hung_up(self):
         with mock.patch.object(tg, "OPENER_TAIL_SECONDS", 0.5):
             threading.Timer(0.2, self.link.hang_up).start()
-            self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER), tg.HUNG_UP)
+            self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00"), tg.HUNG_UP)
         self.assertEqual(self.link.state(), tg.NONE)
         self.assertEqual(self.link.info()["end_reason"], tg.END_HUNG_UP)
 
     def test_hang_up_when_the_library_already_dropped_it(self):
         from pytgcalls.exceptions import NotInCallError
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
 
         async def gone(chat_id):
             raise NotInCallError()
@@ -488,14 +488,14 @@ class TestReviewFindings(LinkCase):
 
     def _call_catching(self):
         try:
-            return self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+            return self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         except BaseException as e:
             return e
 
     def test_late_end_update_does_not_end_the_next_call(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.link.hang_up()
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         gen = self.link.info()["generation"]
         self.link._state = tg.NONE   # simulate the window where a stale update would arrive
         self.remote_hang_up()        # ignored: nothing is in progress
@@ -503,7 +503,7 @@ class TestReviewFindings(LinkCase):
         self.assertEqual(self.link.info(), {"state": tg.CONNECTED, "generation": gen, "end_reason": None})
 
     def test_a_timed_out_play_does_not_keep_playing(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         with mock.patch.object(self.link, "_run", wraps=self.link._run) as run:
             def short(coro, timeout, what):
                 return tg.TelegramLink._run(self.link, coro, 0.1, what)
@@ -515,7 +515,7 @@ class TestReviewFindings(LinkCase):
 
     def test_generation_and_end_reason(self):
         self.assertEqual(self.link.info()["generation"], 0)
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.assertEqual(self.link.info(), {"state": tg.CONNECTED, "generation": 1, "end_reason": None})
         self.remote_hang_up()
         self.assertEqual(self.link.info(), {"state": tg.NONE, "generation": 1, "end_reason": tg.END_REMOTE})
@@ -574,7 +574,7 @@ class TestStop(unittest.TestCase):
                                vad_factory=StubVAD, vad_preload=lambda: None, pulse=FakePulse())
         with mock.patch.multiple(tg, OPENER_MIN_SECONDS=0.004, OPENER_TAIL_SECONDS=0.02, REDIAL_SETTLE_SECONDS=0.0):
             link.start()
-            link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+            link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
             link.stop()
         self.assertEqual(made[0].left, 1)
         self.assertFalse(link._thread.is_alive())
@@ -583,7 +583,7 @@ class TestStop(unittest.TestCase):
 
 class TestRecord(LinkCase):
     def test_captures_speech_until_silence_after_the_cue(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         cue = (0.5 * np.sin(2 * np.pi * 880 * np.arange(2400) / 24000)).astype(np.float32)   # 0.1 s
         result = {}
         t = threading.Thread(target=lambda: result.setdefault("audio", self.link.record(10, 0.3, 5, cue, 24000)))
@@ -599,11 +599,11 @@ class TestRecord(LinkCase):
         self.assertLess(len(audio) / tg.VAD_RATE, 2.0)
 
     def test_nobody_speaks(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.assertIs(self.link.record(10, 0.3, 0.3, None, 24000), tg.TIMEOUT)
 
     def test_hang_up_during_listen_raises(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         threading.Timer(0.2, self.remote_hang_up).start()
         with self.assertRaisesRegex(tg.CallEnded, "during listen"):
             self.link.record(10, 0.3, 5, None, 24000)
@@ -618,7 +618,7 @@ def _not_answered_case(exc):
         ring = exc
 
         def test_maps_to_not_answered(self):
-            self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER), tg.NOT_ANSWERED)
+            self.assertEqual(self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00"), tg.NOT_ANSWERED)
             self.assertEqual(self.link.state(), tg.NONE)
             self.assertEqual(len(self.calls.plays), 1)   # never switched to raw frames
     Case.__name__ = f"TestNotAnswered_{type(exc).__name__}"
@@ -635,7 +635,7 @@ class TestUnexpectedFailure(LinkCase):
 
     def test_raises_and_resets(self):
         with self.assertRaisesRegex(ConnectionError, "network down"):
-            self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+            self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.assertEqual(self.link.state(), tg.NONE)
 
 
@@ -678,7 +678,7 @@ class AcceptedCase(LinkCase):
 
 
 def _call(link):
-    return link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+    return link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
 
 
 class TestAudioFailure(AcceptedCase):
@@ -785,14 +785,14 @@ class TestEventLog(unittest.TestCase):
 
 class TestAnsweredEvents(LinkCase):
     def test_success_path_events(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         names = [e["event"] for e in self.link.events.recent(50)]
         names = [n for n in names if not n.startswith("audio_") and n != "opener_written"]
         self.assertEqual(names[:5], ["requested", "ringing", "answered_media_connected", "recording", "raw_frames"])
         self.assertEqual(names[5], "connected")
 
     def test_playback_timeline_events(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.link.play(np.zeros(2400, dtype=np.float32), 24000)
         names = [e["event"] for e in self.link.events.recent(100)]
         for n in ("first_frame_sent", "playback_queued", "audio_out_start", "playback_done"):
@@ -841,7 +841,7 @@ class TestAmplitudeEvents(LinkCase):
 
     def test_no_audio_events_while_debug_is_off(self):
         self.link.audio_stats = False
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.push_incoming(speech_frames(0.05, loud=True))
         time.sleep(0.3)
         self.link.hang_up()
@@ -850,20 +850,20 @@ class TestAmplitudeEvents(LinkCase):
 
     def test_turning_it_on_mid_call_starts_the_events(self):
         self.link.audio_stats = False
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.link.audio_stats = True
         self.wait_until(lambda: len(events_named(self.link, "audio_in")) >= 1)
 
     def test_opener_written_event(self):
         tone = (0.5 * np.sin(2 * np.pi * 440 * np.arange(2400) / 24000)).astype(np.float32)
-        self.link.call(tone, 24000, CALLER)
+        self.link.call(tone, 24000, CALLER, "80FF00")
         (e,) = events_named(self.link, "opener_written")
         self.assertAlmostEqual(e["duration_s"], 0.1, places=3)
         self.assertAlmostEqual(e["peak"], 0.5 * 32767, delta=100)
         self.assertGreater(e["rms"], 1000)
 
     def test_incoming_summary_counts_all_frames_even_when_not_listening(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.push_incoming(speech_frames(0.05, loud=True) + speech_frames(0.03, loud=False))   # not listening
         self.assertEqual(self.link._incoming.qsize(), 0)
         self.wait_until(lambda: sum(e["frames"] for e in events_named(self.link, "audio_in")) >= 8)
@@ -876,12 +876,12 @@ class TestAmplitudeEvents(LinkCase):
         self.assertEqual(evs[-1]["phase"], "raw")
 
     def test_summary_is_emitted_even_with_no_frames(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.wait_until(lambda: len(events_named(self.link, "audio_in")) >= 3)
         self.assertTrue(all(e["frames"] == 0 for e in events_named(self.link, "audio_in")))
 
     def test_outgoing_summary_separates_audio_and_silence(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         tone = (0.3 * np.sin(2 * np.pi * 440 * np.arange(12000) / 24000)).astype(np.float32)   # 0.5 s
         self.link.play(tone, 24000)
         self.wait_until(lambda: sum(e["audio_frames"] for e in events_named(self.link, "audio_out")) >= 50)
@@ -893,7 +893,7 @@ class TestAmplitudeEvents(LinkCase):
         self.assertGreater(max(e["audio_rms"] for e in evs), 3000)
 
     def test_stats_stop_with_the_call_after_a_final_summary(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         self.link.hang_up()
         n = len(events_named(self.link, "audio_in"))
         self.assertGreaterEqual(n, 1)
@@ -902,7 +902,7 @@ class TestAmplitudeEvents(LinkCase):
         self.assertIsNone(self.link._stats_task)
 
     def test_opener_phase_probe_reports_not_exposed_when_no_outgoing_frames(self):
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
         (e,) = events_named(self.link, "audio_opener_out")
         self.assertFalse(e["exposed"])
         self.assertEqual(e["frames"], 0)
@@ -915,7 +915,7 @@ class TestAmplitudeEvents(LinkCase):
         with mock.patch.object(tg, "OPENER_TAIL_SECONDS", 0.3):
             th = threading.Thread(target=lambda: self.wait_until(lambda: self.link.state() == tg.CONNECTED) or during_opener())
             th.start()
-            self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+            self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
             th.join()
         (e,) = events_named(self.link, "audio_opener_out")
         self.assertTrue(e["exposed"])
@@ -935,7 +935,7 @@ class TestPlayStream(LinkCase):
 
     def setUp(self):
         super().setUp()
-        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)
+        self.link.call(np.zeros(100, dtype=np.float32), 24000, CALLER, "80FF00")
 
     def loud(self, frames=None):
         return [f for f in (self.calls.frames if frames is None else frames) if f != self.SILENCE]
@@ -952,13 +952,13 @@ class TestPlayStream(LinkCase):
             self.wait_until(lambda: len(self.loud()) >= 5)
             yield sine(0.3, 660.0)
 
-        self.assertAlmostEqual(self.link.play_stream(produce(), 24000), 0.6)
+        self.assertAlmostEqual(self.link.play_stream(produce(), 24000, "80FF00"), 0.6)
         self.assertEqual(len(self.loud()), 60)
 
     def test_segments_in_time_play_contiguously_without_underrun(self):
         a, b, c = sine(0.2), sine(0.3, 550.0), sine(0.1, 660.0)
         n0 = len(self.calls.frames)
-        self.link.play_stream(iter([a, b, c]), 24000)
+        self.link.play_stream(iter([a, b, c]), 24000, "80FF00")
         sent = self.calls.frames[n0:]
         first = next(i for i, f in enumerate(sent) if f != self.SILENCE)
         self.assertEqual(sent[first:first + 60], self.loud(sent))   # 60 loud frames back to back
@@ -978,7 +978,7 @@ class TestPlayStream(LinkCase):
             yield b
 
         n0 = len(self.calls.frames)
-        self.link.play_stream(produce(), 24000)
+        self.link.play_stream(produce(), 24000, "80FF00")
         sent = self.calls.frames[n0:]
         # The audio itself is exact: nothing sped up, dropped or repeated.
         self.assertEqual(b"".join(self.loud(sent)), tg.to_call_pcm(a, 24000) + tg.to_call_pcm(b, 24000))
@@ -997,7 +997,7 @@ class TestPlayStream(LinkCase):
             time.sleep(0.15)
             yield sine(0.1)
 
-        self.link.play_stream(produce(), 24000)
+        self.link.play_stream(produce(), 24000, "80FF00")
         s = self.summary()
         self.assertGreaterEqual(s["first_audio_ms"], 140)
         self.assertEqual(s["underruns"], 0)
@@ -1011,7 +1011,7 @@ class TestPlayStream(LinkCase):
             raise ValueError("kokoro broke")
 
         with self.assertRaisesRegex(ValueError, "kokoro broke"):
-            self.link.play_stream(produce(), 24000)
+            self.link.play_stream(produce(), 24000, "80FF00")
         self.assertEqual(len(self.link._outgoing), 0)
         n = len(self.loud())
         time.sleep(0.15)
@@ -1028,17 +1028,17 @@ class TestPlayStream(LinkCase):
             yield sine(0.5)
 
         with self.assertRaisesRegex(tg.CallEnded, "ended during playback"):
-            self.link.play_stream(produce(), 24000)
+            self.link.play_stream(produce(), 24000, "80FF00")
         self.assertTrue(self.summary()["aborted"])
 
     def test_remote_hang_up_while_the_last_segment_plays_raises_call_ended(self):
         threading.Timer(0.1, self.remote_hang_up).start()
         with self.assertRaisesRegex(tg.CallEnded, "ended during playback"):
-            self.link.play_stream(iter([sine(2.0)]), 24000)
+            self.link.play_stream(iter([sine(2.0)]), 24000, "80FF00")
 
     def test_no_audio_raises(self):
         with self.assertRaisesRegex(RuntimeError, "got no audio"):
-            self.link.play_stream(iter([]), 24000)
+            self.link.play_stream(iter([]), 24000, "80FF00")
         self.assertTrue(self.summary()["aborted"])
 
     def test_pump_stalls_during_the_stream_are_counted(self):
@@ -1049,7 +1049,7 @@ class TestPlayStream(LinkCase):
             time.sleep(0.05)
             yield sine(0.2)
 
-        self.link.play_stream(produce(), 24000)
+        self.link.play_stream(produce(), 24000, "80FF00")
         s = self.summary()
         self.assertGreaterEqual(s["pump_stalls"], 1)
         self.assertGreaterEqual(s["max_pump_lag_ms"], 50)
@@ -1070,6 +1070,6 @@ class TestPlayStreamWithoutCall(LinkCase):
             yield sine(0.1)
 
         with self.assertRaisesRegex(tg.CallEnded, "no connected"):
-            self.link.play_stream(produce(), 24000)
+            self.link.play_stream(produce(), 24000, "80FF00")
         self.assertEqual(touched, [])
         self.assertEqual(events_named(self.link, "speech_stream_done"), [])
