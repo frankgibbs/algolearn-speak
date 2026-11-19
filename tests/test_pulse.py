@@ -148,9 +148,25 @@ class TestGating(PulseCase):
         self.assertNotIn("-inf", bodies)
         self.assertEqual(bodies[-1], "end")
 
-    def test_ids_of_a_restarted_daemon_are_higher(self):
+    def test_an_id_is_the_utterances_wall_clock_start(self):
+        # Regression (2026-11-18): ids were the daemon's start time + a counter, so after a daemon up
+        # for hours they lagged the wall clock, and one hand-sent datagram with a current-time id
+        # left the receiver dropping every real utterance as late. Each id is now its start in ms.
+        before = time.time_ns() // 1_000_000
         self.link.play_stream(iter([sine(0.09)]), RATE)
-        self.assertGreater(self.got()[0][0], 1_700_000_000_000)   # wall-clock ms at the link's start
+        after = time.time_ns() // 1_000_000
+        self.assertTrue(before <= self.got()[0][0] <= after, (before, self.got()[0][0], after))
+
+    def test_ids_rise_when_the_wall_clock_does_not(self):
+        real = tg.time.time_ns
+        tg.time.time_ns = lambda: 1_000_000_000_000 * 1_000_000   # frozen, below the ids already given
+        self.addCleanup(setattr, tg.time, "time_ns", real)
+        self.link.play_stream(iter([sine(0.09)]), RATE)
+        self.link.play_stream(iter([sine(0.09)]), RATE)
+        ids = [u for u, _s, _b in self.got()]
+        first, second = ids[0], ids[-1]
+        self.assertEqual(second, first + 1)
+        self.assertGreater(first, 1_000_000_000_000)   # above the greeting's id, not the frozen clock
 
     def test_a_gap_inside_the_utterance_is_sent_as_silence(self):
         def produce():
@@ -167,7 +183,7 @@ class TestGating(PulseCase):
         self.link.play_stream(iter([sine(0.09)]), RATE)
         ids = sorted({u for u, _s, _b in self.got()})
         self.assertEqual(len(ids), 2)
-        self.assertEqual(ids[1], ids[0] + 1)
+        self.assertLess(ids[0], ids[1])
 
     def test_the_switch_cue_is_skipped_and_the_speech_pulses(self):
         cue = np.zeros(int(0.3 * RATE), dtype=np.float32)   # silent stand-in for switch_pcm: any level is from speech

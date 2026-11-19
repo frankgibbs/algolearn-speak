@@ -409,7 +409,9 @@ def silero_vad_factory(silence_seconds: float):
 # The link sends one UDP datagram per 30 ms of persona speech to the receiver there:
 #   pulse1 <utterance id> <seq> <RMS dBFS, one decimal, or -inf>
 #   pulse1 <utterance id> <seq> end
-# Utterance ids count up from the daemon start time in ms, so they only rise, across restarts too.
+# Each utterance's id is its wall-clock start in ms, kept strictly above the previous id of this run,
+# so ids rise across utterances and restarts and stay near the current time (never far behind a
+# datagram sent by hand). The receiver's idle reset covers a wall clock stepped back.
 # Only speech pulses: speak/converse streams, the call greeting and the spoken part of the
 # session-switch announcement. Cues, the chime and the owner's voice never do. The lights are
 # decoration: a failed send never touches the call (DECISION PM 2026-11-18, design 2.6).
@@ -550,12 +552,10 @@ class TelegramLink:
         self._lag_max = 0.0
         self._lag_stalls = 0
         self._stream: _Stream | None = None
-        # Voice pulse (loop thread only): the utterance being pulsed, the next utterance id (per
-        # daemon run), the greeting's envelope task and this call's failed sends.
+        # Voice pulse (loop thread only): the utterance being pulsed, the last utterance id given out
+        # (this run), the greeting's envelope task and this call's failed sends.
         self._pulse_utt: _PulseUtterance | None = None
-        # Utterance ids start at this run's wall clock in ms, so a restarted daemon's ids are always
-        # above the last run's and the receiver never mistakes a new utterance for a finished one.
-        self._pulse_next_id = time.time_ns() // 1_000_000
+        self._pulse_last_id = 0
         self._pulse_task: asyncio.Task | None = None
         self._pulse_failures = 0
 
@@ -1155,8 +1155,10 @@ class TelegramLink:
     def _pulse_begin(self, skip_bytes: int) -> _PulseUtterance:
         if self._pulse_utt is not None:   # one utterance at a time: close the one still open
             self._pulse_end()
-        self._pulse_next_id += 1
-        self._pulse_utt = _PulseUtterance(self._pulse_next_id, skip_bytes)
+        # The id is the utterance's wall-clock start in ms, strictly above the last one: two
+        # utterances begun in the same ms (or a wall clock stepped back) still get rising ids.
+        self._pulse_last_id = max(time.time_ns() // 1_000_000, self._pulse_last_id + 1)
+        self._pulse_utt = _PulseUtterance(self._pulse_last_id, skip_bytes)
         return self._pulse_utt
 
     def _pulse_level(self, u: _PulseUtterance, level: float) -> None:
