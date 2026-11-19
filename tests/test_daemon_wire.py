@@ -357,7 +357,7 @@ class TurnLink:
         self.log.append("greeting")
         return tg.ANSWERED
 
-    def play(self, audio, rate) -> None:
+    def play(self, audio, rate, speech_from=None) -> None:
         self.log.append(("play", len(audio)))
 
     def play_watched(self, segments, rate, classify, accept):

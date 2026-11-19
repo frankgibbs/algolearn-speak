@@ -28,6 +28,7 @@ services:
       SPEAK_RESUME_PHRASE: "continue"    # said alone while held: it restarts the cut sentence
       SPEAK_PERSONAS_FILE: /var/lib/speak/personas.json   # docs/DESIGN_PERSONAS.md; seeded with Angie when missing
       SPEAK_MISSED_CALLS_FILE: /var/lib/speak/missed_calls.json   # unreturned missed calls; created empty when missing
+      SPEAK_PULSE_TARGET: proxmox01.home.arpa:6743   # case lights pulse with the persona's voice (lan/gpu/case-fan-loop/DESIGN-voice-pulse.md)
     volumes:
       - speak_models:/root/.cache/huggingface   # models download once, not on every rebuild
       - speak_state:/var/lib/speak              # the persona registry and missed calls survive rebuilds

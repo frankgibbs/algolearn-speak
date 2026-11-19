@@ -73,7 +73,7 @@ class FakeLink:
     def state(self) -> str:
         return self._state
 
-    def play(self, audio, rate) -> None:
+    def play(self, audio, rate, speech_from=None) -> None:
         self.log.append(("play", len(audio)))
         if self._state != tg.CONNECTED:
             raise tg.CallEnded("the Telegram call ended during playback")

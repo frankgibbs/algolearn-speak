@@ -39,6 +39,7 @@ import datetime
 import logging
 import os
 import queue
+import socket
 import tempfile
 import threading
 import time
@@ -402,6 +403,92 @@ def silero_vad_factory(silence_seconds: float):
     return lambda block: vad(torch.from_numpy(block.copy()), return_seconds=False)
 
 
+# ------------------------------------------------------------------ voice pulse (case lights)
+#
+# proxmox01's case lights pulse with the persona's voice (lan/gpu/case-fan-loop/DESIGN-voice-pulse.md).
+# The link sends one UDP datagram per 30 ms of persona speech to the receiver there:
+#   pulse1 <utterance id> <seq> <RMS dBFS, one decimal, or -inf>
+#   pulse1 <utterance id> <seq> end
+# Utterance ids count up from the daemon start time in ms, so they only rise, across restarts too.
+# Only speech pulses: speak/converse streams, the call greeting and the spoken part of the
+# session-switch announcement. Cues, the chime and the owner's voice never do. The lights are
+# decoration: a failed send never touches the call (DECISION PM 2026-11-18, design 2.6).
+
+PULSE_WINDOW_FRAMES = 3                         # 30 ms of call audio per level
+PULSE_WINDOW_SECONDS = PULSE_WINDOW_FRAMES / 100
+
+
+def pulse_level(pcm: np.ndarray) -> float:
+    """RMS of int16 (or float in [-1, 1]) samples in dB relative to full scale; -inf for exact silence."""
+    a = np.asarray(pcm)
+    if a.size == 0:
+        raise ValueError("pulse_level of no samples")
+    f = a.astype(np.float64)
+    if np.issubdtype(a.dtype, np.integer):
+        f /= 32768.0
+    ms = float(np.dot(f, f)) / f.size
+    return float(10.0 * np.log10(ms)) if ms > 0 else float("-inf")
+
+
+def pulse_envelope(audio: np.ndarray, rate: int) -> list[float]:
+    """Levels of mono float audio in consecutive 30 ms windows (the last, shorter one included):
+    the greeting's envelope, which is played as a file before the pump runs."""
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    step = round(rate * PULSE_WINDOW_SECONDS)
+    return [pulse_level(audio[i:i + step]) for i in range(0, len(audio), step)]
+
+
+def pulse_datagram(utterance: int, seq: int, level: float | None) -> bytes:
+    """One datagram; level None is the utterance's end."""
+    if level is None:
+        body = "end"
+    elif level == float("-inf"):
+        body = "-inf"
+    else:
+        body = f"{level:.1f}"
+    return f"pulse1 {utterance} {seq} {body}".encode("ascii")
+
+
+def parse_pulse_target(value: str) -> tuple[str, int]:
+    """SPEAK_PULSE_TARGET "host:port" -> (host, port). Raises RuntimeError when it is not that."""
+    host, sep, port = value.rpartition(":")
+    if not sep or not host or not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise RuntimeError(f"SPEAK_PULSE_TARGET={value!r} is not host:port")
+    return host, int(port)
+
+
+class PulseSender:
+    """An unconnected, non-blocking UDP socket aimed at the case-light receiver. The host name is
+    resolved once, here (a failure stops the daemon at start). send() raises OSError on a failed send."""
+
+    def __init__(self, host: str, port: int) -> None:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+        if not infos:
+            raise RuntimeError(f"SPEAK_PULSE_TARGET: {host} has no IPv4 address")
+        self.address = infos[0][4]
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setblocking(False)
+
+    def send(self, payload: bytes) -> None:
+        self._sock.sendto(payload, self.address)
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+class _PulseUtterance:
+    """One pulsed utterance (loop thread only). `skip_bytes` of queued audio at its front are not
+    speech (the session-switch cue); frames count once the first speech frame is sent, and from then
+    on the silence of gaps and pauses counts too, so the lights dip between words."""
+
+    def __init__(self, utterance: int, skip_bytes: int) -> None:
+        self.id = utterance
+        self.seq = 0
+        self.skip_bytes = skip_bytes
+        self.started = False
+        self.window: list[bytes] = []
+
+
 class TelegramLink:
     """See the module docstring. `client_factory()` returns a Telethon client and
     `calls_factory(client)` a PyTgCalls; both are injected so tests never touch Telegram."""
@@ -413,8 +500,11 @@ class TelegramLink:
         calls_factory: Callable,
         vad_factory: Callable = silero_vad_factory,
         vad_preload: Callable = preload_silero_vad,
+        *,
+        pulse,
     ) -> None:
         self.target = target
+        self._pulse = pulse   # PulseSender (or a test fake with send(bytes)): the case-light datagrams
         self._client_factory = client_factory
         self._calls_factory = calls_factory
         self._vad_factory = vad_factory
@@ -460,6 +550,14 @@ class TelegramLink:
         self._lag_max = 0.0
         self._lag_stalls = 0
         self._stream: _Stream | None = None
+        # Voice pulse (loop thread only): the utterance being pulsed, the next utterance id (per
+        # daemon run), the greeting's envelope task and this call's failed sends.
+        self._pulse_utt: _PulseUtterance | None = None
+        # Utterance ids start at this run's wall clock in ms, so a restarted daemon's ids are always
+        # above the last run's and the receiver never mistakes a new utterance for a finished one.
+        self._pulse_next_id = time.time_ns() // 1_000_000
+        self._pulse_task: asyncio.Task | None = None
+        self._pulse_failures = 0
 
     def _event(self, event: str, **fields) -> None:
         """Record a call event for the current call (elapsed seconds since it was requested)."""
@@ -652,7 +750,12 @@ class TelegramLink:
         self._state = NONE
         self._end_reason = reason
         self._ended_at = time.monotonic()
-        self._event("ended", reason=reason, duration_s=round(time.monotonic() - self._call_t0, 3))
+        if self._pulse_task is not None:
+            self._pulse_task.cancel()
+            self._pulse_task = None
+        self._pulse_end()
+        self._event("ended", reason=reason, duration_s=round(time.monotonic() - self._call_t0, 3),
+                    pulse_send_failures=self._pulse_failures)
         self._ended.set()
         self._listening = False
         self._watching = False
@@ -736,6 +839,7 @@ class TelegramLink:
         os.close(fd)
         try:
             opener_seconds = write_opener(opener, greeting, rate)
+            greeting_levels = pulse_envelope(greeting, rate)
             await self._redial_settle()
             self._generation += 1
             self._end_reason = None
@@ -746,6 +850,7 @@ class TelegramLink:
             for st in (self._in_stats, self._out_stats, self._out_audio_stats, self._opener_out_stats):
                 st.reset()
             self._out_silence_frames = 0
+            self._pulse_failures = 0
             self._call_id, self._call_t0, self._caller = uuid.uuid4().hex[:8], time.monotonic(), caller
             self._event("requested", generation=self._generation, target=self.target)
             log.info("call %d (%s): dialing for %s", self._generation, self._call_id, caller)
@@ -786,6 +891,7 @@ class TelegramLink:
             finally:
                 self._ring_task = None
             self._event("answered_media_connected", opener_s=round(opener_seconds, 3))  # the greeting file starts playing now
+            self._pulse_task = asyncio.create_task(self._pulse_greeting(greeting_levels))
             # Answered. Anything that fails from here tears the call down: never a live,
             # half-built call with no pump.
             try:
@@ -946,7 +1052,10 @@ class TelegramLink:
                 frame = silence
                 if stream is not None and stream.audio_started:
                     stream.gap_frames += 1
+            pulse_u = self._pulse_utt   # taken before the await: the utterance this frame belongs to
             await self._calls.send_frame(self._user_id, Device.MICROPHONE, frame)
+            if pulse_u is not None:
+                self._pulse_frame(pulse_u, frame, sending)
             self._out_stats.add(frame)
             if sending:
                 self._out_audio_stats.add(frame)
@@ -988,18 +1097,27 @@ class TelegramLink:
         self._end_call(END_FAILED)
         asyncio.ensure_future(self._leave())
 
-    def play(self, audio: np.ndarray, rate: int) -> None:
-        """Queue `audio` on the call and return once it has all been sent. Raises CallEnded."""
+    def play(self, audio: np.ndarray, rate: int, speech_from: int | None = None) -> None:
+        """Queue `audio` on the call and return once it has all been sent. Raises CallEnded.
+        `speech_from` is the sample of `audio` where persona speech starts (the session-switch
+        announcement after its cue): from there on it pulses the case lights. None: a cue, no pulse."""
         pcm = to_call_pcm(audio, rate)
-        self._run(self._play(pcm), len(pcm) / (FRAME_BYTES * 100) + 30.0, "playing audio into the call")
+        skip = None if speech_from is None else round(speech_from * CALL_RATE / rate) * 2 * CALL_CHANNELS
+        self._run(self._play(pcm, skip), len(pcm) / (FRAME_BYTES * 100) + 30.0, "playing audio into the call")
 
-    async def _play(self, pcm: bytes) -> None:
+    async def _play(self, pcm: bytes, pulse_skip: int | None = None) -> None:
         self._require_pump()
         self._lag_max, self._lag_stalls = 0.0, 0
         self._drained.clear()
+        if pulse_skip is not None:
+            self._pulse_begin(pulse_skip)
         self._outgoing.extend(pcm)
         self._event("playback_queued", audio_ms=len(pcm) // FRAME_BYTES * 10)
-        await self._wait_drained()
+        try:
+            await self._wait_drained()
+        finally:
+            if pulse_skip is not None:
+                self._pulse_end()
         if self._ended.is_set():
             raise CallEnded("the Telegram call ended during playback")
         self._event("playback_done", max_pump_lag_ms=round(self._lag_max * 1000), pump_stalls=self._lag_stalls)
@@ -1019,6 +1137,80 @@ class TelegramLink:
         except asyncio.CancelledError:
             self._outgoing.clear()   # timed out: the rest must not play after the error
             raise
+
+    # ------------------------------------------------------------ voice pulse (case lights)
+
+    def _pulse_send(self, payload: bytes) -> None:
+        """Fire one datagram. A failure is dropped: the first of a call is recorded and logged,
+        the rest only counted (the `ended` event's pulse_send_failures). Never raises."""
+        try:
+            self._pulse.send(payload)
+        except OSError as e:
+            self._pulse_failures += 1
+            if self._pulse_failures == 1:
+                log.warning("voice pulse: send failed (%s); speech goes on, later failures on this call "
+                            "are only counted", describe(e))
+                self._event("pulse_send_failed", error=describe(e))
+
+    def _pulse_begin(self, skip_bytes: int) -> _PulseUtterance:
+        if self._pulse_utt is not None:   # one utterance at a time: close the one still open
+            self._pulse_end()
+        self._pulse_next_id += 1
+        self._pulse_utt = _PulseUtterance(self._pulse_next_id, skip_bytes)
+        return self._pulse_utt
+
+    def _pulse_level(self, u: _PulseUtterance, level: float) -> None:
+        self._pulse_send(pulse_datagram(u.id, u.seq, level))
+        u.seq += 1
+
+    def _pulse_frame(self, u: _PulseUtterance, frame: bytes, audio: bool) -> None:
+        """The pump sent `frame` (`audio`: from the queue, else idle silence) while `u` was open.
+        Every PULSE_WINDOW_FRAMES counted frames make one level. A frame of an utterance that closed
+        while the frame was being sent is its own: it is counted into `u`, which has already sent
+        its end, so it is dropped here."""
+        if u is not self._pulse_utt:
+            return
+        if audio and not u.started and u.skip_bytes >= FRAME_BYTES:   # still the cue in front of the speech
+            u.skip_bytes -= FRAME_BYTES
+            return
+        if not u.started and not frame.strip(b"\0"):   # before the first speech frame: idle silence while
+            return                                      # Kokoro synthesizes, or leading zero padding
+        u.started = True
+        u.window.append(frame)
+        if len(u.window) == PULSE_WINDOW_FRAMES:
+            level = pulse_level(np.frombuffer(b"".join(u.window), dtype=np.int16))
+            u.window.clear()
+            self._pulse_level(u, level)
+
+    def _pulse_end(self) -> None:
+        """Close the open utterance; its `end` goes out only if a level did."""
+        u = self._pulse_utt
+        if u is None:
+            return
+        self._pulse_utt = None
+        if u.window:   # the last, shorter window
+            self._pulse_level(u, pulse_level(np.frombuffer(b"".join(u.window), dtype=np.int16)))
+            u.window.clear()
+        if u.seq:
+            self._pulse_send(pulse_datagram(u.id, u.seq, None))
+
+    async def _pulse_greeting(self, levels: list[float]) -> None:
+        """The greeting plays as a file outside the pump: send its precomputed envelope on the
+        same 30 ms clock from the moment the file starts. _end_call cancels it (and sends the end)."""
+        u = self._pulse_begin(0)
+        u.started = True
+        t0 = time.monotonic()
+        try:
+            for i, level in enumerate(levels):
+                await asyncio.sleep(max(0.0, t0 + (i + 1) * PULSE_WINDOW_SECONDS - time.monotonic()))
+                if self._pulse_utt is not u:   # a pump utterance took over (and sent this one's end)
+                    return
+                self._pulse_level(u, level)
+            if self._pulse_utt is u:
+                self._pulse_end()
+        finally:
+            if self._pulse_task is asyncio.current_task():
+                self._pulse_task = None
 
     # ------------------------------------------------------------ streamed audio out
 
@@ -1060,6 +1252,7 @@ class TelegramLink:
         self._require_pump()
         self._lag_max, self._lag_stalls = 0.0, 0
         self._stream = _Stream()
+        self._pulse_begin(0)
 
     async def _stream_add(self, pcm: bytes, produce_s: float) -> None:
         st = self._stream
@@ -1095,6 +1288,7 @@ class TelegramLink:
         if st is None:   # already summarized: the failure came after a completed finish
             return
         self._stream = None
+        self._pulse_end()
         fields = {"segments": st.segments, "audio_ms": round(st.audio_bytes / (FRAME_BYTES * 100) * 1000),
                   "first_audio_ms": st.first_audio_ms, "underruns": st.underruns,
                   "underrun_ms": st.underrun_frames * 10, "max_pump_lag_ms": round(self._lag_max * 1000),

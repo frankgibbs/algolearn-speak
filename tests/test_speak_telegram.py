@@ -138,6 +138,19 @@ class FakeCalls:
         self._app.input_call = None   # leave_call's own discard_call drops the cache
 
 
+class FakePulse:
+    """Stands in for PulseSender: keeps every datagram; `fail` makes send raise it."""
+
+    def __init__(self):
+        self.sent: list[bytes] = []
+        self.fail: OSError | None = None
+
+    def send(self, payload: bytes) -> None:
+        if self.fail is not None:
+            raise self.fail
+        self.sent.append(payload)
+
+
 class StubVAD:
     """Energy VAD with Silero's event shape: start on the first loud block, end after `silence` quiet seconds."""
 
@@ -185,7 +198,9 @@ class LinkCase(unittest.TestCase):
             self.calls = FakeCalls(client, self.ring)
             return self.calls
 
-        self.link = tg.TelegramLink("owner", FakeTelethon, calls_factory, vad_factory=StubVAD, vad_preload=lambda: None)
+        self.pulse = FakePulse()
+        self.link = tg.TelegramLink("owner", FakeTelethon, calls_factory, vad_factory=StubVAD, vad_preload=lambda: None,
+                                    pulse=self.pulse)
         self.link.start()
         self.addCleanup(self.link.stop)
 
@@ -509,7 +524,7 @@ class TestReviewFindings(LinkCase):
 class TestVadPreload(unittest.TestCase):
     def link(self, preload):
         return tg.TelegramLink("owner", FakeTelethon, lambda c: FakeCalls(c), vad_factory=StubVAD,
-                               vad_preload=preload)
+                               vad_preload=preload, pulse=FakePulse())
 
     def test_start_loads_the_model_before_connecting(self):
         order = []
@@ -520,7 +535,7 @@ class TestVadPreload(unittest.TestCase):
                 await super().connect()
 
         link = tg.TelegramLink("owner", Client, lambda c: FakeCalls(c), vad_factory=StubVAD,
-                               vad_preload=lambda: order.append("preload"))
+                               vad_preload=lambda: order.append("preload"), pulse=FakePulse())
         link.start()
         self.addCleanup(link.stop)
         self.assertEqual(order[0], "preload")
@@ -545,7 +560,7 @@ class TestRevokedSession(unittest.TestCase):
         class Revoked(FakeTelethon):
             authorized = False
         link = tg.TelegramLink("owner", Revoked, lambda c: FakeCalls(c), vad_factory=StubVAD,
-                               vad_preload=lambda: None)
+                               vad_preload=lambda: None, pulse=FakePulse())
         with self.assertRaisesRegex(RuntimeError, "not authorized"):
             link.start()
         self.assertFalse(link._thread.is_alive())   # a failed start stops and closes its loop
@@ -556,7 +571,7 @@ class TestStop(unittest.TestCase):
     def test_stop_hangs_up_and_closes_the_loop(self):
         made = []
         link = tg.TelegramLink("owner", FakeTelethon, lambda c: made.append(FakeCalls(c)) or made[-1],
-                               vad_factory=StubVAD, vad_preload=lambda: None)
+                               vad_factory=StubVAD, vad_preload=lambda: None, pulse=FakePulse())
         with mock.patch.multiple(tg, OPENER_MIN_SECONDS=0.004, OPENER_TAIL_SECONDS=0.02, REDIAL_SETTLE_SECONDS=0.0):
             link.start()
             link.call(np.zeros(100, dtype=np.float32), 24000, CALLER)

@@ -469,7 +469,7 @@ class ScriptedLink:
         self.log.append(("record",))
         return np.zeros(eng.STT_RATE, dtype=np.float32)
 
-    def play(self, audio, rate) -> None:
+    def play(self, audio, rate, speech_from=None) -> None:
         self.log.append(("cue",))
 
     def hang_up(self) -> str:
@@ -707,7 +707,8 @@ class TestPhraseSettings(unittest.TestCase):
                "SPEAK_WHISPER_MODEL": "w", "SPEAK_LANGUAGE": "en", "SPEAK_QUIET_HOURS": "22:00-07:00",
                "SPEAK_HOLD_PHRASE": "hold on", "SPEAK_RESUME_PHRASE": "continue", "TZ": "America/Los_Angeles",
                "SPEAK_PERSONAS_FILE": "/var/lib/speak/personas.json",
-               "SPEAK_MISSED_CALLS_FILE": "/var/lib/speak/missed_calls.json"}
+               "SPEAK_MISSED_CALLS_FILE": "/var/lib/speak/missed_calls.json",
+               "SPEAK_PULSE_TARGET": "proxmox01.home.arpa:6743"}
         with mock.patch.dict(os.environ, env):
             self.assertEqual(d.load_settings()["phrases"], {"hold on": proto.CMD_HOLD, "continue": proto.CMD_RESUME})
         env.pop("SPEAK_HOLD_PHRASE")

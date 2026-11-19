@@ -95,7 +95,7 @@ DEBUG_LOGGERS = ("speak", "pytgcalls", "ntgcalls", "telethon")   # ntgcalls' nat
 REQUIRED_TELEGRAM_ENV = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "TELEGRAM_CALL_TARGET")
 REQUIRED_SPEAK_ENV = ("SPEAK_KOKORO_MODEL", "SPEAK_VOICE", "SPEAK_SPEED", "SPEAK_WHISPER_MODEL",
                       "SPEAK_LANGUAGE", "SPEAK_QUIET_HOURS", "SPEAK_HOLD_PHRASE", "SPEAK_RESUME_PHRASE",
-                      "SPEAK_PERSONAS_FILE", "SPEAK_MISSED_CALLS_FILE", "TZ")
+                      "SPEAK_PERSONAS_FILE", "SPEAK_MISSED_CALLS_FILE", "SPEAK_PULSE_TARGET", "TZ")
 BIND_HOST = "0.0.0.0"   # open to the LAN by design (owner decision 4); no auth, no TLS
 WHISPER_HTTP_PORT = 9000   # the retired whisper-service's port, so its clients need no change
 TRANSCRIBE_TOOL = "transcribe"   # how status names an HTTP transcription holding the audio lock
@@ -222,7 +222,8 @@ def load_settings() -> dict:
     if not proto.PERSONA_SPEED_MIN <= speed <= proto.PERSONA_SPEED_MAX:   # the speed every new persona starts with
         raise RuntimeError(f"SPEAK_SPEED={speed} must be from {proto.PERSONA_SPEED_MIN} to {proto.PERSONA_SPEED_MAX}")
     return {**env, "SPEAK_SPEED": speed, "tz": tz, "quiet_window": parse_quiet_hours(env["SPEAK_QUIET_HOURS"]),
-            "phrases": parse_phrases(env["SPEAK_HOLD_PHRASE"], env["SPEAK_RESUME_PHRASE"])}
+            "phrases": parse_phrases(env["SPEAK_HOLD_PHRASE"], env["SPEAK_RESUME_PHRASE"]),
+            "pulse_target": tg.parse_pulse_target(env["SPEAK_PULSE_TARGET"])}
 
 
 def load_env() -> dict[str, str]:
@@ -737,8 +738,10 @@ class SpeakService:
             if tool == "listen":
                 spoken += SWITCH_LISTEN_SUFFIX
             voice = Voice(self.engines.voice_pack(persona.voice), persona.speed)
-            audio = np.concatenate([switch_pcm(), self.engines.synthesize(spoken, voice)])
-            self.guard_call(sess, tool, lambda: self.link.play(audio, TTS_RATE))
+            cue = switch_pcm()
+            audio = np.concatenate([cue, self.engines.synthesize(spoken, voice)])
+            # The spoken part pulses the case lights; the cue in front of it does not.
+            self.guard_call(sess, tool, lambda: self.link.play(audio, TTS_RATE, speech_from=len(cue)))
             self.link.record_event(SESSION_SWITCH_EVENT, tool=tool, from_project=previous[1].project,
                                    to_project=sess.speaker.project, to_persona=persona.name, spoken=spoken,
                                    announce_s=round(len(audio) / TTS_RATE, 2))
@@ -1564,7 +1567,7 @@ class SpeakDaemon:
 
 # ------------------------------------------------------------------ entry point
 
-def build_link(env: dict[str, str]) -> tg.TelegramLink:
+def build_link(env: dict[str, str], pulse: tg.PulseSender) -> tg.TelegramLink:
     from pytgcalls import PyTgCalls
     from telethon import TelegramClient as TelethonClient
     from telethon.sessions import StringSession
@@ -1574,6 +1577,7 @@ def build_link(env: dict[str, str]) -> tg.TelegramLink:
         client_factory=lambda: TelethonClient(StringSession(env["TELEGRAM_SESSION"]),
                                               int(env["TELEGRAM_API_ID"]), env["TELEGRAM_API_HASH"]),
         calls_factory=PyTgCalls,
+        pulse=pulse,
     )
 
 
@@ -1611,7 +1615,9 @@ def main() -> None:
         PersonaStore.check_dir(settings["SPEAK_PERSONAS_FILE"])
         engines = Engines(settings["SPEAK_KOKORO_MODEL"], settings["SPEAK_WHISPER_MODEL"], settings["SPEAK_LANGUAGE"])
         engines.load(settings["SPEAK_VOICE"], settings["SPEAK_SPEED"])
-        link = build_link(telegram_env)
+        pulse = tg.PulseSender(*settings["pulse_target"])   # resolved once; a bad name stops the daemon here
+        log.info("voice pulse: case-light datagrams to %s:%d", *pulse.address)
+        link = build_link(telegram_env, pulse)
         personas = PersonaStore.open(settings["SPEAK_PERSONAS_FILE"], engines.voices, settings["SPEAK_VOICE"],
                                      settings["SPEAK_SPEED"], settings["tz"], link.record_event)
         missed = MissedCalls.open(settings["SPEAK_MISSED_CALLS_FILE"], settings["tz"])

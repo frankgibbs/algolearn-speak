@@ -41,8 +41,9 @@ class CallLink(ScriptedLink):
     def info(self) -> dict:
         return {**super().info(), "generation": self.generation}
 
-    def play(self, audio, rate) -> None:
+    def play(self, audio, rate, speech_from=None) -> None:
         self.log.append(("cue", len(audio)))
+        self.speech_from = speech_from
         if self.drop_on_play:
             self._state = tg.NONE
             raise RuntimeError("call dropped while playing")
